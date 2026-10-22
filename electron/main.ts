@@ -47,6 +47,19 @@ const isDev = !app.isPackaged;
 const APP_ROOT = path.resolve(__dirname, '..', '..');
 const RENDERER_DIST = path.join(APP_ROOT, 'dist', 'renderer');
 
+// 应用图标（用户确认的白瓷叠帧稿，见 assets/icon-manifest.json）。
+// 开发态直接读源码 assets/；打包后读随包拷贝的 dist/assets/（build-main 前置复制）。
+function appIconPath(): string | null {
+  for (const candidate of [path.join(APP_ROOT, 'dist', 'assets', 'app-icon.ico'), path.join(APP_ROOT, 'assets', 'app-icon.ico')]) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+}
+
 // 数据目录：
 //   默认使用系统的 userData（AppData\Roaming\WinCapture Studio）。
 //   WCS_USER_DATA 环境变量可覆盖，用于便携模式、自动化测试，
@@ -130,6 +143,7 @@ function loadRenderer(win: BrowserWindow, hash = ''): void {
 // ---------------------------------------------------------------------------
 
 function createMainWindow(): BrowserWindow {
+  const icon = appIconPath();
   const win = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -138,6 +152,7 @@ function createMainWindow(): BrowserWindow {
     backgroundColor: '#14161b',
     show: false,
     title: 'WinCapture Studio',
+    ...(icon ? { icon } : {}),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(APP_ROOT, 'dist', 'main', 'preload.cjs'),
@@ -176,6 +191,7 @@ function createOverlayWindow(): BrowserWindow {
     transparent: false,
     backgroundColor: '#14161b',
     show: false,
+    ...(appIconPath() ? { icon: appIconPath() as string } : {}),
     webPreferences: {
       preload: path.join(APP_ROOT, 'dist', 'main', 'preload.cjs'),
       contextIsolation: true,
@@ -1346,6 +1362,8 @@ function startApp(): void {
   app.commandLine.appendSwitch('js-flags', '--expose-gc');
 
   app.whenReady().then(async () => {
+    // 任务栏/窗口分组用显式的 AppUserModelID，避免 Windows 上出现无图标的空分组。
+    app.setAppUserModelId('com.huihui.wincapture-studio');
     store = new ProjectStore(app.getPath('userData'));
     engine = buildEngine();
 

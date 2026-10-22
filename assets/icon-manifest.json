@@ -1,0 +1,39 @@
+{
+  "name": "WinCapture Studio",
+  "selection": "art-white-blue",
+  "status": "user_selected_provisional",
+  "selected_date": "2026-10-22",
+  "master": "assets/app-icon.png",
+  "windows_icon": "assets/app-icon.ico",
+  "ui_icon": "assets/app-icon-64.png",
+  "ico_sizes": [
+    16,
+    20,
+    24,
+    32,
+    40,
+    48,
+    64,
+    128,
+    256
+  ],
+  "original_size": [
+    1254,
+    1254
+  ],
+  "master_sha256": "31c9855ddd284b5fd1ee10b0752a64dc3791f3ead8a9fc2cd656d6e1afa75050",
+  "source_generator": "built-in imagegen",
+  "prompt_file": "prompts.txt",
+  "application_source_integration": "applied",
+  "integration_targets": [
+    "electron/main.ts: 主窗口与悬浮条 BrowserWindow icon + AppUserModelId",
+    "src/renderer/App.tsx: 左栏品牌位 <img>",
+    "index.html: favicon",
+    "public/app-icon.png: Vite public 目录，构建后位于 dist/renderer/",
+    "scripts/build-main.mjs: 构建时把 ICO 与 32/64/128 PNG 复制到 dist/assets/"
+  ],
+  "packaging_integration": "pending_electron_builder",
+  "known_limitations": [
+    "Minor alpha-edge artifacts remain from the accepted provisional artwork."
+  ]
+}

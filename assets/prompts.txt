@@ -1,0 +1,29 @@
+Generator: built-in imagegen
+
+INITIAL DESIGN PROMPT
+
+Use case: logo-brand
+Asset type: art-directed desktop app icon for WinCapture Studio, a screen-recording and cinematic tutorial creation app.
+
+Primary request: WHITE is the main color, BLUE is a restrained secondary accent. It must clearly evoke screen recording, but it must feel like a small beautifully crafted piece of sculptural art, NOT a toolbar pictogram or a simple outlined monitor.
+
+Design concept: "capturing a flowing moment".
+One porcelain-white rounded-square app tile. Inside it, a beautiful floating LANDSCAPE SCREEN made from two thin overlapping white porcelain-and-paper frames, offset by only a small amount to suggest successive captured video frames. The front screen is a wide rounded rectangle. Its top and left edges are gently sculpted white satin ceramic; its lower-right corner curls forward in an elegant fluid paper fold, revealing a thin deep-blue underside. The continuous lower edge of the screen subtly flows into that sculptural curled fold, like a frozen moving film frame. This curl is the signature feature and should look masterfully designed rather than decorative clutter.
+The screen interior is mostly frosted icy white, with a single graceful translucent sapphire-blue wave of light sweeping across its lower third and fading softly into the white screen. The wave is INSIDE the rectangular screen, suggesting moving recorded imagery; it is not a background landscape or a landscape photograph. Add one small circular sapphire recording indicator precisely integrated into the upper-right WHITE rim of the front screen. The indicator is clearly a tiny flat circular blue light, not a large ball, lens or camera.
+Use only TWO overlapping frames, ONE curled corner, ONE blue light-wave and ONE little recording indicator. The screen silhouette must remain immediately readable.
+
+Composition: centered, compact, balanced; floating screen occupies about 65 percent of tile width. Slightly turned in space for refined depth, around 8 degrees, no dramatic isometric angle. Frame is landscape 16:10 with visibly thin elegant edges. Entire composition fits comfortably within the tile, with generous breathing room. White tile occupies about 84 percent of the square canvas, actual transparent alpha outside it.
+
+Art direction and materials: collectible contemporary ceramic-and-glass object, refined editorial 3D illustration, sophisticated miniature sculpture, precise smooth geometry, frosted optical surfaces, delicate paper-like folds, strong but soft blue rim accents, beautiful light and shadow. White porcelain is dominant; sapphire is concentrated in the revealed underside, the tiny recording light and the translucent wave. Intricate lighting and material craft, restrained simple overall silhouette. NOT a flat stock icon.
+Lighting: large soft studio light from upper left; gentle cool-blue bounce from lower right; delicate contact shadows separate the white layers from the white tile. Clean pearly highlights along the curled edge, subtle blue light transmitted through frosted glass, no blown-out glow.
+Color palette: about 80 percent white and pearl white #FAFCFF, subtle blue-gray shadows, 20 percent sapphire and ice blue #397BE8 / #A6CDF8. No purple, red, orange, black or rainbow gradients.
+Constraints: ONE finished icon, no text, no letters, no captions, no presentation board, no watermark, no extra variants. High aesthetic quality at large size, strong simple screen silhouette at taskbar size. Actual transparency outside the tile, clean alpha boundary, no stray pixels.
+Avoid: a blue monitor-outline glyph on white, a monitor stand, cheap stock illustration, thick plastic tubes, cartoon toy materials, heavy bevels, photorealistic computer hardware, camera lens, generic play triangle, abstract monogram, W or C, random sparkles or stars, excessive bubbles, busy particles, neon bloom, dark background.
+
+EDGE CLEANUP EDIT PROMPT
+
+Use case: background-extraction
+Edit target: the attached white-and-blue sculptural screen-recording app icon.
+Make ONE precise cleanup: remove every stray white, gray and blue speck, fragment, fringe and irregular particle OUTSIDE the rounded-square tile. The tile must have a pristine, continuous, smooth rounded-square silhouette on a truly transparent background. Remove all scattered material above, below, left and right of the tile. No white halo outside the tile, no rough torn-paper silhouette. Maintain antialiased clean edges.
+Preserve the icon artwork INSIDE the tile exactly: white porcelain tile, two overlapping white screen frames, elegant curled lower-right corner with blue underside, translucent blue light wave inside the screen, small blue recording light upper right. Keep the composition, proportions, perspective, materials, highlights, colors and screen details unchanged.
+Output one icon with actual alpha transparency outside the smoothly rounded tile. No checkerboard printed into the image, no backdrop, no text, no extra design changes.
