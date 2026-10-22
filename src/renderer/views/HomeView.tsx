@@ -2,10 +2,10 @@
  * 首页：最近工程、新建录制、恢复未完成录制、教程入口
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useApp } from '../lib/store';
-import { Badge, Button, EmptyState, Icon, IconButton, InlineNote, Modal, Panel, Spinner } from '../components/ui';
-import { cn, describeError, formatBytes, formatClock, formatDurationLong, formatRelativeTime, unwrap } from '../lib/format';
+import { Badge, Button, EmptyState, Icon, IconButton, InlineNote, Modal, Panel } from '../components/ui';
+import { cn, formatClock, formatDurationLong, formatRelativeTime, unwrap } from '../lib/format';
 import { TICKS_PER_SECOND } from '@domain/timebase';
 import type { RecoverableSession } from '@shared/ipc';
 import { wcs } from '../lib/wcs';
@@ -17,12 +17,10 @@ export function HomeView() {
     refreshRecents,
     refreshRecoverables,
     openProject,
-    createProject,
     projectLoading,
     setView,
     pushToast,
     apiMode,
-    systemInfo,
     project,
     duration,
     pushError,
@@ -120,15 +118,12 @@ export function HomeView() {
           <Button variant="primary" size="lg" icon="record" onClick={() => setView('record')}>
             新建录制
           </Button>
-          <Button size="lg" icon="editor" onClick={() => void createProject()} disabled={projectLoading}>
-            空白工程
-          </Button>
-          <Button size="lg" variant="ghost" icon="book" onClick={() => setView('tutorial')}>
-            打开教程步骤
+          <Button size="lg" icon="folder" onClick={() => void openProject()} disabled={projectLoading}>
+            打开工程
           </Button>
           {project && (
-            <Button size="lg" variant="ghost" icon="play" onClick={() => setView('editor')}>
-              继续编辑当前工程
+            <Button size="lg" variant="ghost" icon="editor" onClick={() => setView('editor')}>
+              继续编辑「{project.name}」
             </Button>
           )}
         </div>
@@ -143,7 +138,7 @@ export function HomeView() {
             <div className="home-stat-value">{formatDurationLong(stats.duration)}</div>
           </div>
           <div>
-            <div className="home-stat-label">待恢复会话</div>
+            <div className="home-stat-label">待恢复</div>
             <div className={cn('home-stat-value', stats.recoverable > 0 && 'is-warn')}>{stats.recoverable}</div>
           </div>
           <div>
@@ -154,18 +149,16 @@ export function HomeView() {
       </section>
 
       <div className="home-grid">
-        <div>
+        <div style={{ minWidth: 0 }}>
+          {/* 恢复会话（§P1）：只在存在时显示一条可操作提示，不常驻占版面 */}
           {recoverables.length > 0 && (
             <Panel
               title="恢复未完成录制"
               icon="refresh"
               subtitle={`${recoverables.length} 个会话可恢复`}
-              className=""
-              actions={
-                <IconButton icon="refresh" label="刷新可恢复会话" size="sm" onClick={() => void refreshRecoverables()} />
-              }
+              actions={<IconButton icon="refresh" label="刷新可恢复会话" size="sm" onClick={() => void refreshRecoverables()} />}
             >
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 {recoverables.map((session) => (
                   <div key={session.projectPath} className="recover-card">
                     <div className="recover-title">
@@ -212,8 +205,8 @@ export function HomeView() {
                 <Button size="sm" variant="ghost" icon="refresh" onClick={() => void refreshRecents()}>
                   刷新
                 </Button>
-                <Button size="sm" variant="ghost" icon="folder" onClick={() => void wcs().pickDirectory()}>
-                  打开目录
+                <Button size="sm" variant="ghost" icon="folder" onClick={() => void openProject()}>
+                  打开工程…
                 </Button>
               </>
             }
@@ -222,16 +215,11 @@ export function HomeView() {
               <EmptyState
                 icon="editor"
                 title="还没有工程"
-                description="新建一次录制，或从已有素材开始一个空白工程。"
+                description="新建一次录制，或打开一个已有工程。"
                 actions={
-                  <>
-                    <Button variant="primary" size="sm" icon="record" onClick={() => setView('record')}>
-                      新建录制
-                    </Button>
-                    <Button size="sm" onClick={() => void createProject()}>
-                      空白工程
-                    </Button>
-                  </>
+                  <Button variant="primary" size="sm" icon="record" onClick={() => setView('record')}>
+                    新建录制
+                  </Button>
                 }
               />
             ) : (
@@ -297,107 +285,27 @@ export function HomeView() {
         </div>
 
         <div className="side-stack">
-          <Panel title="开始" icon="record">
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <button type="button" className="quick-action" onClick={() => setView('record')}>
-                <span className="quick-action-icon">
-                  <Icon name="record" size={16} />
-                </span>
-                <span>
-                  <span className="quick-action-title">新建录制</span>
-                  <span className="quick-action-desc">选择显示器或窗口，检查麦克风与摄像头</span>
-                </span>
-              </button>
-              <button type="button" className="quick-action" onClick={() => setView('editor')}>
-                <span className="quick-action-icon">
-                  <Icon name="editor" size={16} />
-                </span>
-                <span>
-                  <span className="quick-action-title">打开编辑器</span>
-                  <span className="quick-action-desc">预览、剪辑、运镜、遮挡与画幅</span>
-                </span>
-              </button>
-              <button type="button" className="quick-action" onClick={() => setView('tutorial')}>
-                <span className="quick-action-icon">
-                  <Icon name="book" size={16} />
-                </span>
-                <span>
-                  <span className="quick-action-title">教程步骤</span>
-                  <span className="quick-action-desc">由标记生成草稿，编辑标题与截图</span>
-                </span>
-              </button>
-              <button type="button" className="quick-action" onClick={() => setView('export')}>
-                <span className="quick-action-icon">
-                  <Icon name="export" size={16} />
-                </span>
-                <span>
-                  <span className="quick-action-title">导出视频或教程</span>
-                  <span className="quick-action-desc">选择画幅、输出路径与预计体积</span>
-                </span>
-              </button>
-            </div>
-          </Panel>
-
           <Panel title="当前工程" icon="layers">
             {project ? (
-              <div className="kv-list">
-                <div className="kv-row">
-                  <span className="kv-key">名称</span>
-                  <span className="kv-value" style={{ fontFamily: 'inherit' }}>{project.name}</span>
+              <>
+                <div className="side-project-name" title={project.name}>
+                  {project.name}
                 </div>
-                <div className="kv-row">
-                  <span className="kv-key">时长</span>
-                  <span className="kv-value">{formatClock(duration)}</span>
+                <div className="side-project-meta">
+                  {formatClock(duration)} ·{' '}
+                  {project.tracks.reduce((acc, t) => acc + t.clips.length, 0)} 个片段 · {project.steps.length} 个步骤
                 </div>
-                <div className="kv-row">
-                  <span className="kv-key">片段 / 效果</span>
-                  <span className="kv-value">
-                    {project.tracks.reduce((acc, t) => acc + t.clips.length, 0)} / {project.effects.length}
-                  </span>
+                <div className="side-project-actions">
+                  <Button size="sm" variant="primary" icon="editor" onClick={() => setView('editor')}>
+                    继续编辑
+                  </Button>
+                  <Button size="sm" variant="ghost" icon="export" onClick={() => setView('export')}>
+                    导出
+                  </Button>
                 </div>
-                <div className="kv-row">
-                  <span className="kv-key">教程步骤</span>
-                  <span className="kv-value">{project.steps.length}</span>
-                </div>
-                <div className="kv-row">
-                  <span className="kv-key">未确认遮挡</span>
-                  <span className="kv-value">
-                    {project.effects.filter((e) => e.kind === 'privacy' && !(e.parameters as { confirmed?: boolean }).confirmed).length}
-                  </span>
-                </div>
-              </div>
+              </>
             ) : (
-              <EmptyState title="没有打开的工程" description="从最近工程打开，或新建一个录制。" />
-            )}
-          </Panel>
-
-          <Panel title="系统" icon="info">
-            {systemInfo ? (
-              <div className="kv-list">
-                <div className="kv-row">
-                  <span className="kv-key">系统</span>
-                  <span className="kv-value">{systemInfo.osVersion}</span>
-                </div>
-                <div className="kv-row">
-                  <span className="kv-key">可用内存</span>
-                  <span className="kv-value">{formatBytes(systemInfo.freeMemoryBytes)}</span>
-                </div>
-                <div className="kv-row">
-                  <span className="kv-key">硬件编码</span>
-                  <span className="kv-value">{systemInfo.hardwareEncoding ? '可用' : '不可用'}</span>
-                </div>
-                <div className="kv-row">
-                  <span className="kv-key">默认输出目录</span>
-                  <span className="kv-value" title={systemInfo.videosPath}>
-                    {systemInfo.videosPath}
-                  </span>
-                </div>
-              </div>
-            ) : (
-              <div className="wcs-empty">
-                <Spinner />
-                <p>正在读取系统信息…</p>
-              </div>
+              <EmptyState title="没有打开的工程" description="从最近工程打开，或新建一次录制。" />
             )}
           </Panel>
 

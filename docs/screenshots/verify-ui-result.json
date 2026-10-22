@@ -5,49 +5,49 @@
       "name": "01-home",
       "label": "首页：最近工程 / 新建录制 / 恢复未完成录制 / 教程入口",
       "file": "docs\\screenshots\\01-home.png",
-      "bytes": 387608
+      "bytes": 379562
     },
     {
       "name": "02-record",
       "label": "录制设置：来源缩略图与真实分辨率 / 电平表 / 摄像头 / 质量档位 / 磁盘",
       "file": "docs\\screenshots\\02-record.png",
-      "bytes": 338092
+      "bytes": 325830
     },
     {
       "name": "03-editor",
       "label": "编辑器：预览 canvas + 时间线 + 属性面板",
       "file": "docs\\screenshots\\03-editor.png",
-      "bytes": 277980
+      "bytes": 256627
     },
     {
       "name": "04-editor-canvas",
       "label": "编辑器 · 画布属性：画幅 16:9/1:1/9:16、背景、圆角、阴影、摄像头布局",
       "file": "docs\\screenshots\\04-editor-canvas.png",
-      "bytes": 268595
+      "bytes": 243388
     },
     {
       "name": "05-export",
       "label": "导出面板：产物类型 / 输出路径 / 画幅 / 预计体积 / 进度与结果区",
       "file": "docs\\screenshots\\05-export.png",
-      "bytes": 191984
+      "bytes": 210777
     },
     {
       "name": "06-tutorial",
       "label": "教程页：步骤列表 / 标题说明编辑 / 截图预览 / 合并拆分",
       "file": "docs\\screenshots\\06-tutorial.png",
-      "bytes": 234015
+      "bytes": 255420
     },
     {
       "name": "07-settings",
       "label": "设置页：系统信息 / 采集能力 / 快捷键 / 诊断",
       "file": "docs\\screenshots\\07-settings.png",
-      "bytes": 249783
+      "bytes": 276620
     },
     {
       "name": "08-overlay-bar",
       "label": "录制悬浮控制条：状态文字 + 图标 + 计时 + 暂停 / 标记 / 停止",
       "file": "docs\\screenshots\\08-overlay-bar.png",
-      "bytes": 18913
+      "bytes": 19836
     }
   ],
   "consoleErrors": [],
@@ -73,7 +73,7 @@
         "rows": 4,
         "text": "00:00.00 / 00:30.00"
       },
-      "afterPlay": "00:00.71 / 00:30.00",
+      "afterPlay": "00:00.70 / 00:30.00",
       "advancedTracks": {
         "before": 4
       },

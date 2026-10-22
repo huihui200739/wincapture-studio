@@ -208,7 +208,7 @@ function ClipTab({
           <div className="wcs-empty" style={{ padding: '16px 8px' }}>
             <Icon name="info" size={18} />
             <p>在时间线上点选一个片段，即可裁剪、移动或删除它。</p>
-            <p style={{ color: 'var(--text-dim)', fontSize: 10.5 }}>提示：删除时间线片段不会删除源素材文件。</p>
+            <p style={{ color: 'var(--text-dim)', fontSize: 'var(--fs-aux)' }}>提示：删除时间线片段不会删除源素材文件。</p>
           </div>
         ) : (
           <>
@@ -339,7 +339,7 @@ function ClipTab({
         {[mic, system].filter(Boolean).map((track) => (
           <div key={track!.kind} style={{ marginBottom: 10 }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-              <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
+              <span style={{ fontSize: 'var(--fs-aux)', color: 'var(--text-soft)' }}>
                 {track!.kind === 'mic' ? '麦克风' : '系统声音'}
               </span>
               <button
@@ -1130,7 +1130,7 @@ function CanvasTab({
             aria-label="自定义背景色"
             value={canvas.background.startsWith('#') ? canvas.background : ''}
             placeholder="#101418"
-            style={{ width: 92, height: 24, fontSize: 10.5 }}
+            style={{ width: 92, height: 24, fontSize: 'var(--fs-aux)' }}
             onChange={(event) => {
               const value = event.target.value.trim();
               if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(value)) setCanvas({ background: value });

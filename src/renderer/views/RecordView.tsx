@@ -659,7 +659,7 @@ export function RecordView() {
                     <div style={{ display: 'grid', placeItems: 'center', height: '100%', color: 'var(--text-dim)' }}>
                       <div style={{ textAlign: 'center' }}>
                         <Icon name="eyeOff" size={22} />
-                        <div style={{ fontSize: 11.5, marginTop: 6 }}>摄像头已关闭</div>
+                        <div style={{ fontSize: 'var(--fs-aux)', marginTop: 6 }}>摄像头已关闭</div>
                       </div>
                     </div>
                   )}
@@ -795,7 +795,7 @@ export function RecordView() {
             </div>
             <div className="disk-row">
               <span>输出目录</span>
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)', textAlign: 'right', wordBreak: 'break-all' }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-aux)', color: 'var(--text-dim)', textAlign: 'right', wordBreak: 'break-all' }}>
                 {system?.videosPath ?? '—'}
               </span>
             </div>
@@ -835,68 +835,49 @@ export function RecordView() {
                 ]}
               />
             </Field>
-            <Toggle
-              checked={config.systemAudioEnabled}
-              onChange={(next) => updateConfig({ systemAudioEnabled: next })}
-              label="同时录制系统声音"
-              description="讲解演示时通常需要"
-            />
-            <Toggle
-              checked={config.microphoneEnabled}
-              onChange={(next) => updateConfig({ microphoneEnabled: next })}
-              label="同时录制麦克风"
-            />
-            <Toggle
-              checked={config.cameraEnabled}
-              onChange={(next) => updateConfig({ cameraEnabled: next })}
-              label="同时录制摄像头"
-            />
-            <div style={{ marginTop: 10 }}>
-              <InlineNote tone="info">
-                开始录制前只请求当前实际使用设备的授权。若系统拒绝，会给出可执行的重新授权指引。
-              </InlineNote>
-            </div>
+            <InlineNote tone="info">
+              设备开关只在左侧「声音」「摄像头」面板各有一处。右边不再重复，避免同一项出现两个开关。
+            </InlineNote>
           </Panel>
 
-          <Panel title="开始前检查" icon="shield">
-            <div className="kv-list">
-              <div className="kv-row">
-                <span className="kv-key">来源</span>
-                <span className="kv-value">
-                  {selectedSource ? (selectedSource.available ? '可用' : '不可用') : '未选择'}
-                </span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">麦克风</span>
-                <span className="kv-value">{config.microphoneEnabled ? '已启用' : '未启用'}</span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">系统声音</span>
-                <span className="kv-value">{config.systemAudioEnabled ? '已启用' : '未启用'}</span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">摄像头</span>
-                <span className="kv-value">{config.cameraEnabled ? '已启用' : '未启用'}</span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">磁盘</span>
-                <span className="kv-value">{diskInsufficient ? '不足' : pathCheck ? (pathCheck.writable ? '可写' : '不可写') : '检查中'}</span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">硬件编码</span>
-                <span className="kv-value">{system?.hardwareEncoding ? '可用' : '不可用（走软件编码）'}</span>
-              </div>
+          <Panel title="开始前检查" icon="shield" subtitle="状态一览">
+            <div className="check-chips">
+              <span className={cn('check-chip', selectedSource?.available ? 'is-ok' : selectedSource ? 'is-warn' : 'is-warn')}>
+                <Icon name={selectedSource?.available ? 'check' : 'warning'} size={12} />
+                来源 {selectedSource ? (selectedSource.available ? '可用' : '不可用') : '未选择'}
+              </span>
+              <span className={cn('check-chip', config.microphoneEnabled ? 'is-ok' : 'is-off')}>
+                <Icon name="mic" size={12} />
+                麦克风 {config.microphoneEnabled ? '开' : '关'}
+              </span>
+              <span className={cn('check-chip', config.systemAudioEnabled ? 'is-ok' : 'is-off')}>
+                <Icon name="volume" size={12} />
+                系统声音 {config.systemAudioEnabled ? '开' : '关'}
+              </span>
+              <span className={cn('check-chip', config.cameraEnabled ? 'is-ok' : 'is-off')}>
+                <Icon name="camera" size={12} />
+                摄像头 {config.cameraEnabled ? '开' : '关'}
+              </span>
+              <span className={cn('check-chip', diskInsufficient ? 'is-danger' : pathCheck && !pathCheck.writable ? 'is-danger' : 'is-ok')}>
+                <Icon name="disk" size={12} />
+                磁盘 {diskInsufficient ? '不足' : pathCheck ? (pathCheck.writable ? '可写' : '不可写') : '检查中'}
+              </span>
+              <span className={cn('check-chip', system?.hardwareEncoding ? 'is-ok' : 'is-off')}>
+                <Icon name="layers" size={12} />
+                {system?.hardwareEncoding ? '硬件编码' : '软件编码'}
+              </span>
             </div>
-            <div style={{ marginTop: 11 }}>
-              {recording ? (
-                <Button block variant="danger" icon="stop" loading={busy.capture} onClick={() => void stopRecording()}>
-                  停止录制并进入编辑器
-                </Button>
-              ) : (
-                <Button block variant="primary" size="lg" icon="record" disabled={!!blockedReason} onClick={beginCountdown}>
-                  开始录制（{config.countdownSeconds} 秒倒计时）
-                </Button>
-              )}
+            <div style={{ marginTop: 12 }}>
+              {/* 开始/停止只保留顶部一处主操作（§P0：一次操作即看清状态，不必滚动找按钮） */}
+              <div className="check-hint">
+                {blockedReason ? (
+                  <InlineNote tone="warn">{blockedReason}</InlineNote>
+                ) : (
+                  <span className="check-hint-text">
+                    <Icon name="check" size={13} /> 全部就绪，点右上角「开始录制」即可（{config.countdownSeconds} 秒倒计时）。
+                  </span>
+                )}
+              </div>
             </div>
           </Panel>
 

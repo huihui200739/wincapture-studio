@@ -4,16 +4,17 @@
 
 import { useEffect, useMemo, type ReactNode } from 'react';
 import { useApp, VIEWS, type ViewId } from './lib/store';
-import { Icon, IconButton, Badge, Kbd } from './components/ui';
-import { formatClock, formatDateTime, formatBytes } from './lib/format';
-import { ticksToSeconds } from './lib/format';
+import { Icon, IconButton, Badge } from './components/ui';
+import { formatClock, cn } from './lib/format';
 import { HomeView } from './views/HomeView';
 import { RecordView } from './views/RecordView';
 import { EditorView } from './views/EditorView';
 import { ExportView } from './views/ExportView';
 import { TutorialView } from './views/TutorialView';
 import { SettingsView } from './views/SettingsView';
-import { cn } from './lib/format';
+
+// 应用图标（public/app-icon.png，用户确认的白瓷叠帧稿）。用相对路径，兼容 file:// 加载。
+const APP_ICON_URL = './app-icon.png';
 
 function ToastStack() {
   const { toasts, dismissToast } = useApp();
@@ -46,9 +47,8 @@ function Rail() {
     <nav className="app-rail" aria-label="主导航">
       <div className="rail-brand">
         <div className="rail-logo" aria-hidden="true">
-          WC
+          <img src={APP_ICON_URL} alt="" width={28} height={28} />
         </div>
-        <span className="rail-brand-name">Studio</span>
       </div>
       <div className="rail-nav">
         {VIEWS.map((item) => (
@@ -123,58 +123,61 @@ function TopBar() {
 
       {view === 'editor' && project && (
         <div className="topbar-group">
-          <IconButton icon="undo" label={canUndo ? `撤销（${undo})` : '撤销（无可撤销操作）'} size="sm" onClick={undo} disabled={!canUndo} />
-          <IconButton icon="redo" label="重做" size="sm" onClick={redo} disabled={!canRedo} />
+          <IconButton icon="undo" label={canUndo ? `撤销（Ctrl+Z）` : '撤销（无可撤销操作）'} size="sm" onClick={undo} disabled={!canUndo} />
+          <IconButton icon="redo" label="重做（Ctrl+Y）" size="sm" onClick={redo} disabled={!canRedo} />
           <button type="button" className="wcs-btn is-sm" onClick={() => void save()} disabled={saving || !dirty}>
             {saving ? <span className="wcs-spinner" style={{ width: 12, height: 12 }} /> : <Icon name="save" size={13} />}
             {dirty ? '保存' : '已保存'}
           </button>
-          <span className="topbar-sub" style={{ fontSize: 10.5 }}>
+          <span className="topbar-saved-at">
             {savedAt ? `上次保存 ${new Date(savedAt).toLocaleTimeString('zh-CN')}` : dirty ? '有未保存修改' : '—'}
           </span>
           <div className="topbar-divider" />
         </div>
       )}
 
-      <div className="topbar-group">
-        <Badge tone={apiMode === 'native' ? 'ok' : 'warn'} title={apiMode === 'native' ? '已连接主进程' : '未检测到 window.wcs，使用内置示例数据'}>
-          {apiMode === 'native' ? '主进程已连接' : '示例数据模式'}
-        </Badge>
-      </div>
+      {apiMode === 'mock' && (
+        <div className="topbar-group">
+          <Badge tone="warn" title="未检测到 window.wcs，界面使用内置示例数据运行">
+            示例数据模式
+          </Badge>
+        </div>
+      )}
     </header>
   );
 }
 
+/**
+ * 状态栏（§P2）：正常状态只显示「已保存」这类用户能理解的事实。
+ * 进程连接、revision、内存、原生采集能力等内部信息移到设置页，
+ * 只有真正需要用户处理的异常才在这里露出。
+ */
 function StatusBar() {
-  const { apiMode, project, duration, systemInfo, recents, quality } = useApp();
+  const { project, duration, dirty, saving, systemInfo } = useApp();
   const durationText = useMemo(() => formatClock(duration), [duration]);
+  const saveText = saving ? '保存中…' : dirty ? '有未保存修改' : project ? '已保存' : '—';
+  const lowMemory = systemInfo ? systemInfo.freeMemoryBytes < 512 * 1024 * 1024 : false;
+
   return (
     <footer className="app-status" aria-label="状态栏">
       <span className="status-item">
-        <span className={cn('status-dot', apiMode === 'native' ? 'is-ok' : 'is-warn')} />
-        {apiMode === 'native' ? '原生采集可用' : '示例数据（未连接主进程）'}
-      </span>
-      <span className="status-item">
-        <Icon name="clock" size={11} />
-        工程时长 {durationText}
+        <span className={cn('status-dot', dirty ? 'is-warn' : 'is-ok')} />
+        {saveText}
       </span>
       {project && (
-        <span className="status-item">
-          版本 {project.revision} · {project.tracks.reduce((acc, t) => acc + t.clips.length, 0)} 个片段 · {project.effects.length} 个效果
+        <span className="status-item" title={project.name}>
+          <Icon name="clock" size={11} />
+          {durationText}
         </span>
       )}
-      {systemInfo && (
-        <span className="status-item">
-          <Icon name="disk" size={11} />
-          内存可用 {formatBytes(systemInfo.freeMemoryBytes)}
+      {lowMemory && (
+        <span className="status-item" style={{ color: 'var(--warn)' }}>
+          <Icon name="warning" size={11} />
+          可用内存偏低，长录制可能中断
         </span>
       )}
-      <span className="status-item">
-        <Icon name="screen" size={11} />
-        默认档位 {quality.label}
-      </span>
-      <span className="status-item" style={{ marginLeft: 'auto' }}>
-        {recents.length} 个最近工程 · {formatDateTime(Date.now())}
+      <span className="status-item" style={{ marginLeft: 'auto', color: 'var(--text-dim)' }}>
+        WinCapture Studio
       </span>
     </footer>
   );

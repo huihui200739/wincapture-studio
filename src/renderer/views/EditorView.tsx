@@ -45,9 +45,6 @@ export function EditorView() {
     undo,
     redo,
     save,
-    dirty,
-    canUndo,
-    canRedo,
     selectedClipId,
     selectClip,
     selectedEffectId,
@@ -63,25 +60,64 @@ export function EditorView() {
   const [timelineCollapsed, setTimelineCollapsed] = useState(false);
   const [drag, setDrag] = useState<DragState>({ kind: 'none' });
   const [scene, setScene] = useState<FrameScene | null>(null);
-  const stageRef = useRef<HTMLDivElement | null>(null);
-  const [stageRect, setStageRect] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [wrapSize, setWrapSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
 
   const { toDisplayRect, screenBox } = useSourceToDisplay(project ?? { ...emptyProjectFallback }, tick);
 
   const totalDuration = project ? timelineDuration(project) : 0;
 
-  // 舞台尺寸（用于把遮挡矩形映射到显示像素）
+  /**
+   * 预览 contain 尺寸（§P0）。
+   *
+   * 只把 canvas 的固有尺寸交给 CSS 的 max-width/max-height 是不够的：百分比高度在
+   * flex 行里没有确定参照高度，画布会被撑开并被容器裁掉（表现为上方大留白、下方
+   * 源画面与摄像头被截断）。这里按「容器可用宽高 + 输出画幅」显式算出 contain 盒，
+   * canvas 与遮挡层共用同一个盒子，横屏/竖屏/方形都能完整显示。
+   */
+  const outputAspect = useMemo(() => {
+    if (scene && scene.outputWidth > 0 && scene.outputHeight > 0) return scene.outputWidth / scene.outputHeight;
+    const aspect = project?.variants.find((v) => v.id === project.settings.activeVariantId)?.aspect;
+    return aspect && aspect[1] > 0 ? aspect[0] / aspect[1] : 16 / 9;
+  }, [scene, project]);
+
+  const stageFit = useMemo(() => {
+    const availW = Math.max(0, wrapSize.width);
+    const availH = Math.max(0, wrapSize.height);
+    if (availW <= 0 || availH <= 0) return { width: 0, height: 0 };
+    let width = availW;
+    let height = width / outputAspect;
+    if (height > availH) {
+      height = availH;
+      width = height * outputAspect;
+    }
+    return { width: Math.max(1, Math.floor(width)), height: Math.max(1, Math.floor(height)) };
+  }, [wrapSize, outputAspect]);
+
+  // 舞台可用尺寸：contain 计算的输入。视觉尺寸变化时重算，时间线折叠/展开也会跟着更新。
+  // 依赖 hasProject：没有工程时编辑器走空态分支，wrapRef 还是 null，
+  // 只写 [] 的话观察器永远不会挂上（表现为预览尺寸恒为 0）。
+  const hasProject = !!project;
   useEffect(() => {
-    const node = stageRef.current;
+    if (!hasProject) return;
+    const node = wrapRef.current;
     if (!node) return;
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      setStageRect({ width: Math.round(entry.contentRect.width), height: Math.round(entry.contentRect.height) });
-    });
+    const measure = () => {
+      const rect = node.getBoundingClientRect();
+      // 用内容盒（去掉 padding）作为可用区域
+      const style = getComputedStyle(node);
+      const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+      const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+      setWrapSize({
+        width: Math.max(0, Math.round(rect.width - padX)),
+        height: Math.max(0, Math.round(rect.height - padY)),
+      });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
     observer.observe(node);
     return () => observer.disconnect();
-  }, [project]);
+  }, [hasProject]);
 
   // 键盘快捷键
   useShortcuts(
@@ -365,23 +401,9 @@ export function EditorView() {
             />
           </div>
 
-          <div className="stage-toolbar-divider" />
-          <div className="stage-toolbar-group">
-            <IconButton icon="split" label="在播放头分割（Ctrl+B）" size="sm" onClick={splitAtPlayhead} />
-            <IconButton icon="trash" label="删除所选（Delete）" size="sm" variant="danger" onClick={deleteSelection} />
-          </div>
-
-          <div className="stage-toolbar-divider" />
-          <div className="stage-toolbar-group">
-            <IconButton icon="undo" label="撤销（Ctrl+Z）" size="sm" onClick={undo} disabled={!canUndo} />
-            <IconButton icon="redo" label="重做（Ctrl+Y）" size="sm" onClick={redo} disabled={!canRedo} />
-            <Button size="sm" variant="ghost" icon="save" onClick={() => void save()} disabled={!dirty}>
-              {dirty ? '保存' : '已保存'}
-            </Button>
-          </div>
-
           <div className="stage-toolbar-spacer" />
 
+          {/* 剪辑工具（分割/删除）集中在时间线工具栏，这里只保留播放与遮挡提示（§P1） */}
           <div className="stage-toolbar-group">
             <Badge tone="muted" title="在预览上拖拽即可框选遮挡区域">
               <Icon name="shield" size={11} /> 拖拽框选遮挡
@@ -390,15 +412,14 @@ export function EditorView() {
           </div>
         </div>
 
-        <div className="stage-canvas-wrap">
+        <div className="stage-canvas-wrap" ref={wrapRef}>
           <div
             className="stage-canvas-inner"
-            ref={stageRef}
+            style={{ width: stageFit.width, height: stageFit.height, cursor: drag.kind === 'creating' ? 'crosshair' : 'default' }}
             onPointerDown={onStagePointerDown}
             onPointerMove={onStagePointerMove}
             onPointerUp={onStagePointerUp}
             onPointerCancel={() => setDrag({ kind: 'none' })}
-            style={{ cursor: drag.kind === 'creating' ? 'crosshair' : 'default' }}
           >
             <PreviewCanvas project={project} tick={tick} onScene={setScene} maxWidth={1280} />
             <div className="stage-overlay-layer">

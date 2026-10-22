@@ -23,11 +23,15 @@ const TRACK_LABEL: Record<TrackKind, string> = {
   system: '系统声音',
 };
 
-const TRACK_COLOR: Record<TrackKind, string> = {
-  primaryVideo: 'linear-gradient(180deg, #2f6df6, #2757c4)',
-  camera: 'linear-gradient(180deg, #7b5cd6, #5f45b4)',
-  mic: 'linear-gradient(180deg, #2f9c72, #257a5a)',
-  system: 'linear-gradient(180deg, #2b8fa8, #22718a)',
+/**
+ * 轨道配色（§P1）：颜色只表达稳定的轨道类别，不靠渐变抢预览。
+ * 片段底色用低饱和中性色，类别色只出现在左侧色条与标签圆点上。
+ */
+const TRACK_STYLE: Record<TrackKind, { accent: string; background: string }> = {
+  primaryVideo: { accent: '#77a9ff', background: 'rgba(119, 169, 255, 0.16)' },
+  camera: { accent: '#b39ddb', background: 'rgba(179, 157, 219, 0.16)' },
+  mic: { accent: '#4fc08d', background: 'rgba(79, 192, 141, 0.16)' },
+  system: { accent: '#5fbccd', background: 'rgba(95, 188, 205, 0.16)' },
 };
 
 export interface TimelineProps {
@@ -258,7 +262,7 @@ export function Timeline({
           size="sm"
           onClick={onToggleCollapsed}
         />
-        <span style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 500 }}>时间线</span>
+        <span style={{ fontSize: 'var(--fs-aux)', color: 'var(--text-muted)', fontWeight: 500 }}>时间线</span>
         <Badge tone="muted">{`${project.tracks.reduce((acc, t) => acc + t.clips.length, 0)} 片段`}</Badge>
         <div className="stage-toolbar-divider" />
         <IconButton icon="split" label="在播放头分割（Ctrl+B）" size="sm" onClick={onSplitAtPlayhead} />
@@ -313,14 +317,14 @@ export function Timeline({
                     style={{
                       background:
                         row.kind === 'zoom'
-                          ? '#4c8dff'
+                          ? '#77a9ff'
                           : row.kind === 'privacy'
-                            ? '#ef5f5f'
+                            ? '#ff5c69'
                             : row.kind === 'step'
-                              ? '#45c08a'
+                              ? '#4fc08d'
                               : row.kind === 'marker'
-                                ? '#45c08a'
-                                : undefined,
+                                ? '#4fc08d'
+                                : TRACK_STYLE[row.kind as TrackKind].accent,
                     }}
                   />
                   <span>{row.label}</span>
@@ -448,7 +452,8 @@ export function Timeline({
                             style={{
                               left: tickToX(leftTick),
                               width,
-                              background: TRACK_COLOR[row.kind as TrackKind],
+                              background: TRACK_STYLE[row.kind as TrackKind].background,
+                              ['--clip-accent' as string]: TRACK_STYLE[row.kind as TrackKind].accent,
                             }}
                             role="button"
                             tabIndex={0}

@@ -135,7 +135,7 @@ function createMainWindow(): BrowserWindow {
     height: 900,
     minWidth: 1080,
     minHeight: 680,
-    backgroundColor: '#0b0f14',
+    backgroundColor: '#14161b',
     show: false,
     title: 'WinCapture Studio',
     autoHideMenuBar: true,
@@ -174,7 +174,7 @@ function createOverlayWindow(): BrowserWindow {
     skipTaskbar: true,
     alwaysOnTop: true,
     transparent: false,
-    backgroundColor: '#12161c',
+    backgroundColor: '#14161b',
     show: false,
     webPreferences: {
       preload: path.join(APP_ROOT, 'dist', 'main', 'preload.cjs'),
