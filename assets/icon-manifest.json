@@ -32,7 +32,12 @@
     "public/app-icon.png: Vite public 目录，构建后位于 dist/renderer/",
     "scripts/build-main.mjs: 构建时把 ICO 与 32/64/128 PNG 复制到 dist/assets/"
   ],
-  "packaging_integration": "pending_electron_builder",
+  "packaging_integration": "applied_electron_builder",
+  "packaging_targets": [
+    "electron-builder.yml: win.icon → EXE 图标",
+    "electron-builder.yml: nsis.installerIcon / uninstallerIcon / installerHeaderIcon → 安装包与卸载器",
+    "scripts/verify-package.cjs: 比对内嵌图标与源图的像素分布，防止回落到默认 Electron 图标"
+  ],
   "known_limitations": [
     "Minor alpha-edge artifacts remain from the accepted provisional artwork."
   ]

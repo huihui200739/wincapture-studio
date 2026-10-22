@@ -1,0 +1,68 @@
+# electron-builder 配置
+#
+# 路径约定（与源码里的解析逻辑对齐，改动前先读这三处）：
+#   electron/main.ts       APP_ROOT = __dirname/../..  → 打包后 = resources/app.asar
+#                          RENDERER_DIST = APP_ROOT/dist/renderer
+#                          appIconPath() = APP_ROOT/dist/assets/app-icon.ico
+#   electron/capture/workers.ts
+#                          isPackaged 时 base = dirname(app.getAppPath())/native
+#                          即 resources/native → 必须用 extraResources 放进去
+appId: com.huihui.wincapture-studio
+productName: WinCapture Studio
+copyright: Copyright © 2026 WinCapture Studio
+
+directories:
+  output: release
+  buildResources: build
+
+# 只打包运行必需的东西：构建产物 + 运行时依赖。
+# 源码、测试、文档、脚本都不进包（它们不影响运行，只会让包变大）。
+files:
+  - dist/main/**/*
+  - dist/renderer/**/*
+  - dist/assets/**/*
+  - package.json
+  - '!**/*.map'
+  - '!**/*.ts'
+  - '!**/*.md'
+
+# 原生采集进程必须落在 resources/native（见 workers.ts 的 isPackaged 分支）。
+# 放进 asar 里无法被 spawn，所以走 extraResources。
+extraResources:
+  - from: dist/native
+    to: native
+    filter: ['**/*.exe']
+  # 运行时窗口图标：appIconPath() 从 app.asar/dist/assets 读取，
+  # 但 installer/uninstaller 需要一份可直接引用的副本。
+  - from: assets/app-icon.ico
+    to: app-icon.ico
+
+# mediabunny 是 ESM，主进程用动态 import 加载。
+# asar 内的 ESM 动态导入在部分 Electron 版本上会失败，解包更稳。
+asarUnpack:
+  - node_modules/mediabunny/**
+
+win:
+  icon: assets/app-icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+  # 没有代码签名证书，明确关掉签名，避免构建时报「无法签名」。
+  signAndEditExecutable: true
+  artifactName: ${productName}-${version}-Setup.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: WinCapture Studio
+  installerIcon: assets/app-icon.ico
+  uninstallerIcon: assets/app-icon.ico
+  installerHeaderIcon: assets/app-icon.ico
+  # 卸载时保留用户工程与录制产物（删数据是破坏性操作，交给用户自己决定）
+  deleteAppDataOnUninstall: false
+
+# 不生成自动更新元数据（没有更新服务器）
+publish: null

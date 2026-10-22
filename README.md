@@ -31,6 +31,35 @@ npm start         # 启动应用
 
 受限制环境（AppData 不可写等）：设置环境变量 `WCS_USER_DATA=<目录>` 指定数据目录；工程输出目录会自动从「视频」回退到数据目录。
 
+## 打包发布
+
+```powershell
+npm run pack            # 构建 + 生成 NSIS 安装包 → release/WinCapture Studio-0.1.0-Setup.exe
+npm run pack:dir        # 只出 release/win-unpacked（调试用，跳过 NSIS，快很多）
+npm run verify:package  # 验收产物：图标内嵌、native 进程、asar 内容、安装包完整性
+npm run release         # pack + verify:package
+```
+
+产物（实测）：安装包 **109MB**，`win-unpacked` 主 EXE **238MB**，解压后约 **384MB**。
+
+打包走 `scripts/package.mjs` 而不是直接调 electron-builder，原因是本机环境下有两处坑：
+npm 会把 `NPM_CONFIG_ELECTRON_BUILDER_BINARIES_MIRROR` 当成自己的未知配置丢弃，
+而 `cmd /c` 启动的子进程无法稳定继承 PowerShell 的 `$env:`。脚本在同一进程内 spawn
+并显式传 env，同时把缓存目录固定在 `.tmp/eb-cache`、下载源指向国内镜像
+（GitHub releases 在本机 `connect ETIMEDOUT`）。
+
+`electron-builder.yml` 里的路径约定与源码强耦合，改动前先读这三处：
+
+| 源码 | 打包后期望位置 | 配置项 |
+| --- | --- | --- |
+| `main.ts` `APP_ROOT = __dirname/../..` | `resources/app.asar` | `files` |
+| `workers.ts` `dirname(appPath)/native` | `resources/native/{grabber,audio}.exe` | `extraResources` |
+| `main.ts` `appIconPath()` | `app.asar/dist/assets/app-icon.ico` | `files` + `build-main.mjs` 复制 |
+
+图标三处都已接入同一图稿：主窗口/悬浮条（运行时）、EXE（`win.icon`）、安装包与卸载器
+（`nsis.installerIcon` 等）。`verify:package` 会比对内嵌图标与 `assets/app-icon-32.png`
+的像素分布，防止误用默认 Electron 图标。
+
 ## 测试与验证
 
 ```powershell
@@ -101,8 +130,9 @@ src/
 - 1080p 录制总工作集 2136MB，未达到 §16.2 的 1.2GB 目标（原因见上一节）
 - 浏览器引擎要求关闭 GPU 沙箱（`disable-gpu-sandbox`，已在应用内设置）：受限环境下隐藏窗口连续硬件编码否则会让渲染进程崩溃
 - 纯音频导出（M4A）为 P1 能力，当前版本未启用
-- 图标：运行时窗口 / 任务栏 / 界面品牌位已接入用户确认稿；EXE 与安装包图标需要打包配置
-  （electron-builder 等），本仓库暂无打包配置，未接入
+- 图标：运行时窗口 / 任务栏 / 界面品牌位、EXE、安装包与卸载器都已接入用户确认稿（见「打包发布」）
+- 安装包未做代码签名：没有证书，Windows SmartScreen 首次运行会提示「未知发布者」。
+  内网分发可接受；对外分发需要购买代码签名证书并在 `electron-builder.yml` 配置 `win.certificateFile`
 
 ## 第三方组件
 

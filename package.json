@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "WinCapture Studio - Windows 录屏与教程制作工具",
+  "author": "WinCapture Studio",
+  "license": "UNLICENSED",
   "main": "dist/main/main.cjs",
   "scripts": {
     "build:native": "node scripts/build-native.mjs",
@@ -21,7 +23,11 @@
     "verify:layout": "electron --no-sandbox scripts/verify-layout.cjs",
     "verify:icon": "electron --no-sandbox scripts/verify-icon.cjs",
     "verify:overlay": "electron --no-sandbox scripts/verify-overlay.cjs",
-    "verify:all": "npm run verify:ui && npm run verify:stage-fit && npm run verify:layout && npm run verify:overlay && npm run verify:icon"
+    "verify:all": "npm run verify:ui && npm run verify:stage-fit && npm run verify:layout && npm run verify:overlay && npm run verify:icon",
+    "pack": "npm run build && node scripts/package.mjs",
+    "pack:dir": "npm run build && node scripts/package.mjs --dir",
+    "verify:package": "node scripts/verify-package.cjs",
+    "release": "npm run pack && npm run verify:package"
   },
   "dependencies": {
     "mediabunny": "^1.62.0"
@@ -33,6 +39,7 @@
     "@vitejs/plugin-react": "^5.0.0",
     "@vitest/coverage-v8": "^3.2.7",
     "electron": "^45.0.0",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.25.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
