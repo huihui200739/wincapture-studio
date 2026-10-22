@@ -1,0 +1,121 @@
+{
+  "ok": true,
+  "shots": [
+    {
+      "name": "09-cursor",
+      "label": "编辑器 · 属性面板「光标」页签：大小 / 点击反馈 / 显示 / 烧录光标（避免双光标）",
+      "file": "docs\\screenshots\\09-cursor.png",
+      "bytes": 270838
+    },
+    {
+      "name": "10-overlay-memo",
+      "label": "录制悬浮条（460×132）· 备忘录展开：绝对定位浮层，不撑开主布局，内容只存本机",
+      "file": "docs\\screenshots\\10-overlay-memo.png",
+      "bytes": 22644
+    }
+  ],
+  "consoleErrors": [],
+  "checks": {
+    "tabsBefore": [
+      "片段",
+      "运镜",
+      "遮挡",
+      "光标",
+      "画布"
+    ],
+    "cursorTab": {
+      "hasBody": true,
+      "textHead": "光标效果还没有光标效果。启用后可调整光标大小与点击反馈。启用光标效果光标由事件轨在成片上叠加绘制。如果录制时源画面已经烧录了系统光标，请打开「烧录光标」，避免出现双光标。",
+      "sliders": 0,
+      "toggles": 0,
+      "notes": 0,
+      "buttons": [
+        "启用光标效果"
+      ],
+      "mentionsDualCursor": true
+    },
+    "enableCursor": {
+      "enabled": true
+    },
+    "cursorAfterEnable": {
+      "sliders": 2,
+      "toggles": 2,
+      "sliderLabels": [
+        "光标大小",
+        "点击反馈强度"
+      ],
+      "toggleLabels": [
+        "显示光标",
+        "烧录光标"
+      ],
+      "mentionsDualCursor": true,
+      "textHead": "光标效果00:00.00 → 00:30.00显示光标关闭后成片不绘制叠加光标；若源画面本身没有光标，观看者将看不到指针。烧录光标源画面已含系统光标时打开此项：直接使用源画面自带的光标，后期不再叠加绘制，避免出现双光标。光标大小26 px输出画面上的光标尺寸；录制教程建议 24–40 px，过大容易遮挡内容。点击反馈强度1.0×点击时波纹的强度倍数；0 表示点击不产生波纹。双光标检查当前为叠加模式：光标由事件轨绘制。若录制时未关闭系统光标（源画面已烧录光标），请打开「烧录光标」，否则成片会出现双光标。删除光标效果"
+    },
+    "burnInBehaviour": {
+      "before": [
+        false,
+        false
+      ]
+    },
+    "burnInAfter": {
+      "disabled": [
+        true,
+        true
+      ],
+      "allDisabled": true,
+      "disabledCount": 2,
+      "total": 2,
+      "textHasReason": true
+    },
+    "undoAfterBurnIn": {
+      "disabled": [
+        false,
+        false
+      ],
+      "anyEnabled": true
+    },
+    "overlayBar": {
+      "hasBar": true,
+      "buttons": [
+        "暂停录制|暂停",
+        "添加标记|标记",
+        "展开备忘录|2",
+        "停止录制|停止"
+      ],
+      "memoOpen": false,
+      "barWidth": 444,
+      "scrollWidth": 460,
+      "innerWidth": 460
+    },
+    "memoOpen": {
+      "hasPopover": true,
+      "hasTextarea": true,
+      "textareaLabel": "备忘录内容",
+      "placeholder": "记录要点，每行一条。添加标记（Ctrl+Alt+M）时把当前行作为标记备注。",
+      "popoverRect": {
+        "x": 8,
+        "y": 8,
+        "w": 444,
+        "h": 120
+      },
+      "barHeight": 40,
+      "scrollWidth": 460,
+      "innerWidth": 460,
+      "overflowsHorizontally": false,
+      "overflowsVertically": false
+    },
+    "memoTyping": {
+      "value": "第一行：打开新建客户表单\n第二行：填写联系人信息",
+      "stored": "第一行：打开新建客户表单\n第二行：填写联系人信息",
+      "storedOpen": "1"
+    },
+    "memoCollapsed": {
+      "hasPopover": false,
+      "barHeight": 40,
+      "scrollWidth": 460,
+      "innerWidth": 460
+    }
+  },
+  "notes": [],
+  "consoleTotal": 6
+}
