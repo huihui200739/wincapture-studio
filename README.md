@@ -38,6 +38,7 @@ npm test                    # 453 个领域层单元测试（含 5 处固定种�
 npm run typecheck           # TypeScript 全仓类型检查
 npm run verify:capture      # GDI/WASAPI 采集探针
 npm run verify:e2e          # 合成帧 → 编码 → 解封装校验
+npm run verify:all          # 界面截图 + 预览适配 + 布局/缩放 + 图标接入
 ```
 
 自动化探针（无需人工干预，真实跑完整链路）：
@@ -45,6 +46,9 @@ npm run verify:e2e          # 合成帧 → 编码 → 解封装校验
 | 探针 | 环境变量 | 验证内容 |
 |---|---|---|
 | 界面截图 | `WCS_SELFTEST=screenshot` | 主进程 + 真实 IPC + 界面渲染，输出截图与 DOM 统计 |
+| 预览适配 | `npm run verify:stage-fit` | 横屏/方形/竖屏 contain 完整显示、遮挡层同矩形、时间线折叠后仍居中 |
+| 布局与缩放 | `npm run verify:layout` | 1366×768 首屏可见「开始录制」、无重复开关、长文案不粘连、200% 缩放不裁切 |
+| 图标接入 | `npm run verify:icon` | ICO 九档尺寸完整、应用内品牌图真实解码、favicon 存在 |
 | 录制链路 | `WCS_RECORDER_PROBE=1` | 真实 GDI/WASAPI 采集 → 分段编码 → 工程落盘 → journal/指针日志 |
 | 端到端 | `WCS_E2E_PROBE=1` | 录制 → 工程 → 导出 1080p MP4（含画面内容检查）→ 教程包 |
 | 性能基准 | `WCS_PERF_PROBE=1` | 对照 §16.2 的全部指标（首帧延迟、丢帧率、音画偏差、尾部损失、工作集、导出速度） |
@@ -97,6 +101,8 @@ src/
 - 1080p 录制总工作集 2136MB，未达到 §16.2 的 1.2GB 目标（原因见上一节）
 - 浏览器引擎要求关闭 GPU 沙箱（`disable-gpu-sandbox`，已在应用内设置）：受限环境下隐藏窗口连续硬件编码否则会让渲染进程崩溃
 - 纯音频导出（M4A）为 P1 能力，当前版本未启用
+- 图标：运行时窗口 / 任务栏 / 界面品牌位已接入用户确认稿；EXE 与安装包图标需要打包配置
+  （electron-builder 等），本仓库暂无打包配置，未接入
 
 ## 第三方组件
 

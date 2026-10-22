@@ -15,7 +15,13 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "verify:capture": "node scripts/probe-grabber.mjs && node scripts/probe-audio.mjs",
-    "verify:e2e": "npm run build && electron --no-sandbox scripts/verify-e2e.cjs"
+    "verify:e2e": "npm run build && electron --no-sandbox scripts/verify-e2e.cjs",
+    "verify:ui": "electron --no-sandbox scripts/verify-ui.cjs",
+    "verify:stage-fit": "electron --no-sandbox scripts/verify-stage-fit.cjs",
+    "verify:layout": "electron --no-sandbox scripts/verify-layout.cjs",
+    "verify:icon": "electron --no-sandbox scripts/verify-icon.cjs",
+    "verify:overlay": "electron --no-sandbox scripts/verify-overlay.cjs",
+    "verify:all": "npm run verify:ui && npm run verify:stage-fit && npm run verify:layout && npm run verify:overlay && npm run verify:icon"
   },
   "dependencies": {
     "mediabunny": "^1.62.0"
