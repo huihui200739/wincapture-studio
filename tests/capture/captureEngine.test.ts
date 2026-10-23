@@ -39,6 +39,7 @@ interface EngineInternals {
   micPackets: AudioPacket[];
   systemPackets: AudioPacket[];
   pendingSegments: SegmentView[];
+  pointerEvents: { tick: number; kind: string; x: number; y: number; button?: number }[];
   grabber: { frequency: bigint; stop: () => Promise<void>; captureBounds?: { x: number; y: number; width: number; height: number } } | null;
   normalizedPointer(x: number, y: number): { x: number; y: number };
   audio: null;
@@ -387,4 +388,36 @@ describe('CaptureEngine: 状态机复位（第二场录制可开始）', () => {
     const { engine } = makeEngine();
     expect(() => engine.addMarker('x')).toThrowError(/无法添加标记/);
   });
+});
+
+it('uses click QPC and source coordinates, excluding pause, pre-roll and outside-source input', () => {
+  const { engine, internals } = makeEngine();
+  internals.session = makeSession('test'); internals.state = 'Recording'; internals.clock.setZero(100_000_000);
+  internals.grabber = { frequency: FREQ, stop: async () => {}, captureBounds: { x: -1920, y: 100, width: 1920, height: 1080 } };
+  const event = { qpc: 110_000_000n, kind: 'down' as const, x: -960, y: 640, button: 2 };
+  engine.recordPointerEvent(event, FREQ);
+  internals.clock.pause(120_000_000); internals.clock.resume(140_000_000);
+  engine.recordPointerEvent({ ...event, qpc: 130_000_000n }, FREQ);
+  engine.recordPointerEvent({ ...event, qpc: 99_000_000n }, FREQ);
+  engine.recordPointerEvent({ ...event, qpc: 150_000_000n, x: 100 }, FREQ);
+  engine.recordPointerEvent({ ...event, qpc: 150_000_000n, kind: 'up' }, FREQ);
+  expect(internals.pointerEvents.map(({ tick, kind, x, y, button }) => ({ tick, kind, x, y, button }))).toEqual([
+    { tick: 10_000_000, kind: 'down', x: 0.5, y: 0.5, button: 2 },
+    { tick: 30_000_000, kind: 'up', x: 0.5, y: 0.5, button: 2 },
+  ]);
+});
+
+it('filters covered windows and maps clicks with the live target window geometry', () => {
+  const { engine, internals } = makeEngine();
+  internals.session = makeSession('test', { sourceKind: 'window', sourceId: 'window:100' });
+  internals.state = 'Recording'; internals.clock.setZero(100_000_000);
+  internals.grabber = { frequency: FREQ, stop: async () => {}, captureBounds: { x: 0, y: 0, width: 1920, height: 1080 } };
+  const event = { qpc: 110_000_000n, kind: 'down' as const, x: -500, y: 350, button: 0,
+    hwnd: '200', bounds: { x: -1000, y: 100, width: 1000, height: 500 } };
+  engine.recordPointerEvent(event, FREQ);
+  expect(internals.pointerEvents).toHaveLength(0);
+  engine.recordPointerEvent({ ...event, hwnd: '100' }, FREQ);
+  expect(internals.pointerEvents).toHaveLength(1);
+  expect(internals.pointerEvents[0].x).toBeCloseTo(0.5);
+  expect(internals.pointerEvents[0].y).toBeCloseTo(0.5);
 });

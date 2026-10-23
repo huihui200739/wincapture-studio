@@ -1,0 +1,10 @@
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { ROOT, useLocalTempDir } from './lib/local-temp.mjs';
+useLocalTempDir('performance');
+const env = { ...process.env, WCS_PERF_PROBE: '1', WCS_PERF_SECONDS: process.env.WCS_PERF_SECONDS || '20', WCS_USER_DATA: path.join(ROOT, '.tmp', 'performance', 'user-data') };
+delete env.ELECTRON_RUN_AS_NODE;
+const child = spawn(path.join(ROOT, 'node_modules', 'electron', 'dist', 'electron.exe'), ['--no-sandbox', ROOT], { env, cwd: ROOT, windowsHide: true, stdio: 'inherit' });
+const timer = setTimeout(() => { child.kill(); process.exitCode = 1; }, 120_000);
+child.once('error', error => { clearTimeout(timer); console.error(error); process.exitCode = 1; });
+child.once('exit', code => { clearTimeout(timer); process.exitCode = code ?? 1; });

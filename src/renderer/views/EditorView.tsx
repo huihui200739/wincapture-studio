@@ -136,10 +136,10 @@ export function EditorView() {
    * canvas 与遮挡层共用同一个盒子，横屏/竖屏/方形都能完整显示。
    */
   const outputAspect = useMemo(() => {
-    if (scene && scene.outputWidth > 0 && scene.outputHeight > 0) return scene.outputWidth / scene.outputHeight;
     const aspect = project?.variants.find((v) => v.id === project.settings.activeVariantId)?.aspect;
+    // Geometry must follow the project even before the next asynchronous preview draw.
     return aspect && aspect[1] > 0 ? aspect[0] / aspect[1] : 16 / 9;
-  }, [scene, project]);
+  }, [project]);
 
   const stageFit = useMemo(() => {
     const availW = Math.max(0, wrapSize.width);
@@ -177,7 +177,7 @@ export function EditorView() {
     const observer = new ResizeObserver(measure);
     observer.observe(node);
     return () => observer.disconnect();
-  }, [hasProject]);
+  }, [hasProject, timelineCollapsed]);
 
   // 键盘快捷键
   useShortcuts(

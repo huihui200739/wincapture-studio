@@ -24,6 +24,7 @@ import {
   protocol,
   net,
   desktopCapturer,
+  webContents,
   type OpenDialogOptions,
   type SaveDialogOptions,
 } from 'electron';
@@ -40,6 +41,22 @@ import type { Project } from '../src/domain/project';
 import type { PointerLog } from '../src/domain/types';
 import { ProjectStore, createProject, hashFile, isPathInside, newProjectId } from './projectStore';
 import { CaptureEngine, type RecordSession } from './capture/captureEngine';
+import { DesktopVideoSource } from './capture/desktopCapture';
+const desktopSources = new Map<number, { worker: DesktopVideoSource; source: Electron.DesktopCapturerSource }>();
+interface RecorderReply { ok: boolean; data?: Uint8Array; mp4?: string; frames?: number; encoder?: string; durationUs?: number; error?: string }
+const recorderJobs = new Map<number, { sender: number; finish(result: RecorderReply): void }>();
+let recorderJobSequence = 0;
+function requestRecorderSegment(win: BrowserWindow, payload: unknown): Promise<RecorderReply> {
+  return new Promise((resolve, reject) => {
+    const id = ++recorderJobSequence;
+    const cleanup = () => { clearTimeout(timer); recorderJobs.delete(id); win.removeListener('closed', closed); };
+    const closed = () => { cleanup(); reject(new Error('录制编码窗口已关闭')); };
+    const timer = setTimeout(() => { cleanup(); reject(new Error('录制分段编码超过 30 秒')); }, 30_000);
+    recorderJobs.set(id, { sender: win.webContents.id, finish: result => { cleanup(); resolve(result); } });
+    win.once('closed', closed);
+    try { win.webContents.send(IPC.recorderSegment, { id, payload }); } catch (error) { cleanup(); reject(error); }
+  });
+}
 import { CameraCoordinator } from './capture/cameraCapture';
 import { listAudioDevices, resolveWorkerPaths } from './capture/workers';
 
@@ -832,6 +849,22 @@ function buildEngine(): CaptureEngine {
   const created = new CaptureEngine(
     workers,
     {
+      modernCapture: async (config, region, fps) => {
+        const list = await desktopCapturer.getSources({ types: [config.sourceKind === 'window' ? 'window' : 'screen'], thumbnailSize: { width: 0, height: 0 } });
+        const display = screen.getAllDisplays()[Number(config.sourceId.split(':')[1])];
+        const source = list.find(item => config.sourceKind === 'window' ? item.id.startsWith(config.sourceId + ':') : item.display_id === String(display?.id));
+        if (!source) throw new Error('所选来源不支持现代采集');
+        const worker = new DesktopVideoSource({ clockExe: workers.grabberExe, ready: waitForReady, createWindow: () => {
+          const win = new BrowserWindow({ show: false, width: 640, height: 360, webPreferences: { preload: path.join(APP_ROOT, 'dist', 'main', 'preload.cjs'), sandbox: false, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
+          const id = win.webContents.id; desktopSources.set(id, { worker, source }); win.once('closed', () => desktopSources.delete(id));
+          loadRenderer(win, '#camera-desktop'); return win;
+        } }, region, { width: region.outputWidth, height: region.outputHeight, fps,
+          sourceWidth: display ? screen.dipToScreenRect(null, display.bounds).width : region.width,
+          sourceHeight: display ? screen.dipToScreenRect(null, display.bounds).height : region.height,
+          region: config.sourceKind === 'screen' && display ? { x: region.x - screen.dipToScreenRect(null, display.bounds).x,
+            y: region.y - screen.dipToScreenRect(null, display.bounds).y, width: region.width, height: region.height } : undefined });
+        return worker;
+      },
       onStatus: (status) => {
         lastStatus = status;
         send(IPC.captureStatus, status);
@@ -842,50 +875,10 @@ function buildEngine(): CaptureEngine {
         const win = createRecorderWindow();
         await waitForReady(win);
 
-        // 帧序列化必须分批 + 让出事件循环。
-        //
-        // 为什么：一段 1080p/2s 有 60 张 JPEG（每张 100~300KB），
-        // 一次性 toString('base64') + JSON.stringify 是几百毫秒的纯同步操作，
-        // 会完全堵死主进程事件循环。而 grabber 的帧是通过管道读到主进程的，
-        // 事件循环一堵，管道读取就滞后，采集端只能丢帧 ——
-        // 实测采集帧率从 30fps 掉到 25fps、录制覆盖率只有 88%。
-        //
-        // 分批处理（每批 8 帧）+ 每批后 setImmediate，让管道 IO 有机会被处理。
-        //
-        // 同时直接拼 JS 源码，不再先建 frames 数组再 JSON.stringify：
-        // 后者会让「原始 Buffer + base64 字符串 + 序列化结果」三份同时驻留，
-        // 一段 1080p 就能瞬时占用数百 MB（实测主进程峰值 857MB）。
-        const BATCH = 8;
-        const parts: string[] = [
-          `{index:${info.index},startTick:${info.startTick},durationTicks:${info.durationTicks},` +
-            `width:${info.width},height:${info.height},fps:${info.fps},frames:[`,
-        ];
-        for (let i = 0; i < info.frames.length; i++) {
-          const frame = info.frames[i];
-          parts.push(`${i > 0 ? ',' : ''}{mediaTick:${frame.mediaTick},jpeg:"${frame.jpeg.toString('base64')}"}`);
-          if ((i + 1) % BATCH === 0) {
-            await new Promise<void>((resolve) => setImmediate(resolve));
-          }
-        }
-        parts.push(
-          `],audio:{mic:${JSON.stringify(serializeAudio(info.audio.mic))},` +
-            `system:${JSON.stringify(serializeAudio(info.audio.system))}}}`,
-        );
-        const payloadSource = parts.join('');
-        // parts 里都是临时字符串，拼完即可释放
-        parts.length = 0;
-
-        const result = (await win.webContents.executeJavaScript(
-          `(async () => {
-             try {
-               if (!window.__wcsRecorder) throw new Error('录制编码运行时未就绪（window.__wcsRecorder 缺失）');
-               return await window.__wcsRecorder.encodeSegment(${payloadSource});
-             } catch (e) {
-               return { ok: false, error: String((e && e.stack) || e) };
-             }
-           })()`,
-          true,
-        )) as { ok: boolean; mp4?: string; frames?: number; encoder?: string; durationUs?: number; error?: string };
+        // Binary IPC avoids base64 and JavaScript-source copies of every JPEG and PCM packet.
+        const result = await requestRecorderSegment(win, { index: info.index, startTick: info.startTick,
+          durationTicks: info.durationTicks, width: info.width, height: info.height, fps: info.fps,
+          binary: true, frames: info.frames, audio: { mic: [], system: [] } });
         if (!result?.ok) {
           throw new AppError({
             code: 'E_ENCODER_UNAVAILABLE',
@@ -895,22 +888,14 @@ function buildEngine(): CaptureEngine {
             detail: result?.error,
           });
         }
-        parts.length = 0;
         const output = {
-          mp4: result.mp4 ? Buffer.from(result.mp4, 'base64') : null,
+          mp4: result.data ? Buffer.from(result.data) : result.mp4 ? Buffer.from(result.mp4, 'base64') : null,
           frames: result.frames ?? 0,
           encoder: result.encoder ?? 'unknown',
           durationUs: result.durationUs ?? 0,
         };
 
-        // 每段完成后主动收缩主进程堆。
-        //
-        // 一段 1080p/2s 的编解码过程会在主进程留下原始 JPEG Buffer、
-        // base64 字符串中间量、以及返回的 MP4 base64 字符串，合计可达数十 MB。
-        // V8 默认延迟回收，连续录制时段段叠加，实测主进程峰值 1.2GB、进程树 2.6GB，
-        // 超出 §16.2「总工作集 ≤1.2GB」。
-        // 这里在段边界主动触发一次 GC（需 --expose-gc，见 startApp），
-        // 把峰值压回正常水位。
+        // 在分段边界回收已交付的 JPEG/MP4 缓冲，避免 V8 延迟回收导致工作集堆积。
         const gc = (globalThis as { gc?: () => void }).gc;
         if (typeof gc === 'function') {
           setTimeout(() => {
@@ -967,9 +952,10 @@ function buildEngine(): CaptureEngine {
         sendAppEvent('capture-ended', { reason });
       },
       // 摄像头分段（R04）：由 CameraCoordinator 在独立隐藏窗口里采集并落盘
-      commitCameraSegment: async (projectPath, index, durationTicks, fps) => {
+      cameraClock: async clock => { await camera?.syncClock(clock); },
+      commitCameraSegment: async (projectPath, index, durationTicks, fps, startTick) => {
         if (!camera) return null;
-        return camera.commitSegment(projectPath, index, durationTicks, fps);
+        return camera.commitSegment(projectPath, index, durationTicks, fps, startTick);
       },
     },
     {
@@ -995,16 +981,6 @@ function buildEngine(): CaptureEngine {
     return source?.available ? source : null;
   };
   return created;
-}
-
-function serializeAudio(packets: { startFrame: number; rms: number; qpc: bigint; left: Float32Array; right: Float32Array }[]) {
-  return packets.map((p) => ({
-    startFrame: p.startFrame,
-    rms: p.rms,
-    qpc: p.qpc.toString(),
-    left: Array.from(p.left),
-    right: Array.from(p.right),
-  }));
 }
 
 /**
@@ -1211,7 +1187,9 @@ function closeOverlayWindow(): void {
 /** 关闭摄像头协调器与隐藏窗口（停止录制后必须调用，否则指示灯常亮）。 */
 async function closeCamera(): Promise<void> {
   const coordinator = camera;
+  const win = cameraWindow;
   camera = null;
+  cameraWindow = null;
   if (coordinator) {
     try {
       await coordinator.close();
@@ -1219,8 +1197,6 @@ async function closeCamera(): Promise<void> {
       console.warn('[camera] 关闭失败', error);
     }
   }
-  const win = cameraWindow;
-  cameraWindow = null;
   if (win && !win.isDestroyed()) {
     try {
       win.destroy();
@@ -1401,6 +1377,7 @@ function validateCaptureConfig(raw: unknown): CaptureConfig {
   const cameraDeviceId = optionalDevice(config.cameraDeviceId, 'cameraDeviceId');
   return {
     sourceId,
+    backend: config.backend === 'wgc' || config.backend === 'compatibility' ? config.backend : 'auto',
     sourceKind,
     qualityId: quality.id,
     fps: { num: Math.round(fpsNum), den: Math.round(fpsDen) },
@@ -1500,6 +1477,22 @@ async function loadProjectForOpen(projectPath: string): Promise<{ path: string; 
 // ---------------------------------------------------------------------------
 
 function registerIpc(): void {
+  ipcMain.on(IPC.recorderResult, (event, reply: { id?: number; result?: RecorderReply }) => {
+    const job = reply && typeof reply.id === 'number' ? recorderJobs.get(reply.id) : undefined;
+    if (job && event.sender.id === job.sender && reply.result && typeof reply.result.ok === 'boolean') job.finish(reply.result);
+  });
+  ipcMain.on(IPC.captureDesktopFrame, (event, packet: unknown) => { desktopSources.get(event.sender.id)?.worker.accept(packet); });
+  handleFor(IPC.captureCameraPreview, ['main'], async (enabled: unknown, deviceId: unknown) => {
+    if (typeof enabled !== 'boolean' || (deviceId !== undefined && (typeof deviceId !== 'string' || deviceId.length > 500))) throw new Error('摄像头预览参数无效');
+    if (!enabled) {
+      if (!captureStartInFlight && !currentSession && !ACTIVE_CAPTURE_STATES.has(engine.getState())) await closeCamera();
+      return { ok: true };
+    }
+    const coordinator = ensureCamera();
+    if (captureStartInFlight && !coordinator.getStatus().active) return { ok: false, error: '摄像头正在启动' };
+    if (!currentSession && !captureStartInFlight && !await coordinator.open(deviceId as string | undefined)) return { ok: false, error: coordinator.getStatus().reason ?? '摄像头不可用' };
+    return coordinator.snapshot();
+  });
   // ---- 采集 ----
   handleFor(IPC.captureListSources, ['main'], async (): Promise<CaptureSourceInfo[]> => {
     const displays = screen.getAllDisplays();
@@ -2377,8 +2370,13 @@ function startApp(): void {
     });
     session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
       const url = webContents?.getURL?.() ?? '';
-      return ['media', 'audioCapture', 'videoCapture'].includes(permission) && isInternalUrl(url);
+      return ['media', 'audioCapture', 'videoCapture', 'display-capture'].includes(permission) && isInternalUrl(url);
     });
+    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+      const contents = request.frame ? webContents.fromFrame(request.frame) : undefined;
+      const capture = contents ? desktopSources.get(contents.id) : undefined;
+      callback(capture ? { video: capture.source } : {});
+    }, { useSystemPicker: false });
 
     registerMediaProtocol();
     registerIpc();

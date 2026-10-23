@@ -98,6 +98,7 @@ export const QUALITY_PROFILES: QualityProfile[] = [
 ];
 
 export interface CaptureConfig {
+  backend?: 'auto' | 'wgc' | 'compatibility';
   sourceId: string;
   sourceKind: 'screen' | 'window';
   qualityId: string;
@@ -217,6 +218,10 @@ export const IPC = {
   /** 显示器枚举（返回 DisplayInfo[]，含 bounds/scaleFactor），与来源列表是两件事 */
   captureListDisplays: 'capture:list-displays',
   captureListDevices: 'capture:list-devices',
+  captureCameraPreview: 'capture:camera-preview',
+  captureDesktopFrame: 'capture:desktop-frame',
+  recorderSegment: 'recorder:segment',
+  recorderResult: 'recorder:result',
   captureStart: 'capture:start',
   capturePause: 'capture:pause',
   captureResume: 'capture:resume',

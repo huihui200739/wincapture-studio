@@ -15,6 +15,7 @@ import type { BrowserWindow } from 'electron';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import type { CameraSegmentResult } from '../../src/renderer/cameraRuntime';
+import type { CameraMediaClock } from '../../src/media/cameraBuffer';
 
 export interface CameraCoordinatorDeps {
   /** 创建（或复用）role=camera 的隐藏窗口 */
@@ -46,6 +47,7 @@ export class CameraCoordinator {
     segments: 0,
   };
   private opened = false;
+  private opening: Promise<boolean> | null = null;
 
   constructor(private readonly deps: CameraCoordinatorDeps) {}
 
@@ -54,7 +56,14 @@ export class CameraCoordinator {
   }
 
   /** 打开摄像头。失败时记录 reason 并返回 false，不抛异常。 */
-  async open(deviceId?: string): Promise<boolean> {
+  open(deviceId?: string): Promise<boolean> {
+    if (this.opened && this.win && !this.win.isDestroyed() && (!deviceId || deviceId === this.status.deviceId)) return Promise.resolve(true);
+    if (this.opening) return this.opening;
+    this.opening = this.openDevice(deviceId).finally(() => { this.opening = null; });
+    return this.opening;
+  }
+  private async openDevice(deviceId?: string): Promise<boolean> {
+    if (this.opened && this.win && !this.win.isDestroyed() && (!deviceId || deviceId === this.status.deviceId)) return true;
     try {
       const win = this.deps.createCameraWindow();
       this.win = win;
@@ -123,12 +132,14 @@ export class CameraCoordinator {
     index: number,
     durationTicks: number,
     fps: number,
+    startTick = 0,
   ): Promise<{ path: string; bytes: number; frames: number } | null> {
     if (!this.opened || !this.win || this.win.isDestroyed()) return null;
 
     try {
       const request = {
         index,
+        startTick,
         durationTicks,
         fps,
         // 摄像头固定 720p（R04）
@@ -178,6 +189,7 @@ export class CameraCoordinator {
 
   /** 关闭摄像头并销毁隐藏窗口。 */
   async close(): Promise<void> {
+    await this.opening?.catch(() => false);
     if (this.win && !this.win.isDestroyed()) {
       try {
         await this.win.webContents.executeJavaScript(
@@ -199,12 +211,16 @@ export class CameraCoordinator {
   }
 
   /** 取一帧快照（PNG base64），用于验证画面不是全黑。 */
-  async snapshot(): Promise<{ ok: boolean; png?: string; error?: string }> {
+  async syncClock(clock: CameraMediaClock): Promise<void> {
+    if (this.opened && this.win && !this.win.isDestroyed()) await this.win.webContents.executeJavaScript(`window.__wcsCamera.setClock(${JSON.stringify(clock)})`);
+  }
+
+  async snapshot(width = 480, height = 270): Promise<{ ok: boolean; png?: string; error?: string }> {
     if (!this.win || this.win.isDestroyed()) return { ok: false, error: '摄像头窗口不存在' };
     try {
       return (await this.win.webContents.executeJavaScript(
         `(async () => {
-           try { return await window.__wcsCamera.snapshot(); }
+           try { return await window.__wcsCamera.snapshot(${width}, ${height}); }
            catch (e) { return { ok: false, error: String(e) }; }
          })()`,
         true,

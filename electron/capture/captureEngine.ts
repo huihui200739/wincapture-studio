@@ -9,15 +9,13 @@
  *   - 崩溃恢复日志（journal.jsonl）
  *
  * 关键设计：
- *   视频帧不在主进程编码，而是通过 HTTP 提供给录制渲染窗口，
+ *   视频帧通过二进制 IPC 提供给录制渲染窗口，
  *   由渲染窗口用 WebCodecs 编码成 H.264 分段 MP4（主进程没有 WebCodecs）。
  *   主进程负责的是：采集、时间戳、分段调度、落盘、校验、提交。
  */
 
 import fsp from 'node:fs/promises';
-import http from 'node:http';
 import path from 'node:path';
-import type { AddressInfo } from 'node:net';
 
 import {
   canTransition,
@@ -34,6 +32,8 @@ import { secondsToTicks } from '../../src/domain/timebase';
 import { SessionClock } from '../../src/domain/sessionClock';
 import { AudioWorker, GrabberWorker, type AudioPacket, type VideoFramePacket, type WorkerPaths } from './workers';
 import { QpcClock } from './qpcClock';
+import { PointerWorker, type NativePointerEvent } from './pointerWorker';
+import type { CameraMediaClock } from '../../src/media/cameraBuffer';
 import { SegmentGrid, type SegmentSlice } from './segmentPlanner';
 import { audioBufferFrames, audioOffsetFrames, writePcmInto, type PlacedPcmPacket } from './audioAlign';
 
@@ -85,6 +85,8 @@ export interface RecordSession {
 }
 
 export interface RecorderHooks {
+  modernCapture?: (config: CaptureConfig, region: { x: number; y: number; width: number; height: number; outputWidth: number; outputHeight: number }, fps: number) => Promise<VideoCaptureSource>;
+  cameraClock?: (clock: CameraMediaClock) => Promise<void>;
   /** 状态变化通知（主进程 → 界面） */
   onStatus: (status: CaptureStatus) => void;
   /** 请求录制渲染窗口开始一段编码 */
@@ -108,8 +110,11 @@ export interface RecorderHooks {
     index: number,
     durationTicks: number,
     fps: number,
+    startTick?: number,
   ) => Promise<{ path: string; bytes: number; frames: number } | null>;
 }
+
+export type VideoCaptureSource = Pick<GrabberWorker, 'frequency' | 'captureBounds' | 'start' | 'stop' | 'onFrame' | 'onExit'> & { backend?: string };
 
 export interface SegmentRequest {
   index: number;
@@ -153,11 +158,12 @@ interface PendingSegment {
 
 /** 采集引擎：一个进程内只允许一个活动会话。 */
 export class CaptureEngine {
+  private pointerWorker: PointerWorker | null = null;
   private state: CaptureState = 'Idle';
   private session: RecordSession | null = null;
   private clock = new SessionClock();
   private qpcClock = new QpcClock();
-  private grabber: GrabberWorker | null = null;
+  private grabber: VideoCaptureSource | null = null;
   private audio: AudioWorker | null = null;
 
   private frames: { mediaTick: number; jpeg: Buffer; qpc: bigint }[] = [];
@@ -325,7 +331,7 @@ export class CaptureEngine {
     if (windowSource) {
       region.width -= region.width % 2; region.height -= region.height % 2;
       width = region.width; height = region.height;
-      degradationParts.push('窗口兼容采集（PrintWindow）；最小化或受保护窗口不可录制');
+      degradationParts.push('窗口采集；最小化或受保护窗口可能不可录制');
     }
 
     // 输出尺寸：区域录制按区域原生像素输出，保证「选择结果与预览一致」(R01)。
@@ -397,7 +403,8 @@ export class CaptureEngine {
     }
 
     // 启动屏幕采集
-    const grabber = new GrabberWorker(this.workerPaths.grabberExe, {
+    let grabber: VideoCaptureSource = new GrabberWorker(this.workerPaths.grabberExe, {
+      outputWidth: width, outputHeight: height,
       windowHandle: windowSource ? /^window:(\d+)$/.exec(config.sourceId)?.[1] : undefined,
       width: region.width,
       height: region.height,
@@ -409,7 +416,18 @@ export class CaptureEngine {
     this.grabber = grabber;
 
     try {
-      await grabber.start();
+      let modern: VideoCaptureSource | null = null;
+      if (this.hooks.modernCapture && config.backend !== 'compatibility') {
+        try {
+          modern = await this.hooks.modernCapture(config, { ...region, outputWidth: width, outputHeight: height }, fps); await modern.start();
+          grabber = modern; this.grabber = grabber; degradationParts.push('现代采集：Chromium/WGC');
+        } catch (error) {
+          await modern?.stop().catch(() => {});
+          if (config.backend === 'wgc') throw error;
+          degradationParts.push(`现代采集不可用，已回退兼容采集：${String(error).slice(0, 180)}`);
+        }
+      }
+      if (grabber !== modern) await grabber.start();
     } catch (error) {
       this.transition('RecoverableFailure');
       // 启动失败（含 3 秒超时）必须把可能已经半启动的子进程收掉：
@@ -438,6 +456,19 @@ export class CaptureEngine {
     });
 
     // 启动音频采集
+    this.pointerWorker = new PointerWorker(path.join(path.dirname(this.workerPaths.grabberExe), 'pointer.exe'));
+    this.pointerWorker.onEvent(event => this.recordPointerEvent(event, this.pointerWorker?.frequency ?? 10_000_000n));
+    this.pointerWorker.onExit(() => {
+      if (!this.stopping && this.session && ['Recording', 'Paused'].includes(this.state)) {
+        this.session.degradation = [this.session.degradation, '真实鼠标点击采集已停止'].filter(Boolean).join('；');
+        this.emitStatus(true);
+      }
+    });
+    try { await this.pointerWorker.start(); }
+    catch (error) {
+      degradationParts.push('真实鼠标点击采集不可用');
+      this.hooks.onAppEvent('pointer-degraded', { reason: String(error) });
+    }
     if (config.microphoneEnabled || config.systemAudioEnabled) {
       const audio = new AudioWorker(this.workerPaths.audioExe, {
         enableSystem: config.systemAudioEnabled,
@@ -596,6 +627,7 @@ export class CaptureEngine {
     // 首帧确定会话零点（§9.2）
     if (!this.clock.hasZero) {
       this.clock.setZero(qpcTick);
+      void this.syncCameraClock('recording', qpcTick);
       void this.appendJournal('heartbeat', { zero: qpcTick });
     }
     // 停止命令之后才采集到的画面不属于本次会话（停止瞬间到进程退出之间最多还会有几十毫秒）。
@@ -665,11 +697,8 @@ export class CaptureEngine {
     };
     this.nextSegmentNumber += 1;
     this.pendingSegments.push(segment);
-    // 摄像头是实时源：必须在切段瞬间（而不是屏幕段编码完之后）开始采集，
-    // 否则每个摄像头段都会比对应屏幕段晚「屏幕编码耗时」，累积后声画/画中画错位。
-    // 同时不能在这个串行编码循环里 await 它：摄像头段要录满 durationTicks 实时时间，
-    // await 会让队列以 >1.6s/段 的速度堆积，触发背压丢屏幕段。
-    this.scheduleCameraSegment(segment.index, segment.durationTicks);
+    // 摄像头已连续采集；立即投递此段的媒体时间范围，独立编码并及时释放已采集帧。
+    this.scheduleCameraSegment(segment.index, segment.durationTicks, segment.startTick);
     return segment;
   }
 
@@ -1018,19 +1047,17 @@ export class CaptureEngine {
   /**
    * 摄像头分段提交（R04）：与屏幕段同索引、同时长，导出时两轨时间映射一致。
    *
-   * 摄像头是实时源：encodeSegment 会「实时」采集 durationTicks 的画面。
-   * 因此必须在切段瞬间就启动，并且绝不能串在屏幕段的编码循环里 await
-   * （否则每段编码耗时都会让摄像头段晚开始，且队列以 >1.6s/段 的速度堆积触发背压丢帧）。
+   * encodeSegment 只消费连续采样缓冲中属于该时间范围的画面，不在提交时重新采集。
    * 这里用一条串行 Promise 链保证同一隐藏窗口不会被并发编码，失败只记录不抛异常（§9.5）。
    */
-  private scheduleCameraSegment(index: number, durationTicks: number): void {
+  private scheduleCameraSegment(index: number, durationTicks: number, startTick: number): void {
     const commit = this.hooks.commitCameraSegment;
     const session = this.session;
     if (!commit || !session) return;
     this.cameraJobsPending += 1;
     this.cameraChain = this.cameraChain.then(async () => {
       try {
-        await commit(session.projectPath, index, durationTicks, session.effective.fps);
+        await commit(session.projectPath, index, durationTicks, session.effective.fps, startTick);
       } catch (error) {
         this.hooks.onAppEvent('camera-error', { index, message: String(error) });
       } finally {
@@ -1085,6 +1112,7 @@ export class CaptureEngine {
     const pauseQpc = this.nowQpc();
     this.transition('Pausing');
     this.clock.pause(pauseQpc);
+    await this.syncCameraClock('paused', pauseQpc);
     // 提交当前段，保证暂停点之前的画面完整（结束边界取冻结后的媒体时长，
     // 让末帧与暂停点之间的音频样本也能落在本段，而不是被裁掉）
     this.flushRemainingFrames(this.clock.durationTicks(this.nowQpc()));
@@ -1106,6 +1134,7 @@ export class CaptureEngine {
     }
     this.transition('Resuming');
     this.clock.resume(this.nowQpc());
+    await this.syncCameraClock('recording', this.nowQpc());
     await this.appendJournal('resume', { at: this.nowQpc() });
     this.transition('Recording');
     this.scheduleSegment();
@@ -1191,6 +1220,7 @@ export class CaptureEngine {
     }
     if (this.state !== 'Stopping') this.transition('Stopping');
     this.clock.stop(stopQpc);
+    await this.syncCameraClock('stopped', stopQpc);
     await this.appendJournal('stop', { at: stopQpc });
 
     // 关键顺序：先停采集进程、把管道里剩下的帧读完，再切最后一段。
@@ -1272,6 +1302,7 @@ export class CaptureEngine {
   }
 
   private stopTimers(): void {
+    const pointer = this.pointerWorker; this.pointerWorker = null; void pointer?.stop();
     if (this.segmentTimer) {
       clearTimeout(this.segmentTimer);
       this.segmentTimer = null;
@@ -1402,9 +1433,30 @@ export class CaptureEngine {
     }, POINTER_INTERVAL_MS);
   }
 
-  private normalizedPointer(x: number, y: number): { x: number; y: number } {
+  private async syncCameraClock(state: CameraMediaClock['state'], qpc: number): Promise<void> {
+    if (!this.clock.hasZero) return;
+    const wallTimeMs = performance.timeOrigin + performance.now() + (qpc - this.nowQpc()) / 10_000;
+    try { await this.hooks.cameraClock?.({ state, mediaTick: this.clock.mediaTickAt(qpc), wallTimeMs }); }
+    catch (error) { this.hooks.onAppEvent('camera-error', { message: String(error) }); }
+  }
+
+  recordPointerEvent(event: NativePointerEvent, frequency: bigint): void {
+    if (!this.session || !this.clock.hasZero || this.state !== 'Recording' || frequency <= 0n) return;
+    const window = this.session.config.sourceKind === 'window';
+    if (window && event.hwnd && this.session.config.sourceId !== `window:${event.hwnd}`) return;
+    const qpc = Math.round(Number(event.qpc) * 10_000_000 / Number(frequency));
+    if (qpc < this.clock.zero! || this.clock.isDuringPause(qpc)) return;
+    const tick = this.clock.mediaTickAt(qpc);
+    if (tick === null || tick < 0) return;
+    const point = this.normalizedPointer(event.x, event.y, window ? event.bounds : undefined);
+    if (point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) return;
+    this.pointerEvents.push({ tick, kind: event.kind, ...point, button: event.button, px: event.x, py: event.y, geometryVersion: 1, captureState: 'ok' });
+    if (event.kind === 'down') this.pointerClicks.push({ tick, ...point });
+  }
+
+  private normalizedPointer(x: number, y: number, overrideBounds?: { x: number; y: number; width: number; height: number }): { x: number; y: number } {
     const session = this.session;
-    const bounds = this.grabber?.captureBounds;
+    const bounds = overrideBounds ?? this.grabber?.captureBounds;
     if (!session || !bounds) return { x: x / Math.max(1, session?.effective.width ?? 1), y: y / Math.max(1, session?.effective.height ?? 1) };
     const window = session.config.sourceKind === 'window';
     if (window && (x < bounds.x || y < bounds.y || x >= bounds.x + bounds.width || y >= bounds.y + bounds.height)) return { x: -1, y: -1 };
@@ -1442,7 +1494,7 @@ export class CaptureEngine {
       clicks: this.pointerClicks,
     };
     const target = path.join(session.projectPath, 'events', 'pointer.jsonl');
-    const lines = this.pointerEvents.map((e) => JSON.stringify(e)).join('\n');
+    const lines = this.pointerEvents.sort((a, b) => a.tick - b.tick).map((e) => JSON.stringify(e)).join('\n');
     await fsp.writeFile(target, (lines ? lines + '\n' : '') + JSON.stringify({ __meta: meta, __kind: 'meta' }) + '\n');
   }
 
@@ -1549,49 +1601,4 @@ export class CaptureEngine {
   getDurationTicks(): number {
     return Math.max(0, this.clock.durationTicks());
   }
-}
-
-// ---------------------------------------------------------------------------
-// 帧分发服务：把 JPEG 帧通过 HTTP 提供给录制渲染窗口
-// ---------------------------------------------------------------------------
-
-export interface FrameServer {
-  url: string;
-  close: () => Promise<void>;
-  /** 供调试：已服务帧数 */
-  served: () => number;
-}
-
-/**
- * 启动本地帧服务。
- *
- * 为什么用 HTTP 而不是 executeJavaScript 传 Buffer：
- *   跨进程传 3.5MB 的 Buffer 会触发 "An object could not be cloned"，
- *   并且每帧走一次 IPC 会阻塞主进程。HTTP 是流式传输，开销可忽略。
- *
- * 路由：
- *   GET /health          → 会话状态
- *   GET /segment?index=N → 该段的帧与音频（一次性返回，供录制渲染窗口编码）
- */
-export async function startFrameServer(engine: CaptureEngine): Promise<FrameServer> {
-  let served = 0;
-  const server = http.createServer((req, res) => {
-    if (req.url?.startsWith('/health')) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, state: engine.getState() }));
-      return;
-    }
-    res.writeHead(404);
-    res.end();
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as AddressInfo).port;
-  return {
-    url: `http://127.0.0.1:${port}`,
-    served: () => served,
-    close: () =>
-      new Promise<void>((resolve) => {
-        server.close(() => resolve());
-      }),
-  };
 }

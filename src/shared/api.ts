@@ -79,11 +79,14 @@ export interface OverlayApi {
 }
 
 export interface WcsApi {
+  desktop?: { frame(payload: unknown): void };
+  recorder?: { onSegment(callback: (request: unknown) => void): () => void; complete(reply: unknown): void };
   // ---- 采集 ----
   listSources(): Promise<IpcResponse<CaptureSourceInfo[]>>;
   listDisplays(): Promise<IpcResponse<DisplayInfo[]>>;
   listDevices(): Promise<IpcResponse<{ audio: AudioDeviceInfo[]; video: VideoDeviceInfo[] }>>;
   qualityProfiles(): Promise<IpcResponse<QualityProfile[]>>;
+  cameraPreview(enabled: boolean, deviceId?: string): Promise<IpcResponse<{ ok: boolean; png?: string; error?: string }>>;
   startCapture(config: CaptureConfig): Promise<IpcResponse<{ sessionId: string; projectPath: string; cameraNote?: string | null }>>;
   pauseCapture(): Promise<IpcResponse<CaptureStatus>>;
   resumeCapture(): Promise<IpcResponse<CaptureStatus>>;

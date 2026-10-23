@@ -160,6 +160,7 @@ function delay(ms: number): Promise<void> {
 }
 
 class MockWcs implements WcsApi {
+  async cameraPreview(): Promise<IpcResponse<{ ok: boolean; error?: string }>> { return ok({ ok: false, error: '示例模式不打开摄像头' }); }
   readonly role = 'main' as const;
   readonly platform = 'win32';
   readonly overlay = null;

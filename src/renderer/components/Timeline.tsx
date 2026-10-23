@@ -17,6 +17,9 @@ import type { Ticks } from '@domain/timebase';
 import { cn } from '../lib/format';
 import { Badge, Icon, IconButton } from './ui';
 import { AudioWaveform } from './AudioWaveform';
+import { VideoThumbnails } from './VideoThumbnails';
+import { usePreviewMedia } from '../lib/previewSource';
+import { timelineSnapTargets, snapPosition } from '@domain/snapping';
 
 const TRACK_LABEL: Record<TrackKind, string> = {
   primaryVideo: '主视频',
@@ -250,6 +253,8 @@ export function Timeline({
   projectPath,
 }: TimelineProps) {
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const thumbnailMedia = usePreviewMedia(projectPath ?? null);
+  const [snapGuide, setSnapGuide] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const scrubbing = useRef(false);
 
@@ -351,8 +356,12 @@ export function Timeline({
       if (trim) {
         const deltaTicks = Math.round((event.clientX - trim.startX) / pxPerTick);
         // 吸附到 10ms 网格，与移动保持同一手感
-        const snapped = Math.round(deltaTicks / 100_000) * 100_000;
-        const plan = planClipTrim(project, trim.clipId, trim.edge, snapped);
+        const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === trim.clipId)!;
+        const edge = trim.edge === 'left' ? clip.timelineInTicks : clipEndTick(clip);
+        const snap = event.altKey ? { value: edge + deltaTicks, guide: null } : snapPosition(edge + deltaTicks, timelineSnapTargets(project, trim.clipId, tick), 8 / pxPerTick);
+        const plan = planClipTrim(project, trim.clipId, trim.edge, snap.value - edge);
+        const actualEdge = plan ? plan.timelineInTicks + (trim.edge === 'right' ? plan.spanTicks : 0) : null;
+        setSnapGuide(actualEdge !== null && Math.abs(actualEdge - snap.value) <= 1 ? snap.guide : null);
         if (plan) setTrimPreview(plan);
         return;
       }
@@ -360,16 +369,19 @@ export function Timeline({
       if (!drag) return;
       const deltaTicks = Math.round((event.clientX - drag.startX) / pxPerTick);
       // 吸附到 10ms 网格，避免拖出无法复现的零头
-      const snapped = Math.round((drag.originTick + deltaTicks) / 100_000) * 100_000;
-      const desired = Math.max(0, snapped);
+      const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === drag.clipId)!;
+      const snap = event.altKey ? { value: drag.originTick + deltaTicks, guide: null } : snapPosition(drag.originTick + deltaTicks,
+        timelineSnapTargets(project, drag.clipId, tick), 8 / pxPerTick, [0, clipEndTick(clip) - clip.timelineInTicks]);
+      const desired = Math.max(0, snap.value);
       const plan = planClipMove(project, drag.clipId, desired);
       const next = plan ? plan.tick : desired;
+      setSnapGuide(next === desired ? snap.guide : null);
       drag.desiredTick = desired;
       if (next === drag.currentTick) return;
       drag.currentTick = next;
       setDragPreview({ clipId: drag.clipId, tick: next });
     },
-    [project, pxPerTick],
+    [project, pxPerTick, tick],
   );
 
   /** 正在拖动的片段（用于关联组预览：同组片段一起偏移） */
@@ -382,6 +394,7 @@ export function Timeline({
   );
 
   const onClipPointerUp = useCallback(() => {
+    setSnapGuide(null);
     // 裁剪优先：手柄拖拽松手时提交一次 TrimClip（只进一次撤销栈）
     const trim = trimRef.current;
     trimRef.current = null;
@@ -599,6 +612,7 @@ export function Timeline({
               onPointerCancel={onScrubPointerUp}
             >
               {/* 刻度尺 + 拖拽 seek */}
+              {snapGuide !== null && <div className="tl-snap-guide" style={{ left: tickToX(snapGuide) }} />}
               <div className="timeline-ruler" aria-hidden="true">
                 {ticks.map((item) => (
                   <span
@@ -762,10 +776,11 @@ export function Timeline({
                                 onMoveClip(clip.id, nextTick);
                               }
                             }}
-                            title={`${TRACK_LABEL[row.kind as TrackKind]} · ${formatDuration(clip.sourceDurationTicks)} · 拖动重排，双击定位`}
+                            title={`${TRACK_LABEL[row.kind as TrackKind]} · ${formatDuration(clip.sourceDurationTicks)} · 拖动吸附到片段边缘/播放头，Alt 暂停磁吸，双击定位`}
                             onDoubleClick={() => onSeek(clip.timelineInTicks)}
                           >
                             {/* 音频轨叠加真实波形（§10.4）；读不到就退回纯色块 */}
+                            {!isAudioRow && <VideoThumbnails project={project} clip={clip} width={width} camera={row.kind === 'camera'} media={thumbnailMedia} />}
                             {isAudioRow && clip.assetId && (
                               <AudioWaveform
                                 assetId={clip.assetId}

@@ -2,7 +2,7 @@
 /**
  * 以正确姿势启动 Electron 运行验收脚本。
  *
- * 本机/受限环境有两个硬约束（docs/technical-verification.md §7）：
+ * 本机/受限环境有两个硬约束（docs/testing.md §7）：
  *   1. 必须带 `--no-sandbox`，否则进程以 -2147483645 退出；
  *   2. 环境里若存在 `ELECTRON_RUN_AS_NODE`，`require('electron')` 会返回路径字符串，
  *      脚本表现为"不是 Electron 环境"而失败——必须在子进程环境里删掉它。

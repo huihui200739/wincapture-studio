@@ -16,6 +16,7 @@
  */
 
 import { SegmentEncoder } from '../media/encode';
+import { CameraFrameBuffer, type CameraMediaClock } from '../media/cameraBuffer';
 
 export interface CameraSegmentRequest {
   /** 段序号，与 screen 段一致 */
@@ -29,6 +30,7 @@ export interface CameraSegmentRequest {
   height: number;
   /** 该段内要采样的时刻（毫秒，相对段起点），由主进程按固定间隔给出 */
   sampleTimesMs: number[];
+  startTick?: number;
 }
 
 export interface CameraSegmentResult {
@@ -52,6 +54,31 @@ let activeDeviceId: string | null = null;
 /** 采集画布：摄像头原始帧先画到这里再编码，避免直接编码 VideoFrame 的尺寸差异 */
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
+const frameBuffer = new CameraFrameBuffer<VideoFrame>(120);
+let mediaClock: CameraMediaClock | null = null;
+let frameCallback = 0;
+let lastFrameTick = -Infinity;
+
+function setClock(clock: CameraMediaClock): void {
+  if (clock.state === 'recording' && clock.mediaTick === 0) { frameBuffer.clear(); lastFrameTick = -Infinity; }
+  if (clock.state !== 'recording') frameBuffer.trimFrom(clock.mediaTick);
+  mediaClock = clock;
+}
+
+function startFrameSampling(): void {
+  if (!video) return;
+  const sample = () => {
+    if (!video || !stream) return;
+    if (mediaClock?.state === 'recording' && video.readyState >= 2) {
+      const tick = Math.round(mediaClock.mediaTick + (performance.timeOrigin + performance.now() - mediaClock.wallTimeMs) * 10_000);
+      if (tick >= 0 && tick - lastFrameTick >= 250_000) {
+        frameBuffer.push(tick, new VideoFrame(video, { timestamp: Math.round(tick / 10) })); lastFrameTick = tick;
+      }
+    }
+    frameCallback = video.requestVideoFrameCallback(sample);
+  };
+  frameCallback = video.requestVideoFrameCallback(sample);
+}
 
 function ensureElements(): { video: HTMLVideoElement; canvas: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D } {
   if (!video) {
@@ -144,6 +171,7 @@ async function open(deviceId?: string): Promise<{ ok: boolean; deviceId?: string
       const track = media.getVideoTracks()[0];
       activeDeviceId = track?.getSettings().deviceId ?? deviceId ?? null;
       const label = track?.label ?? '';
+      startFrameSampling();
       return { ok: true, deviceId: activeDeviceId ?? undefined, label };
     } catch (error) {
       lastError = String(error instanceof Error ? error.message : error);
@@ -172,6 +200,8 @@ async function open(deviceId?: string): Promise<{ ok: boolean; deviceId?: string
 
 /** 关闭摄像头，释放设备（否则录制结束后摄像头灯会一直亮）。 */
 async function close(): Promise<void> {
+  if (video && frameCallback) video.cancelVideoFrameCallback(frameCallback);
+  frameCallback = 0; mediaClock = null; frameBuffer.clear(); lastFrameTick = -Infinity;
   if (video) {
     try {
       video.pause();
@@ -238,6 +268,7 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
   }
   encoding = true;
   let encoder: SegmentEncoder | null = null;
+  let captured: { tick: number; frame: VideoFrame }[] = [];
   try {
     if (!isReady()) {
       return { ok: false, error: '摄像头未就绪，跳过该段' };
@@ -245,6 +276,9 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
     const fps = request.fps > 0 ? request.fps : 30;
     const width = request.width > 0 ? request.width : 1280;
     const height = request.height > 0 ? request.height : 720;
+    const start = request.startTick ?? 0;
+    captured = frameBuffer.take(start, start + request.durationTicks);
+    if (!captured.length) return { ok: false, error: '此时间段没有已采集的摄像头帧；不会用停止后的画面补录。' };
 
     encoder = new SegmentEncoder({
       width,
@@ -267,16 +301,17 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
     const targetFrames = Math.max(1, Math.round((request.durationTicks / 10_000_000) * fps));
     const frameStepUs = Math.round(1_000_000 / fps);
     let written = 0;
+    let cursor = 0;
     for (let i = 0; i < targetFrames; i++) {
-      if (!drawFrame(width, height)) break;
-      drawContext.drawImage(canvas as unknown as CanvasImageSource, 0, 0, width, height);
+      const tick = start + Math.round(i * 10_000_000 / fps);
+      while (cursor + 1 < captured.length && captured[cursor + 1].tick <= tick) cursor++;
+      const frame = captured[cursor].frame;
+      const scale = Math.max(width / frame.displayWidth, height / frame.displayHeight);
+      const w = frame.displayWidth * scale, h = frame.displayHeight * scale;
+      drawContext.drawImage(frame, (width - w) / 2, (height - h) / 2, w, h);
       await encoder.commitVideoFrame(i * frameStepUs);
       written++;
-      // 摄像头是实时源，帧间留一点时间让 video 元素刷新到下一帧，
-      // 否则一段里会编码出同一帧的多个副本（看起来像卡住）。
-      // 注意：这使摄像头段的采集耗时≈段时长，必须由协调器与屏幕编码并行，
-      // 不能串行 await（见 cameraCapture.ts / captureEngine.ts 的跨范围说明）。
-      await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.floor(1000 / fps) - 2)));
+      // Encode only frames captured within this screen segment's media-clock range.
     }
 
     if (written === 0) {
@@ -304,6 +339,7 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
     return { ok: false, error: String(error instanceof Error ? (error.stack ?? error.message) : error) };
   } finally {
     encoding = false;
+    for (const item of captured) item.frame.close();
     // 每段都新建编码器（硬件 VideoEncoder + OffscreenCanvas 后备存储），
     // 成功与失败都必须释放；旧实现只在 finalize 成功后靠 GC，连续失败会线性涨内存。
     try {
@@ -315,10 +351,10 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
 }
 
 /** 取一帧当前画面的 PNG（用于界面上的摄像头预览校验）。 */
-async function snapshot(): Promise<{ ok: boolean; png?: string; error?: string }> {
+async function snapshot(width = 1280, height = 720): Promise<{ ok: boolean; png?: string; error?: string }> {
   try {
     if (!isReady()) return { ok: false, error: '摄像头未就绪' };
-    if (!drawFrame(1280, 720)) return { ok: false, error: '取帧失败' };
+    if (!drawFrame(width, height)) return { ok: false, error: '取帧失败' };
     const blob = await (canvas as OffscreenCanvas).convertToBlob({ type: 'image/png' });
     const buffer = new Uint8Array(await blob.arrayBuffer());
     let binary = '';
@@ -343,6 +379,7 @@ declare global {
       isReady: typeof isReady;
       encodeSegment: typeof encodeSegment;
       snapshot: typeof snapshot;
+      setClock: typeof setClock;
     };
   }
 }
@@ -365,6 +402,6 @@ function isCameraRole(): boolean {
 }
 
 if (isCameraRole()) {
-  window.__wcsCamera = { listDevices, open, close, isReady, encodeSegment, snapshot };
+  window.__wcsCamera = { listDevices, open, close, isReady, encodeSegment, snapshot, setClock };
   console.log('[camera] 摄像头运行时就绪');
 }

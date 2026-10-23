@@ -66,6 +66,21 @@ async function probe() {
       evaluateScene(p, t * S, { outputWidth: 640, outputHeight: 360 }), t * S, {})));
     assert(thumbs.every((t) => t?.screen && t.status === 'ready'), '缩略图互相取消');
 
+    const holder = document.createElement('div'); holder.style.cssText = 'width:240px;height:54px'; document.body.appendChild(holder);
+    const mounted = Parity.mountThumbnail(holder, { project: p, clip: p.tracks[0].clips[0], width: 240, camera: false, media: cache });
+    let realThumbnail = false;
+    try {
+      for (let i = 0; i < 80; i++) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        const canvas = holder.querySelector('canvas');
+        if (canvas && canvas.width === 288) {
+          const pixel = canvas.getContext('2d').getImageData(48, 27, 1, 1).data;
+          if (pixel[0] > 220 && pixel[1] > 220 && pixel[2] > 220) { realThumbnail = true; break; }
+        }
+      }
+      assert(realThumbnail, '时间线组件没有绘制真实解码缩略图');
+    } finally { mounted.unmount(); holder.remove(); }
+
     const sped = applyCommand(p, makeCommand(p, { kind: 'SetClipRate', clipId: 'clip', rate: { num: 2, den: 1 } })).project;
     sped.tracks[0].clips[0].sourceDurationTicks = S / 2; // 0.25 s output, 15 frames at 60 FPS.
     const profile = createExportProfile(sped, { variantId: 'landscape', resolution: '2160', fps: '60', quality: 'balanced', includeTutorial: false });
@@ -81,7 +96,7 @@ async function probe() {
     } catch (error) { throw new Error(JSON.stringify({ message: error.message, detail: error.detail, code: error.code })); }
     assert(exported.ok && exported.verified && exported.frames === 15, '4K/60FPS/倍速导出校验失败');
     results.push({ export4K60: { ok: exported.ok, verified: exported.verified, frames: exported.frames,
-      bytes: exported.bytes, encoder: exported.encoder, checks: exported.verifiedDetail?.checks }, thumbnails: thumbs.length });
+      bytes: exported.bytes, encoder: exported.encoder, checks: exported.verifiedDetail?.checks }, thumbnails: thumbs.length, timelineThumbnailPixels: realThumbnail });
     return { ok: true, results };
   } finally { cache.dispose(); source.width = 0; source.height = 0; }
 }
@@ -105,6 +120,9 @@ app.whenReady().then(async () => {
       export { exportProject } from './src/media/exporter';
       export { applyCommand, makeCommand } from './src/domain/commands';
       export { pointerForScene, createPointerLookup } from './src/domain/pointer';
+      import {createElement} from 'react'; import {createRoot} from 'react-dom/client';
+      import {VideoThumbnails} from './src/renderer/components/VideoThumbnails';
+      export function mountThumbnail(element, props) { const root = createRoot(element); root.render(createElement(VideoThumbnails, props)); return root; }
     `, resolveDir: ROOT }, bundle: true, format: 'iife', globalName: 'Parity', platform: 'browser', write: false, logLevel: 'silent' });
     win = new BrowserWindow({ show: false, webPreferences: { sandbox: false, backgroundThrottling: false } });
     const entry = path.join(OUT, 'parity-probe.html');

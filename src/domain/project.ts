@@ -326,6 +326,13 @@ export function effectsOfKind<K extends EffectKind>(
 }
 
 /** 时间线总时长：所有主视频轨片段的最大结束时间（§10.1） */
+export function clipTimelineDuration(clip: Clip): Ticks {
+  const rate = clip.rate;
+  if (!rate || !Number.isFinite(rate.num) || !Number.isFinite(rate.den) || rate.num <= 0 || rate.den <= 0) return 0;
+  const ticks = Math.round(clip.sourceDurationTicks * rate.den / rate.num);
+  return Number.isFinite(ticks) ? Math.max(0, ticks) : 0;
+}
+
 export function timelineDuration(project: Project): Ticks {
   const main = findTrack(project, 'primaryVideo');
   if (!main || !Array.isArray(main.clips)) return 0;

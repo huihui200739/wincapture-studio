@@ -147,6 +147,7 @@ internal static class Grabber
         if (args.Length == 1 && args[0] == "--list-windows") return ListWindows();
 
         QueryPerformanceFrequency(out _qpcFrequency);
+        if (args.Length == 1 && args[0] == "--clock") { long qpc; QueryPerformanceCounter(out qpc); Console.WriteLine("{\"qpc\":\"" + qpc + "\",\"frequency\":\"" + _qpcFrequency + "\"}"); return 0; }
         Log("QPCFREQ " + _qpcFrequency);
 
         if (args.Length < 5)
@@ -159,6 +160,7 @@ internal static class Grabber
         int fps = 30;
         bool probe = false;
         IntPtr windowHandle = IntPtr.Zero;
+        int outputWidth = 0, outputHeight = 0;
         try
         {
             width = int.Parse(args[0]);
@@ -171,6 +173,7 @@ internal static class Grabber
             {
                 if (args[i] == "--probe") probe = true;
                 if (args[i].StartsWith("--window=")) windowHandle = new IntPtr(long.Parse(args[i].Substring(9)));
+                if (args[i].StartsWith("--output=")) { string[] output = args[i].Substring(9).Split('x'); outputWidth = int.Parse(output[0]); outputHeight = int.Parse(output[1]); }
             }
         }
         catch (Exception ex)
@@ -187,6 +190,7 @@ internal static class Grabber
         if (fps < 1 || fps > 240) fps = 30;
         if (quality < 20) quality = 20;
         if (quality > 100) quality = 100;
+        if (outputWidth <= 0 || outputHeight <= 0) { outputWidth = width; outputHeight = height; }
 
         // 裁剪到虚拟桌面范围内，避免越界导致全黑
         int screenW = GetSystemMetrics(78); // SM_CXVIRTUALSCREEN
@@ -253,6 +257,9 @@ internal static class Grabber
         int failures = 0;
         Stopwatch clock = Stopwatch.StartNew();
         Bitmap windowBitmap = null;
+        Bitmap outputBitmap = outputWidth != width || outputHeight != height ? new Bitmap(outputWidth, outputHeight, PixelFormat.Format24bppRgb) : null;
+        Graphics outputGraphics = outputBitmap != null ? Graphics.FromImage(outputBitmap) : null;
+        if (outputGraphics != null) outputGraphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBilinear;
         int lastWindowWidth = 0, lastWindowHeight = 0;
 
         try
@@ -321,7 +328,8 @@ internal static class Grabber
                     try
                     {
                         buffer.SetLength(0);
-                        bitmap.Save(buffer, jpegCodec, encoderParams);
+                        if (outputBitmap != null) { outputGraphics.DrawImage(bitmap, 0, 0, outputWidth, outputHeight); outputBitmap.Save(buffer, jpegCodec, encoderParams); }
+                        else bitmap.Save(buffer, jpegCodec, encoderParams);
                         WriteFrame(buffer.ToArray(), qpc);
                         frames++;
                     }
@@ -355,6 +363,8 @@ internal static class Grabber
         finally
         {
             if (windowBitmap != null) windowBitmap.Dispose();
+            if (outputGraphics != null) outputGraphics.Dispose();
+            if (outputBitmap != null) outputBitmap.Dispose();
             timeEndPeriod(1);
             try { graphics.Dispose(); } catch { }
             try { bitmap.Dispose(); } catch { }

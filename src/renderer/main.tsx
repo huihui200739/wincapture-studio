@@ -23,6 +23,7 @@ import { ErrorBoundary } from './components/ui';
 import './recorderRuntime';
 import './exporterRuntime';
 import './cameraRuntime';
+import './desktopRuntime';
 import './styles.css';
 
 type Role = 'main' | 'overlay' | 'recorder' | 'exporter' | 'camera';

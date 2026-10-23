@@ -7,7 +7,7 @@
  *
  * 为什么用原生进程而不是 Chromium 的采集：
  *   本机 Windows.Graphics.Capture 被系统拒绝（E_ACCESSDENIED），getDisplayMedia 全部失败。
- *   详见 docs/technical-verification.md。
+ *   详见 docs/testing.md。
  *
  * 时间基准（文档 §9.2）：
  *   所有帧和音频块都携带 QPC 时间戳。会话开始时刻记为 sessionQpc0，
@@ -30,6 +30,8 @@ export type { AudioErrorPacket, AudioPacket, VideoFramePacket } from './wireProt
 export { MAX_AUDIO_PACKET_BYTES, MAX_VIDEO_FRAME_BYTES } from './wireProtocol';
 
 export interface GrabberOptions {
+  outputWidth?: number;
+  outputHeight?: number;
   windowHandle?: string;
   width: number;
   height: number;
@@ -184,7 +186,8 @@ export class GrabberWorker {
     const child = this.spawnImpl(
       this.exePath,
       [String(width), String(height), String(offsetX), String(offsetY), String(quality), String(fps),
-        ...(this.options.windowHandle ? [`--window=${this.options.windowHandle}`] : [])],
+        ...(this.options.windowHandle ? [`--window=${this.options.windowHandle}`] : []),
+        ...(this.options.outputWidth && this.options.outputHeight ? [`--output=${this.options.outputWidth}x${this.options.outputHeight}`] : [])],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true },
     );
     this.child = child;

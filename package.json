@@ -37,7 +37,10 @@
     "pack": "npm run build && node scripts/package.mjs",
     "pack:dir": "npm run build && node scripts/package.mjs --dir",
     "verify:package": "node scripts/verify-package.cjs",
-    "release": "npm run pack && npm run verify:package"
+    "release": "npm run pack && npm run verify:package && npm run verify:packaged-start",
+    "verify:input-camera": "node scripts/verify-input-camera.mjs",
+    "verify:performance": "node scripts/verify-performance.mjs",
+    "verify:packaged-start": "node scripts/verify-packaged-start.mjs"
   },
   "dependencies": {
     "mediabunny": "^1.62.0"

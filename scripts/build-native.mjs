@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 构建原生采集工作进程（grabber.exe / audio.exe）
+ * 构建原生采集工作进程（grabber.exe / audio.exe / pointer.exe）
  *
  * 为什么在构建期编译：
  *   Electron 子进程内调用 csc 会因权限被拒绝写入（实测 CS0016 拒绝访问），
@@ -22,6 +22,7 @@ const OUT = path.join(root, 'dist', 'native');
 const targets = [
   { name: 'grabber', source: 'grabber.cs', refs: ['/r:System.Drawing.dll'] },
   { name: 'audio', source: 'audio.cs', refs: [] },
+  { name: 'pointer', source: 'pointer.cs', refs: [] },
 ];
 
 if (process.platform !== 'win32') {

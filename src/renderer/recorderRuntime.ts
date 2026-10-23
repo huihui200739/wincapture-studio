@@ -8,8 +8,8 @@
  * 为什么放在渲染进程：WebCodecs（VideoEncoder / AudioEncoder）只在渲染进程可用，
  * 主进程拿不到编码器。分段编码还能把内存占用限制在 2 秒窗口内。
  *
- * 与主进程的接口（由 electron/main.ts 通过 executeJavaScript 调用）：
- *   window.__wcsRecorder.encodeSegment(payload) → { ok, mp4(base64), frames, encoder, durationUs }
+ * 正式录制通过二进制 IPC 接收段并返回 MP4 字节；调试接口兼容 base64：
+ *   window.__wcsRecorder.encodeSegment(payload) → { ok, data?/mp4?, frames, encoder, durationUs }
  *   window.__wcsRecorder.dispose()
  *
  * 协议约束：encodeSegment **永远 resolve**，失败用 { ok:false, error } 表达。
@@ -24,8 +24,8 @@ import { TICKS_PER_SECOND } from '@domain/timebase';
 
 interface IncomingFrame {
   mediaTick: number;
-  /** base64 JPEG */
-  jpeg: string;
+  /** 正式 IPC 传 JPEG 字节；调试接口兼容 base64。 */
+  jpeg: string | Uint8Array;
 }
 
 interface IncomingAudioPacket {
@@ -37,6 +37,7 @@ interface IncomingAudioPacket {
 }
 
 interface SegmentPayload {
+  binary?: boolean;
   index: number;
   startTick: number;
   durationTicks: number;
@@ -60,6 +61,7 @@ interface SegmentPayload {
 }
 
 interface SegmentResponse {
+  data?: Uint8Array;
   ok: boolean;
   mp4?: string;
   frames?: number;
@@ -213,7 +215,7 @@ async function encodeSegment(payload: SegmentPayload): Promise<SegmentResponse> 
     for (let i = 0; i < picks.length; i++) {
       const sourceFrame = payload.frames[picks[i]];
       try {
-        const bitmap = await decodeJpeg(base64ToBytes(sourceFrame.jpeg));
+        const bitmap = await decodeJpeg(typeof sourceFrame.jpeg === 'string' ? base64ToBytes(sourceFrame.jpeg) : sourceFrame.jpeg);
         try {
           ctx.drawImage(bitmap, 0, 0, payload.width, payload.height);
         } finally {
@@ -241,7 +243,7 @@ async function encodeSegment(payload: SegmentPayload): Promise<SegmentResponse> 
 
     return {
       ok: true,
-      mp4: bytesToBase64(result.data),
+      ...(payload.binary ? { data: result.data } : { mp4: bytesToBase64(result.data) }),
       frames: result.frames,
       encoder: result.encoder,
       durationUs: result.durationUs,
@@ -285,6 +287,10 @@ function isRecorderRole(): boolean {
 }
 
 if (isRecorderRole()) {
+  window.wcs?.recorder?.onSegment(request => {
+    const job = request as { id: number; payload: SegmentPayload };
+    void encodeSegment(job.payload).then(result => window.wcs.recorder?.complete({ id: job.id, result }), error => window.wcs.recorder?.complete({ id: job.id, result: { ok: false, error: String(error) } }));
+  });
   window.__wcsRecorder = { encodeSegment, dispose };
   console.log('[recorder] 录制编码窗口就绪');
 }

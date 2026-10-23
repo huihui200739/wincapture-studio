@@ -2015,7 +2015,9 @@ textarea {
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55), 0 0 0 1px #fff;
 }
 .tl-clip:active { cursor: grabbing; }
-.tl-clip-label { overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+.tl-clip-label { overflow: hidden; text-overflow: ellipsis; pointer-events: none; position: relative; z-index: 1; text-shadow: 0 1px 3px #000; }
+.tl-video-thumbnails { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0.52; pointer-events: none; }
+.tl-snap-guide { position: absolute; top: 0; bottom: 0; width: 1px; background: #ffd166; z-index: 9; pointer-events: none; box-shadow: 0 0 3px #ffd166; }
 
 /* 音频轨波形（§10.4）：垫在片段标签下面，不拦截鼠标事件 */
 .tl-waveform {

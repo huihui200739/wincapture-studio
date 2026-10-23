@@ -156,6 +156,7 @@ export class PreviewMediaCache {
           },
           nodeFilePaths: false,
           sampleRate: 48_000,
+          maxOpenSegments: 2,
         },
         segments,
       );

@@ -13,6 +13,7 @@ const { app, BrowserWindow } = require('electron');
 
 const ROOT = path.resolve(__dirname, '..');
 const OUT_DIR = path.join(ROOT, 'dist', 'verify');
+app.setPath('userData', path.join(ROOT, '.tmp', 'camera-device-data'));
 
 function log(message) {
   console.log(`[camera-verify] ${message}`);
@@ -76,6 +77,9 @@ async function main() {
       return;
     }
 
+    await win.webContents.executeJavaScript(`window.__wcsCamera.setClock({state:'recording',mediaTick:0,wallTimeMs:performance.timeOrigin+performance.now()})`);
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    await win.webContents.executeJavaScript(`window.__wcsCamera.setClock({state:'paused',mediaTick:20000000,wallTimeMs:performance.timeOrigin+performance.now()})`);
     // ---- 3. 取快照并检查不是全黑 ----
     const snapshot = await win.webContents.executeJavaScript('window.__wcsCamera.snapshot()', true);
     if (snapshot.ok && snapshot.png) {

@@ -5,7 +5,7 @@
  * 检查 release/ 下的产物是否可交付：
  *   1. NSIS 安装包与 win-unpacked 存在且体积合理；
  *   2. EXE / 安装包内嵌图标与 assets/app-icon.ico 像素一致（不是默认 Electron 图标）；
- *   3. 安装包内 resources/native/{grabber,audio}.exe 存在（录制依赖，缺了录制直接失败）；
+ *   3. 安装包内 resources/native/{grabber,audio,pointer}.exe 存在；
  *   4. asar 内含 dist/renderer/index.html、dist/main/main.cjs、dist/assets/app-icon.ico；
  *   5. 打包后的应用能真正启动并连上 preload（hasWcs）。
  *
@@ -19,7 +19,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..');
 const RELEASE = path.join(ROOT, 'release');
 const UNPACKED = path.join(RELEASE, 'win-unpacked');
-const OUT = path.join(ROOT, 'docs', 'screenshots');
+const OUT = path.join(ROOT, 'dist', 'verify', 'screenshots');
 
 const summary = { ok: true, checks: {}, failures: [] };
 const fail = (m) => summary.failures.push(m);
@@ -190,7 +190,7 @@ function listAsar(asarPath, patterns) {
     const nativeDir = path.join(UNPACKED, 'resources', 'native');
     const nativeFiles = fs.existsSync(nativeDir) ? fs.readdirSync(nativeDir) : [];
     summary.checks.native = nativeFiles;
-    for (const need of ['grabber.exe', 'audio.exe']) {
+    for (const need of ['grabber.exe', 'audio.exe', 'pointer.exe']) {
       if (!nativeFiles.includes(need)) {
         fail(`resources/native/${need} 缺失（录制会直接失败；workers.ts 打包态从 resources/native 解析）`);
       }

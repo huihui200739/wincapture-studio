@@ -4,7 +4,7 @@
  *
  * 作用：
  *   1. 用 Electron 加载构建产物 dist/renderer/index.html（与主进程同样的加载方式）；
- *   2. 逐个视图截图到 docs/screenshots/；
+ *   2. 逐个视图截图到 dist/verify/screenshots/；
  *   3. 通过 win.webContents.on('console-message') 捕获 console 报错与页面未捕获异常；
  *   4. 输出 JSON 结果（截图路径 + 字节数 + 控制台错误）。
  *
@@ -25,7 +25,7 @@ const fs = require('node:fs');
 
 const ROOT = path.resolve(__dirname, '..');
 const ENTRY = path.join(ROOT, 'dist', 'renderer', 'index.html');
-const OUT = path.join(ROOT, 'docs', 'screenshots');
+const OUT = path.join(ROOT, 'dist', 'verify', 'screenshots');
 
 app.setPath('userData', path.join(ROOT, '.verify-ui-data'));
 app.commandLine.appendSwitch('disable-gpu-sandbox');

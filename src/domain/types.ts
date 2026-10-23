@@ -10,6 +10,7 @@ export interface PointerEventLike {
   /** 会话媒体时间 */
   tick: Ticks;
   kind: PointerEventKind;
+  button?: number;
   /** 归一化到源画面 [0,1] */
   x: number;
   y: number;

@@ -3,8 +3,8 @@
  * WP-F 界面验证脚本（R06 光标效果面板 + R12 录制备忘录）
  *
  * 用 Electron 加载 dist/renderer/index.html（mock 数据模式），只截两张图：
- *   docs/screenshots/09-cursor.png      编辑器 · 属性面板「光标」页签
- *   docs/screenshots/10-overlay-memo.png 悬浮控制条 · 备忘录展开
+ *   dist/verify/screenshots/09-cursor.png      编辑器 · 属性面板「光标」页签
+ *   dist/verify/screenshots/10-overlay-memo.png 悬浮控制条 · 备忘录展开
  * 并输出 JSON 结果（截图字节数 + 关键检查 + 控制台错误）。
  *
  * 运行：
@@ -18,7 +18,7 @@ const fs = require('node:fs');
 
 const ROOT = path.resolve(__dirname, '..');
 const ENTRY = path.join(ROOT, 'dist', 'renderer', 'index.html');
-const OUT = path.join(ROOT, 'docs', 'screenshots');
+const OUT = path.join(ROOT, 'dist', 'verify', 'screenshots');
 
 app.setPath('userData', path.join(ROOT, '.verify-wpf-data'));
 app.commandLine.appendSwitch('disable-gpu-sandbox');

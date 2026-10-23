@@ -35,6 +35,9 @@ const role: 'main' | 'overlay' | 'exporter' | 'recorder' | 'camera' = (() => {
 })();
 
 const api: WcsApi = {
+  recorder: role === 'recorder' ? { onSegment: callback => subscribe(IPC.recorderSegment, callback), complete: reply => ipcRenderer.send(IPC.recorderResult, reply) } : undefined,
+  desktop: location.hash.includes('camera-desktop') ? { frame: payload => ipcRenderer.send(IPC.captureDesktopFrame, payload) } : undefined,
+  cameraPreview: (enabled, deviceId) => invoke(IPC.captureCameraPreview, enabled, deviceId),
   // ---- 采集 ----
   listSources: () => invoke(IPC.captureListSources),
   // 注意：listSources 返回 CaptureSourceInfo[]（含 display:0 临时 ID），

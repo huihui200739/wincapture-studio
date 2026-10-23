@@ -18,7 +18,7 @@ const fs = require('node:fs');
 
 const ROOT = path.resolve(__dirname, '..');
 const ENTRY = path.join(ROOT, 'dist', 'renderer', 'index.html');
-const OUT = path.join(ROOT, 'docs', 'screenshots');
+const OUT = path.join(ROOT, 'dist', 'verify', 'screenshots');
 
 app.setPath('userData', path.join(ROOT, '.verify-ui-data'));
 app.commandLine.appendSwitch('disable-gpu-sandbox');

@@ -375,8 +375,34 @@ export function RecordView() {
   }, [capture, config.microphoneEnabled, config.systemAudioEnabled, apiMode]);
 
   // ---- 摄像头预览 ----
+  const [cameraPreviewError, setCameraPreviewError] = useState<string | null>(null);
   useEffect(() => {
     if (!config.cameraEnabled) return;
+    if (apiMode !== 'mock') {
+      let cancelled = false;
+      let timer: ReturnType<typeof setTimeout>;
+      let retryDelay = 250;
+      setCameraPreviewError(null);
+      const update = async () => {
+        try {
+          const result = await wcs().cameraPreview(true, config.cameraDeviceId);
+          if (cancelled) return;
+          if (!result.ok || !result.data?.ok || !result.data.png) { retryDelay = 3000; setCameraPreviewError(result.ok ? result.data?.error ?? '摄像头未就绪' : result.error?.message ?? '摄像头预览失败'); return; }
+          retryDelay = 250;
+          const image = new Image();
+          image.onload = () => {
+            if (cancelled) return;
+            const context = cameraRef.current?.getContext('2d');
+            if (context) { const fit = Math.min(480 / image.width, 360 / image.height); const w = image.width * fit, h = image.height * fit; context.fillStyle = '#101418'; context.fillRect(0, 0, 480, 360); context.drawImage(image, (480 - w) / 2, (360 - h) / 2, w, h); }
+            setCameraPreviewError(null);
+          };
+          image.src = `data:image/png;base64,${result.data.png}`;
+        } catch (error) { retryDelay = 3000; if (!cancelled) setCameraPreviewError(String(error)); }
+        finally { if (!cancelled) timer = setTimeout(update, retryDelay); }
+      };
+      void update();
+      return () => { cancelled = true; clearTimeout(timer); void wcs().cameraPreview(false).catch(() => undefined); };
+    }
     let raf = 0;
     const draw = () => {
       const canvas = cameraRef.current;
@@ -391,7 +417,7 @@ export function RecordView() {
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [config.cameraEnabled]);
+  }, [config.cameraEnabled, config.cameraDeviceId, apiMode]);
 
   // ---- 来源预览 ----
   const selectedSource = useMemo(() => sources.find((s) => s.id === config.sourceId) ?? null, [sources, config.sourceId]);
@@ -824,6 +850,10 @@ export function RecordView() {
             </div>}
           </Panel>
 
+          <Panel title="采集方式" icon="settings">
+            <Select ariaLabel="采集方式" value={config.backend ?? 'auto'} onChange={next => updateConfig({ backend: next as 'auto' | 'wgc' | 'compatibility' })}
+              options={[{ value: 'auto', label: '自动：优先现代采集，失败后兼容回退' }, { value: 'wgc', label: '现代采集 · Chromium / WGC' }, { value: 'compatibility', label: '兼容采集 · GDI / PrintWindow' }]} />
+          </Panel>
           {/* ---- 录制区域（R01）：只在整屏来源上可用 ---- */}
           {selectedSource?.kind === 'screen' && (
             <Panel
@@ -976,17 +1006,17 @@ export function RecordView() {
           <Panel
             title="摄像头"
             icon="camera"
-            subtitle={config.cameraEnabled ? '画中画示意' : '已关闭'}
+            subtitle={config.cameraEnabled ? apiMode === 'mock' ? '示例画面' : '实时取景' : '已关闭'}
           >
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1.6fr)', gap: 14 }}>
               <div>
                 <div className="camera-preview">
                   {config.cameraEnabled ? (
                     <>
-                      <canvas ref={cameraRef} width={480} height={360} aria-label="摄像头预览（示意画面）" />
+                      <canvas ref={cameraRef} width={480} height={360} aria-label="摄像头实时预览" />
                       <div className="camera-preview-overlay">
                         {/* 这里是合成示意画面：真开摄像头会占用设备，录制时独立采集窗口就打不开了 */}
-                        <Badge tone="neutral" icon="camera">示意画面 · 不占用摄像头</Badge>
+                        <Badge tone={cameraPreviewError ? 'warn' : 'neutral'} icon="camera">{apiMode === 'mock' ? '示例画面' : cameraPreviewError ? '摄像头不可用' : '实时取景'}</Badge>
                       </div>
                     </>
                   ) : (
@@ -999,7 +1029,7 @@ export function RecordView() {
                   )}
                 </div>
                 <p className="wcs-field-hint" style={{ marginTop: 8 }}>
-                  预览是示意画面。真实取景在录制时由独立的采集窗口完成，避免预览把摄像头占住导致录制缺画中画。
+                  {apiMode === 'mock' ? '示例模式使用合成画面。' : cameraPreviewError ?? '预览与录制共用同一摄像头连接，关闭开关或离开页面后释放预览。'}
                 </p>
               </div>
               <div>
