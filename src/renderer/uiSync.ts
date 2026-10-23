@@ -249,16 +249,16 @@ export function looksLikeDirectoryPath(raw: string): boolean {
  * 归一化用户输入路径：去空白；没有扩展名时补 `.mp4`；已有扩展名保持不变。
  * 只是归一化，不做授权/存在性检查（那属于主进程）。
  */
-export function normalizeOutputPath(raw: string): string {
+export function normalizeOutputPath(raw: string, extension: 'mp4' | 'm4a' = 'mp4'): string {
   const trimmed = raw.trim();
   if (!trimmed) return '';
   if (looksLikeDirectoryPath(trimmed)) {
-    return `${trimmed}${sanitizeFileStem('')}.mp4`;
+    return `${trimmed}${sanitizeFileStem('')}.${extension}`;
   }
   const lastSeparator = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
   const fileName = trimmed.slice(lastSeparator + 1);
   if (fileName.includes('.')) return trimmed;
-  return `${trimmed}.mp4`;
+  return `${trimmed}.${extension}`;
 }
 
 export interface OutputPathValidation {
@@ -273,17 +273,17 @@ export interface OutputPathValidation {
  * 非空、不像目录、扩展名是 .mp4、文件名不是保留名。
  * 目录是否存在/可写由主进程的 checkPath 决定，不在前端假装校验。
  */
-export function validateOutputPath(raw: string): OutputPathValidation {
+export function validateOutputPath(raw: string, extension: 'mp4' | 'm4a' = 'mp4'): OutputPathValidation {
   const trimmed = raw.trim();
   if (!trimmed) {
     return { ok: false, normalized: '', reason: '请先选择输出路径。' };
   }
   if (looksLikeDirectoryPath(trimmed)) {
-    return { ok: false, normalized: trimmed, reason: '这是一个目录，请选择以 .mp4 结尾的文件路径。' };
+    return { ok: false, normalized: trimmed, reason: `这是一个目录，请选择以 .${extension} 结尾的文件路径。` };
   }
-  const normalized = normalizeOutputPath(trimmed);
-  if (!/\.mp4$/i.test(normalized)) {
-    return { ok: false, normalized, reason: '输出文件需要以 .mp4 结尾。' };
+  const normalized = normalizeOutputPath(trimmed, extension);
+  if (!normalized.toLowerCase().endsWith(`.${extension}`)) {
+    return { ok: false, normalized, reason: `输出文件需要以 .${extension} 结尾。` };
   }
   const fileName = normalized.slice(Math.max(normalized.lastIndexOf('\\'), normalized.lastIndexOf('/')) + 1);
   if (!fileName || /^\.+$/.test(fileName)) {

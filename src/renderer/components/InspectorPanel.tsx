@@ -756,9 +756,22 @@ function ZoomTab({
             />
           </div>
 
-          <div className="inspector-section">
-            <div className="inspector-section-head">
-              <h3>过渡</h3>
+            <div className="inspector-section">
+              <div className="inspector-section-head"><h3>3D 运镜</h3></div>
+              {(['rotateX', 'rotateY', 'rotateZ'] as const).map((axis, i) => (
+                <Slider key={axis} label={['上下倾斜', '左右倾斜', '平面旋转'][i]} min={-45} max={45} step={1}
+                  value={(current.parameters as ZoomParameters)[axis] ?? 0} format={(v) => `${v.toFixed(0)}°`}
+                  onCommit={(next) => update({ [axis]: next })} />
+              ))}
+              <Slider label="透视距离" min={1} max={5} step={0.1}
+                value={(current.parameters as ZoomParameters).perspective ?? 2} format={(v) => `${v.toFixed(1)} 倍`}
+                onCommit={(next) => update({ perspective: next })} />
+              <Button size="sm" variant="ghost" onClick={() => update({ rotateX: 0, rotateY: 0, rotateZ: 0, perspective: 2 })}>重置 3D 角度</Button>
+              <InlineNote tone="info">旋转随进入、退出过渡变化，同时应用到预览、视频和教程截图。</InlineNote>
+            </div>
+            <div className="inspector-section">
+              <div className="inspector-section-head">
+                <h3>过渡</h3>
             </div>
             <Slider
               label="进入过渡"

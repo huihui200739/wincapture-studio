@@ -67,6 +67,12 @@ export type EffectKind = 'zoom' | 'privacy' | 'cursor' | 'annotation';
 export type EffectOrigin = 'automatic' | 'manual';
 
 export interface ZoomParameters {
+  /** 3D screen rotation in degrees; older projects default to a flat screen. */
+  rotateX?: number;
+  rotateY?: number;
+  rotateZ?: number;
+  /** Camera distance relative to the output long edge, 1..5. */
+  perspective?: number;
   /** 目标缩放倍数，1 为不放大 */
   scale: number;
   /** 焦点中心，归一化到源画面 [0,1] */

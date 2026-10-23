@@ -655,6 +655,13 @@ export function validateProject(project: Project, options: ValidationOptions = {
       }
     }
     if (effect.kind === 'zoom') {
+      const motion = effect.parameters as import('./project').ZoomParameters;
+      for (const [field, min, max] of [['rotateX', -45, 45], ['rotateY', -45, 45], ['rotateZ', -45, 45], ['perspective', 1, 5]] as const) {
+        const value = motion[field];
+        if (value !== undefined && (!Number.isFinite(value) || value < min || value > max)) {
+          push({ code: 'effect-parameters-invalid', severity: 'error', message: `3D 运镜 ${field} 必须在 ${min} 到 ${max} 之间。`, entity: 'effect', entityId: effect.id, field: `parameters.${field}` });
+        }
+      }
       const p = effect.parameters as { scale?: number; focusX?: number; focusY?: number };
       if (typeof p.scale !== 'number' || !Number.isFinite(p.scale) || p.scale < 1) {
         push({

@@ -29,6 +29,7 @@
     "verify:overlay": "node scripts/run-electron.mjs scripts/verify-overlay.cjs",
     "verify:exporter": "node scripts/run-electron.mjs scripts/verify-exporter.cjs",
     "verify:parity": "node scripts/run-electron.mjs scripts/verify-parity.cjs",
+    "verify:remaining": "node scripts/run-electron.mjs scripts/verify-remaining.cjs",
     "verify:record": "npm run build && node scripts/verify-record.mjs",
     "verify:camera": "node scripts/run-electron.mjs scripts/verify-camera.cjs",
     "verify:wp-f": "node scripts/run-electron.mjs scripts/verify-wp-f.cjs",

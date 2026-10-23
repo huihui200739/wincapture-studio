@@ -350,6 +350,7 @@ export class SegmentEncoder {
 // ---------------------------------------------------------------------------
 
 export interface MuxerOptions {
+  audioOnly?: boolean;
   width: number;
   height: number;
   fps: number;
@@ -381,6 +382,20 @@ export class ContinuousMuxer {
   async init(hardwarePreferred = true): Promise<string> {
     if (this.output) throw new Error('ContinuousMuxer 已初始化，请新建实例');
     const { width, height, fps, videoBitrate, audioBitrate, audioSampleRate, audioChannels, includeAudio } = this.options;
+    if (this.options.audioOnly) {
+      if (!await canEncodeAudio('aac', { bitrate: audioBitrate, sampleRate: audioSampleRate, numberOfChannels: audioChannels })) {
+        throw new Error('本机没有可用的 AAC 音频编码器');
+      }
+      this.output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
+      this.audioSource = new AudioBufferSource({ codec: 'aac', bitrate: audioBitrate });
+      this.output.addAudioTrack(this.audioSource);
+      this.audioContext = new OfflineAudioContext(audioChannels, audioSampleRate, audioSampleRate);
+      this.audioChannels = audioChannels;
+      this.audioSampleRate = audioSampleRate;
+      this.encoderLabel = 'aac';
+      await this.output.start();
+      return this.encoderLabel;
+    }
     const attempts: HardwareAcceleration[] = hardwarePreferred
       ? ['prefer-hardware', 'no-preference', 'prefer-software']
       : ['no-preference', 'prefer-software'];

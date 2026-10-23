@@ -11,6 +11,7 @@
  */
 
 import { useEffect, useMemo, useRef } from 'react';
+import { mapRectBounds, projectScreenPoint, unprojectScreenPoint } from '@domain/projection';
 import type { Project } from '@domain/project';
 import { activeVariant, findTrack, timelineDuration } from '@domain/project';
 import type { FrameScene } from '@domain/scene';
@@ -253,10 +254,11 @@ export function sourceRectToDisplayRect(
   const viewX = Math.min(1 - viewW, Math.max(0, scene.zoom.focusX - viewW / 2));
   const viewY = Math.min(1 - viewW, Math.max(0, scene.zoom.focusY - viewW / 2));
   return {
-    x: (r.x + ((rect.x - viewX) / viewW) * r.width) / scene.outputWidth,
-    y: (r.y + ((rect.y - viewY) / viewW) * r.height) / scene.outputHeight,
-    width: (rect.width / viewW) * (r.width / scene.outputWidth),
-    height: (rect.height / viewW) * (r.height / scene.outputHeight),
+    ...mapRectBounds(rect, point => {
+      const p = projectScreenPoint(scene, { x: r.x + ((point.x - viewX) / viewW) * r.width,
+        y: r.y + ((point.y - viewY) / viewW) * r.height });
+      return { x: p.x / scene.outputWidth, y: p.y / scene.outputHeight };
+    }),
   };
 }
 
@@ -273,14 +275,10 @@ export function displayRectToSourceRect(
   if (r.width <= 0 || r.height <= 0 || scene.outputWidth <= 0 || scene.outputHeight <= 0) {
     return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
   }
-  const px = rect.x * scene.outputWidth;
-  const py = rect.y * scene.outputHeight;
-  return {
-    x: viewX + ((px - r.x) / r.width) * viewW,
-    y: viewY + ((py - r.y) / r.height) * viewW,
-    width: (rect.width * scene.outputWidth * viewW) / r.width,
-    height: (rect.height * scene.outputHeight * viewW) / r.height,
-  };
+  return mapRectBounds(rect, point => {
+    const p = unprojectScreenPoint(scene, { x: point.x * scene.outputWidth, y: point.y * scene.outputHeight });
+    return { x: viewX + ((p.x - r.x) / r.width) * viewW, y: viewY + ((p.y - r.y) / r.height) * viewW };
+  });
 }
 
 /**

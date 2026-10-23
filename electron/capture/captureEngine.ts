@@ -309,6 +309,8 @@ export class CaptureEngine {
     }
 
     const quality = QUALITY_PROFILES.find((q) => q.id === config.qualityId) ?? QUALITY_PROFILES[1];
+    const windowSource = config.sourceKind === 'window' ? this.windowBounds(config.sourceId) : null;
+    if (config.sourceKind === 'window' && !windowSource) throw new AppError({ code: 'E_SOURCE_CLOSED', message: '所选窗口已关闭或最小化，请刷新窗口列表。', retryable: true, preservedData: true });
     this.transition('Preparing');
 
     const degradationParts: string[] = [];
@@ -318,10 +320,13 @@ export class CaptureEngine {
 
     // ---- 采集区域（§7.1 / R01）----
     // region 是「源显示器内的物理像素矩形」。整屏时用显示器原点。
-    const display = this.resolveDisplayBounds(config.sourceId);
-    const region = this.normalizeRegion(config.region, display, degradationParts);
-
-    await this.deps.ensureProjectDir(projectPath);
+    const display = windowSource ?? this.resolveDisplayBounds(config.sourceId);
+    const region = this.normalizeRegion(windowSource ? undefined : config.region, display, degradationParts);
+    if (windowSource) {
+      region.width -= region.width % 2; region.height -= region.height % 2;
+      width = region.width; height = region.height;
+      degradationParts.push('窗口兼容采集（PrintWindow）；最小化或受保护窗口不可录制');
+    }
 
     // 输出尺寸：区域录制按区域原生像素输出，保证「选择结果与预览一致」(R01)。
     // 不做二次缩放——缩放会让文字变糊，而录屏的主要用途恰恰是看清文字。
@@ -356,6 +361,7 @@ export class CaptureEngine {
     // 权限被拒）会让 engine.start 抛错，但 state 停在 Preparing、session 仍非空。
     // 之后用户再点「开始录制」只会得到「已有录制会话在进行中」，界面却显示空闲。
     try {
+      await this.deps.ensureProjectDir(projectPath);
       await fsp.mkdir(path.join(projectPath, 'media', 'screen'), { recursive: true });
       await fsp.mkdir(path.join(projectPath, 'media', 'mic'), { recursive: true });
       await fsp.mkdir(path.join(projectPath, 'media', 'system'), { recursive: true });
@@ -392,6 +398,7 @@ export class CaptureEngine {
 
     // 启动屏幕采集
     const grabber = new GrabberWorker(this.workerPaths.grabberExe, {
+      windowHandle: windowSource ? /^window:(\d+)$/.exec(config.sourceId)?.[1] : undefined,
       width: region.width,
       height: region.height,
       offsetX: region.x,
@@ -557,6 +564,7 @@ export class CaptureEngine {
   }
 
   /** 由 main.ts 注入的真实显示器几何。 */
+  windowBounds: (sourceId: string) => { x: number; y: number; width: number; height: number } | null = () => null;
   displayBounds: (index: number) => { x: number; y: number; width: number; height: number } = () => ({
     x: 0,
     y: 0,
@@ -1373,8 +1381,7 @@ export class CaptureEngine {
       const session = this.session;
       if (!session) return;
       const mediaTick = Math.max(0, this.clock.durationTicks(this.nowQpc()));
-      const x = point.x / Math.max(1, session.effective.width);
-      const y = point.y / Math.max(1, session.effective.height);
+      const { x, y } = this.normalizedPointer(point.x, point.y);
 
       const last = this.lastPointer;
       const moved = !last || Math.abs(x - last.x) > POINTER_MOVE_EPSILON || Math.abs(y - last.y) > POINTER_MOVE_EPSILON;
@@ -1383,8 +1390,8 @@ export class CaptureEngine {
       this.pointerEvents.push({
         tick: mediaTick,
         kind: 'move',
-        x: Math.max(0, Math.min(1, x)),
-        y: Math.max(0, Math.min(1, y)),
+        x,
+        y,
         px: point.x,
         py: point.y,
         geometryVersion: 1,
@@ -1395,6 +1402,18 @@ export class CaptureEngine {
     }, POINTER_INTERVAL_MS);
   }
 
+  private normalizedPointer(x: number, y: number): { x: number; y: number } {
+    const session = this.session;
+    const bounds = this.grabber?.captureBounds;
+    if (!session || !bounds) return { x: x / Math.max(1, session?.effective.width ?? 1), y: y / Math.max(1, session?.effective.height ?? 1) };
+    const window = session.config.sourceKind === 'window';
+    if (window && (x < bounds.x || y < bounds.y || x >= bounds.x + bounds.width || y >= bounds.y + bounds.height)) return { x: -1, y: -1 };
+    const fit = window ? Math.min(session.effective.width / bounds.width, session.effective.height / bounds.height) : 1;
+    const dw = Math.round(bounds.width * fit), dh = Math.round(bounds.height * fit);
+    return { x: ((x - bounds.x) * fit + (window ? (session.effective.width - dw) / 2 : 0)) / (window ? session.effective.width : bounds.width),
+      y: ((y - bounds.y) * fit + (window ? (session.effective.height - dh) / 2 : 0)) / (window ? session.effective.height : bounds.height) };
+  }
+
   /** 记录一次点击（由界面/全局钩子调用）。 */
   recordClick(x: number, y: number): void {
     const session = this.session;
@@ -1402,8 +1421,8 @@ export class CaptureEngine {
     // 只在录制/暂停期间记录：停止后再点击属于下一次会话，时间戳会落在旧时间轴上
     if (!['Recording', 'Paused', 'Pausing'].includes(this.state)) return;
     const mediaTick = Math.max(0, this.clock.durationTicks(this.nowQpc()));
-    const nx = Math.max(0, Math.min(1, x / Math.max(1, session.effective.width)));
-    const ny = Math.max(0, Math.min(1, y / Math.max(1, session.effective.height)));
+    const { x: nx, y: ny } = this.normalizedPointer(x, y);
+    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
     this.pointerEvents.push({ tick: mediaTick, kind: 'down', x: nx, y: ny, px: x, py: y, geometryVersion: 1, captureState: 'ok' });
     this.pointerClicks.push({ tick: mediaTick, x: nx, y: ny });
   }

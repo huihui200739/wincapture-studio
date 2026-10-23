@@ -516,7 +516,8 @@ export function RecordView() {
   useEffect(() => {
     if (config.sourceKind === sourceKind) return;
     const selection = pickSourceForKind(sources, sourceKind, config.sourceId);
-    updateConfig(selection);
+    if (sourceKind === 'window') setRegionEnabled(false);
+    updateConfig({ ...selection, region: undefined });
   }, [config.sourceId, config.sourceKind, sourceKind, sources, updateConfig]);
 
   // ---- 倒计时 ----
@@ -818,6 +819,9 @@ export function RecordView() {
                 <InlineNote tone="warn">{sourcePixelHint}</InlineNote>
               </div>
             )}
+            {sourceKind === 'window' && <div style={{ marginTop: 10 }}>
+              <InlineNote tone="info">窗口兼容采集支持移动和调整大小；最小化会中断采集，受保护或部分 GPU 窗口可能无法捕获。系统声音录制来自整台电脑。</InlineNote>
+            </div>}
           </Panel>
 
           {/* ---- 录制区域（R01）：只在整屏来源上可用 ---- */}

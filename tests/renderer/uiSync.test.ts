@@ -234,6 +234,11 @@ describe('deriveDefaultOutputPath', () => {
 });
 
 describe('normalizeOutputPath', () => {
+  it('M4A 补扩展名并拒绝错误的格式后缀', () => {
+    expect(normalizeOutputPath('C:\\out\\audio', 'm4a')).toBe('C:\\out\\audio.m4a');
+    expect(validateOutputPath('C:\\out\\audio.m4a', 'm4a').ok).toBe(true);
+    expect(validateOutputPath('C:\\out\\video.mp4', 'm4a').ok).toBe(false);
+  });
   it('缺少扩展名时补 .mp4', () => {
     expect(normalizeOutputPath('C:\\out\\demo')).toBe('C:\\out\\demo.mp4');
   });

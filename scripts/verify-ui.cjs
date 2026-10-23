@@ -236,7 +236,41 @@ async function verifyNewControls(win) {
     autoTab:document.getElementById('inspector-tab-privacy').getAttribute('aria-selected') === 'true' })`);
   if (clipboard.count !== before + 1 || !clipboard.unconfirmed || !clipboard.autoTab) throw new Error('效果粘贴或属性面板联动失败');
   await win.webContents.executeJavaScript(`document.dispatchEvent(new KeyboardEvent('keydown', {key:'z', ctrlKey:true, bubbles:true}))`);
-  return { exportSettings, presetCount, presetApplied, presetUndone, clipboard };
+  await goView(win, 'export', '.export-layout');
+  await win.webContents.executeJavaScript(`[...document.querySelectorAll('.kind-card')].find(e => e.textContent.includes('纯音频')).click()`);
+  await settle(win, 150);
+  const audio = await win.webContents.executeJavaScript(`({ path: document.getElementById('export-path').value,
+    hidesVideo: !document.getElementById('export-resolution'), audioBitrate: !!document.querySelector('[aria-label="音频码率"]') })`);
+  if (!audio.path.endsWith('.m4a') || !audio.hidesVideo || !audio.audioBitrate) throw new Error('M4A 设置未正确切换');
+  await capture(win, '16-m4a-export', 'M4A 纯音频导出');
+  await goView(win, 'editor', '.editor');
+  await win.webContents.executeJavaScript(`if (!document.querySelector('.tl-effect.is-zoom')) document.querySelector('.advanced-tracks-toggle')?.click()`);
+  await settle(win, 150);
+  await win.webContents.executeJavaScript(`document.querySelector('.tl-effect.is-zoom').click()`);
+  await settle(win, 150);
+  const motion = await win.webContents.executeJavaScript(`(() => {
+    const input = [...document.querySelectorAll('.wcs-slider')].find(e => e.textContent.includes('左右倾斜')).querySelector('input');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '-25');
+    input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.dispatchEvent(new PointerEvent('pointerup', { bubbles: true })); return !!input;
+  })()`);
+  await settle(win, 150);
+  await win.webContents.executeJavaScript(`(() => {
+    const input = document.querySelector('input[aria-label="播放进度"]');
+    if (input) {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '50000000');
+      input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  })()`);
+  await settle(win, 150);
+  await capture(win, '17-motion3d', '3D 运镜属性与共用预览');
+  const audioToggle = await win.webContents.executeJavaScript(`(() => {
+    const button = document.querySelector('[aria-label="关闭音频试听"]'); button.click(); return !!button;
+  })()`);
+  await settle(win, 100);
+  const audioOff = await win.webContents.executeJavaScript(`!!document.querySelector('[aria-label="开启音频试听"]')`);
+  if (!motion || !audioToggle || !audioOff) throw new Error('3D/试听控件交互失败');
+  return { exportSettings, presetCount, presetApplied, presetUndone, clipboard, audio, motion, audioOff };
 }
 
 app.whenReady().then(async () => {

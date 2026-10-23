@@ -25,6 +25,7 @@ import { timelineDuration } from '@domain/project';
 import type { SetEffectCommand, DeleteRangeCommand } from '@domain/commands';
 import { cn } from '../lib/format';
 import type { FrameScene } from '@domain/scene';
+import { useAudioPreview } from '../lib/audioPreview';
 
 type DragState = { kind: 'none' } | { kind: 'creating'; x0: number; y0: number; x1: number; y1: number };
 
@@ -57,6 +58,8 @@ export function EditorView() {
   } = useApp();
 
   const [zoom, setZoom] = useState(1);
+  const [audioPreviewEnabled, setAudioPreviewEnabled] = useState(true);
+  const audioPreviewError = useAudioPreview(project, apiMode === 'mock' ? null : projectPath, tick, playing, audioPreviewEnabled);
   const [timelineCollapsed, setTimelineCollapsed] = useState(false);
   const [drag, setDrag] = useState<DragState>({ kind: 'none' });
   const [scene, setScene] = useState<FrameScene | null>(null);
@@ -516,6 +519,9 @@ export function EditorView() {
           </div>
 
           <div className="stage-toolbar-spacer" />
+          <IconButton icon="volume" size="sm" label={audioPreviewEnabled ? '关闭音频试听' : '开启音频试听'}
+            variant={audioPreviewEnabled ? 'secondary' : 'ghost'} onClick={() => setAudioPreviewEnabled(v => !v)} />
+          {audioPreviewError && <Badge tone="warn" title={audioPreviewError}>试听失败</Badge>}
 
           {/* 剪辑工具（分割/删除）集中在时间线工具栏，这里只保留播放与遮挡提示（§P1） */}
           <div className="stage-toolbar-group">

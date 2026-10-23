@@ -456,7 +456,7 @@ export function resampleAudioChannels(
  * - 淡入淡出只做片段边界 8ms 的抗爆音斜坡，不做音量美化。
  * - 混完统一限幅到 [-1, 1]。
  */
-class TimelineAudioMixer {
+export class TimelineAudioMixer {
   private addedSamples = 0;
   private readonly sampleRate: number;
   private readonly channels: number;
@@ -464,7 +464,7 @@ class TimelineAudioMixer {
   constructor(
     private readonly plan: ExportPlan,
     private readonly sources: Map<string, FrameProvider>,
-    private readonly muxer: ContinuousMuxer,
+    private readonly muxer: { audioBufferFactory: Pick<BaseAudioContext, 'createBuffer'> | null; addAudio(buffer: AudioBuffer): Promise<void> },
     private readonly abortCheck: () => void,
     /** clipId → 播放速率（AudioMixInterval 不含 rate，从工程片段补齐） */
     private readonly clipRate: Map<string, number> = new Map(),
@@ -506,7 +506,7 @@ class TimelineAudioMixer {
     return this.addedSamples;
   }
 
-  private async renderChunk(startSample: number, count: number): Promise<AudioBuffer | null> {
+  async renderChunk(startSample: number, count: number): Promise<AudioBuffer | null> {
     const sr = this.sampleRate;
     const channels = this.channels;
     const factory = this.muxer.audioBufferFactory;
@@ -690,6 +690,23 @@ async function verifyMp4(
     }) as unknown as MediabunnyInputLike;
     const opened = input;
     const videoTrack = await opened.getPrimaryVideoTrack();
+    if (plan.audioOnly) {
+      detail.durationSeconds = await opened.computeDuration();
+      detail.checks['noVideoTrack'] = !videoTrack;
+      detail.checks['duration'] = Math.abs(detail.durationSeconds - expectedDuration) <= 0.08;
+      const audio = await opened.getPrimaryAudioTrack();
+      detail.hasAudio = !!audio;
+      detail.checks['audioTrack'] = !!audio;
+      if (audio) {
+        detail.audioChannels = await audio.getNumberOfChannels();
+        detail.audioSampleRate = await audio.getSampleRate();
+        detail.audioCodec = await audio.getCodec();
+        detail.checks['audioFormat'] = detail.audioChannels === plan.audioChannels &&
+          detail.audioSampleRate === plan.audioSampleRate && detail.audioCodec === 'aac';
+      }
+      for (const [key, ok] of Object.entries(detail.checks)) if (!ok) failures.push(`音频校验失败：${key}`);
+      return { ok: failures.length === 0, detail, failures };
+    }
     if (!videoTrack) {
       failures.push('输出中没有视频轨');
       detail.checks['videoTrack'] = false;
@@ -806,7 +823,7 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
   const snapshot = snapshotProject(project);
   const plan = buildExportPlan(snapshot, profile);
   const totalFrames = Math.max(0, plan.totalFrames);
-  const progress = createProgressReporter(jobId, totalFrames, options.onProgress);
+  const progress = createProgressReporter(jobId, plan.audioOnly ? 0 : totalFrames, options.onProgress);
 
   let muxer: ContinuousMuxer | null = null;
   /** `.partial` 是否已经「尝试写入」（写失败也视为可能留下残片，必须清理） */
@@ -842,9 +859,6 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
     const snapshotHash = await sha256Hex(stableStringify(snapshot));
     throwIfAborted();
 
-    if (plan.audioOnly) {
-      throw exportFailedError('纯音频导出（M4A）尚未启用。', 'exporter.ts: profile.audioOnly=true 属 P1 能力');
-    }
     if (totalFrames <= 0) {
       throw exportFailedError('工程时长为 0，没有可导出的帧。', 'exporter.ts: plan.totalFrames=0');
     }
@@ -873,7 +887,7 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
     for (const track of snapshot.tracks) for (const clip of track.clips) clipAsset.set(clip.id, clip.assetId);
 
     const needed = new Set<string>();
-    for (const segment of plan.segments) needed.add(segment.assetId);
+    if (!plan.audioOnly) for (const segment of plan.segments) needed.add(segment.assetId);
     for (const interval of plan.audioIntervals) needed.add(interval.assetId);
 
     const mainAssetIds = new Set<string>();
@@ -910,6 +924,7 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
     // ---- 3. 初始化封装器 ----
     const fps = fpsToNumber(plan.fps);
     muxer = new ContinuousMuxer({
+      audioOnly: plan.audioOnly,
       width: plan.outputWidth,
       height: plan.outputHeight,
       fps,
@@ -922,7 +937,7 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
     const encoderLabel = await muxer.init(true);
     throwIfAborted();
 
-    const drawContext = muxer.drawContext;
+    const drawContext = plan.audioOnly ? null : muxer.drawContext;
     const screenHolder = new FrameHolder();
     const cameraHolder = new FrameHolder();
     const timeMap = new TimeMap(snapshot);
@@ -940,7 +955,7 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
 
     // ---- 4. 逐帧渲染 ----
     framesDone = 0;
-    for (let i = 0; i < totalFrames; i++) {
+    for (let i = 0; i < totalFrames && !plan.audioOnly; i++) {
       throwIfAborted();
       const tick = frameTickAt(plan, i);
       // 指针日志是按「素材/会话时间」记录的（captureEngine 写的是 clock.durationTicks），
@@ -961,7 +976,7 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
         cameraHolder,
         timeMap,
       });
-      drawScene(drawContext, scene, resources, { includeOverlays: false });
+      drawScene(drawContext!, scene, resources, { includeOverlays: false });
       await muxer.addFrame(tick / TICKS_PER_SECOND);
       framesDone += 1;
 
@@ -982,6 +997,14 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
 
     // ---- 5. 音频收尾 ----
     throwIfAborted();
+    if (plan.audioOnly) {
+      const chunk = plan.audioSampleRate;
+      for (let sample = 0; sample < plan.audioTotalSamples; sample += chunk) {
+        throwIfAborted();
+        await audioMixer.pumpTo(Math.min(plan.audioTotalSamples, sample + chunk));
+        progress.emit(2 + Math.min(1, (sample + chunk) / plan.audioTotalSamples) * 82, 'encoding', '正在混合并编码音频…', 0, 0);
+      }
+    }
     await audioMixer.pumpTo(plan.audioTotalSamples, true);
     throwIfAborted();
 

@@ -5,49 +5,61 @@
       "name": "01-home",
       "label": "首页：最近工程 / 新建录制 / 恢复未完成录制 / 教程入口",
       "file": "docs\\screenshots\\01-home.png",
-      "bytes": 379587
+      "bytes": 380076
     },
     {
       "name": "02-record",
       "label": "录制设置：来源缩略图与真实分辨率 / 电平表 / 摄像头 / 质量档位 / 磁盘",
       "file": "docs\\screenshots\\02-record.png",
-      "bytes": 325622
+      "bytes": 325616
     },
     {
       "name": "03-editor",
       "label": "编辑器：预览 canvas + 时间线 + 属性面板",
       "file": "docs\\screenshots\\03-editor.png",
-      "bytes": 355619
+      "bytes": 356466
     },
     {
       "name": "04-editor-canvas",
       "label": "编辑器 · 画布属性：画幅 16:9/1:1/9:16、背景、圆角、阴影、摄像头布局",
       "file": "docs\\screenshots\\04-editor-canvas.png",
-      "bytes": 357144
+      "bytes": 357966
     },
     {
       "name": "05-export",
       "label": "导出面板：产物类型 / 输出路径 / 画幅 / 预计体积 / 进度与结果区",
       "file": "docs\\screenshots\\05-export.png",
-      "bytes": 218638
+      "bytes": 227931
     },
     {
       "name": "06-tutorial",
       "label": "教程页：步骤列表 / 标题说明编辑 / 截图预览 / 合并拆分",
       "file": "docs\\screenshots\\06-tutorial.png",
-      "bytes": 280281
+      "bytes": 280323
     },
     {
       "name": "07-settings",
       "label": "设置页：系统信息 / 采集能力 / 快捷键 / 诊断",
       "file": "docs\\screenshots\\07-settings.png",
-      "bytes": 282352
+      "bytes": 282518
     },
     {
       "name": "08-overlay-bar",
       "label": "录制悬浮控制条：状态文字 + 图标 + 计时 + 暂停 / 标记 / 停止",
       "file": "docs\\screenshots\\08-overlay-bar.png",
       "bytes": 20090
+    },
+    {
+      "name": "16-m4a-export",
+      "label": "M4A 纯音频导出",
+      "file": "docs\\screenshots\\16-m4a-export.png",
+      "bytes": 207835
+    },
+    {
+      "name": "17-motion3d",
+      "label": "3D 运镜属性与共用预览",
+      "file": "docs\\screenshots\\17-motion3d.png",
+      "bytes": 474271
     }
   ],
   "consoleErrors": [],
@@ -96,7 +108,7 @@
       "sliders": 8
     },
     "export": {
-      "kindCards": 3,
+      "kindCards": 4,
       "variantCards": 3,
       "summaryRows": 10,
       "outputPath": "C:\\Users\\huihui\\Videos\\WinCapture Studio\\演示工程 · 新建客户流程.mp4"
@@ -142,7 +154,14 @@
         "count": 3,
         "unconfirmed": true,
         "autoTab": true
-      }
+      },
+      "audio": {
+        "path": "C:\\Users\\huihui\\Videos\\WinCapture Studio\\演示工程 · 新建客户流程.m4a",
+        "hidesVideo": true,
+        "audioBitrate": true
+      },
+      "motion": true,
+      "audioOff": true
     }
   },
   "notes": [],

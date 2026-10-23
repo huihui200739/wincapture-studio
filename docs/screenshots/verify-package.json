@@ -4,7 +4,7 @@
     "artifacts": {
       "setup": {
         "name": "WinCapture Studio-0.1.0-Setup.exe",
-        "mb": 109.16
+        "mb": 109.17
       },
       "unpackedExe": {
         "mb": 238.29

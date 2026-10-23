@@ -164,7 +164,7 @@ export interface ExportProfile {
   fps: { num: number; den: number };
   videoBitrate: number;
   audioBitrate: number;
-  /** 是否导出纯音频 M4A（P1 能力，MVP 关闭） */
+  /** 是否仅导出 AAC 音频，使用 M4A 容器。 */
   audioOnly: boolean;
   /** 教程产物 */
   includeTutorial: boolean;

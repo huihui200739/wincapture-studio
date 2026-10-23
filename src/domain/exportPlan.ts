@@ -40,7 +40,7 @@ export interface ExportProfileLike {
   fps?: { num: number; den: number } | number;
   videoBitrate?: number;
   audioBitrate?: number;
-  /** 纯音频 M4A（P1，MVP 关闭） */
+  /** 纯音频 AAC / M4A 导出。 */
   audioOnly?: boolean;
   includeTutorial?: boolean;
 }

@@ -30,6 +30,7 @@ export type { AudioErrorPacket, AudioPacket, VideoFramePacket } from './wireProt
 export { MAX_AUDIO_PACKET_BYTES, MAX_VIDEO_FRAME_BYTES } from './wireProtocol';
 
 export interface GrabberOptions {
+  windowHandle?: string;
   width: number;
   height: number;
   offsetX: number;
@@ -161,6 +162,13 @@ export class GrabberWorker {
     return this.framesEmitted;
   }
 
+  get captureBounds(): { x: number; y: number; width: number; height: number } {
+    const matches = [...this.parser.raw.matchAll(/WINDOW_BOUNDS (-?\d+) (-?\d+) (\d+) (\d+)/g)];
+    const last = matches.at(-1);
+    return last ? { x: Number(last[1]), y: Number(last[2]), width: Number(last[3]), height: Number(last[4]) }
+      : { x: this.options.offsetX, y: this.options.offsetY, width: this.options.width, height: this.options.height };
+  }
+
   get stderr(): string {
     return this.parser.raw;
   }
@@ -175,7 +183,8 @@ export class GrabberWorker {
     const { width, height, offsetX, offsetY, quality, fps } = this.options;
     const child = this.spawnImpl(
       this.exePath,
-      [String(width), String(height), String(offsetX), String(offsetY), String(quality), String(fps)],
+      [String(width), String(height), String(offsetX), String(offsetY), String(quality), String(fps),
+        ...(this.options.windowHandle ? [`--window=${this.options.windowHandle}`] : [])],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true },
     );
     this.child = child;

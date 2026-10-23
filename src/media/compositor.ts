@@ -12,6 +12,8 @@
 
 import type { FrameScene, NormalizedRect, PrivacyScene } from '../domain/scene';
 import { screenRectPx } from '../domain/scene';
+import { hasMotion } from '../domain/projection';
+import { screenLayer, drawProjectedScreen } from './projectedScreen';
 
 /** 一帧可用的媒体资源（由调用方按时间点解码后提供）。 */
 export interface SceneResources {
@@ -332,6 +334,9 @@ export function drawScene(
   }
 
   // 2. 屏幕内容：圆角裁剪 + 阴影
+  const outputContext = ctx;
+  const layer = hasMotion(scene) ? screenLayer(ctx, W, H) : null;
+  if (layer) { ctx = layer.getContext('2d')!; ctx.save(); }
   if (scene.shadowBlur > 0 && scene.shadowOpacity > 0) {
     ctx.save();
     ctx.shadowColor = `rgba(0,0,0,${scene.shadowOpacity})`;
@@ -394,6 +399,11 @@ export function drawScene(
   ctx.restore();
 
   // 5. 摄像头画中画
+  if (layer) {
+    ctx.restore();
+    ctx = outputContext;
+    drawProjectedScreen(ctx, layer, scene);
+  }
   drawCamera(ctx, scene, resources);
 
   // 6. 画布标注

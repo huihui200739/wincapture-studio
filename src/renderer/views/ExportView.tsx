@@ -35,14 +35,14 @@ import {
   type ExportBundleLike,
 } from '../uiSync';
 
-type Kind = 'video' | 'tutorial' | 'both';
+type Kind = 'video' | 'audio' | 'tutorial' | 'both';
 type Status = 'idle' | 'running' | 'done' | 'failed' | 'cancelled';
 
 const PHASE_TEXT: Record<ExportProgress['phase'], string> = {
   preparing: '准备工程快照',
   rendering: '渲染画面',
-  encoding: '编码视频',
-  muxing: '封装 MP4',
+  encoding: '编码媒体',
+  muxing: '封装输出文件',
   finalizing: '收尾与校验',
   done: '完成',
   cancelled: '已取消',
@@ -59,6 +59,8 @@ export function ExportView() {
   const { project, systemInfo, pushToast, pushError, apiMode, setView, selectEffect } = useApp();
 
   const [kind, setKind] = useState<Kind>('video');
+  const extension = kind === 'audio' ? 'm4a' : 'mp4';
+  useEffect(() => setOutputPath((previous) => previous.replace(/\.(mp4|m4a)$/i, `.${extension}`)), [extension]);
   const [variantId, setVariantId] = useState('landscape');
   const [resolution, setResolution] = useState<ExportResolution>('1080');
   const [outputFps, setOutputFps] = useState<ExportFrameRate>('project');
@@ -101,7 +103,7 @@ export function ExportView() {
     [project],
   );
 
-  const pathCheck = useMemo(() => validateOutputPath(outputPath), [outputPath]);
+  const pathCheck = useMemo(() => validateOutputPath(outputPath, extension), [outputPath, extension]);
 
   /**
    * 默认输出路径：跟着「视频目录 + 当前工程名」走。
@@ -111,8 +113,8 @@ export function ExportView() {
   useEffect(() => {
     if (pathTouched) return;
     const derived = deriveDefaultOutputPath(systemInfo?.videosPath, project?.name);
-    if (derived) setOutputPath(derived);
-  }, [pathTouched, project?.name, systemInfo?.videosPath]);
+    if (derived) setOutputPath(derived.replace(/\.mp4$/i, `.${extension}`));
+  }, [pathTouched, project?.name, systemInfo?.videosPath, extension]);
 
   // 进度订阅
   useEffect(() => {
@@ -136,8 +138,9 @@ export function ExportView() {
 
   const profile = useMemo<ExportProfile | null>(() => {
     if (!project) return null;
-    return createExportProfile(project, { variantId, resolution, fps: outputFps, quality,
+    const result = createExportProfile(project, { variantId, resolution, fps: outputFps, quality,
       includeTutorial: kind === 'tutorial' || kind === 'both' });
+    return { ...result, audioOnly: kind === 'audio', videoBitrate: kind === 'audio' ? 0 : result.videoBitrate };
   }, [kind, project, variantId, resolution, outputFps, quality]);
 
   const estimatedBytes = useMemo(() => {
@@ -150,12 +153,12 @@ export function ExportView() {
     setPicking(true);
     try {
       const picked = unwrap(
-        await wcs().pickSavePath(`${project?.name ?? 'WinCapture 录制'}.mp4`, [
-          { name: 'MP4 视频', extensions: ['mp4'] },
+        await wcs().pickSavePath(`${project?.name ?? 'WinCapture 录制'}.${extension}`, [
+          { name: kind === 'audio' ? 'M4A 音频' : 'MP4 视频', extensions: [extension] },
         ]),
       );
       if (picked) {
-        setOutputPath(normalizeOutputPath(picked));
+        setOutputPath(normalizeOutputPath(picked, extension));
         setPathTouchedFor(projectId);
       }
     } catch (err) {
@@ -176,7 +179,7 @@ export function ExportView() {
 
   const startExport = useCallback(async () => {
     if (!project || !profile || runningRef.current) return;
-    const validation = validateOutputPath(outputPath);
+    const validation = validateOutputPath(outputPath, extension);
     if (!validation.ok) {
       pushToast({ tone: 'warn', title: '输出路径不可用', message: validation.reason ?? '请检查输出路径。' });
       return;
@@ -227,7 +230,7 @@ export function ExportView() {
         tone: outcome.warnings.length > 0 ? 'warn' : 'ok',
         title: outcome.warnings.length > 0 ? '导出完成（有告警）' : '导出完成',
         message: video
-          ? `${formatBytes(video.bytes)} · ${video.frames} 帧 · 完整性校验${video.verified ? '通过' : '未通过'}`
+            ? `${formatBytes(video.bytes)} · ${kind === 'audio' ? 'AAC 音频' : `${video.frames} 帧`} · 完整性校验${video.verified ? '通过' : '未通过'}`
           : '教程包已生成',
       });
       if (outcome.warnings.length > 0) {
@@ -247,7 +250,7 @@ export function ExportView() {
       runningRef.current = false;
       setCancelling(false);
     }
-  }, [kind, outputPath, profile, project, pushToast]);
+  }, [kind, outputPath, profile, project, pushToast, extension]);
 
   /**
    * 取消导出。
@@ -358,7 +361,7 @@ export function ExportView() {
         </div>
       </div>
 
-      {unconfirmedPrivacy.length > 0 && (
+      {kind !== 'audio' && unconfirmedPrivacy.length > 0 && (
         <div style={{ marginBottom: 12 }}>
           <InlineNote tone="warn">
             <strong>{unconfirmedPrivacy.length} 处遮挡未确认。</strong> 这些区域不会被遮挡，导出后仍可能暴露敏感信息。
@@ -386,6 +389,7 @@ export function ExportView() {
             <div className="kind-cards">
               {[
                 { id: 'video' as Kind, icon: 'editor', title: '视频', desc: 'MP4 · H.264 + AAC，含运镜、遮挡与画布样式' },
+                { id: 'audio' as Kind, icon: 'volume', title: '纯音频', desc: 'M4A · AAC，按剪辑、变速、音量和静音设置混合' },
                 { id: 'tutorial' as Kind, icon: 'book', title: '图文教程', desc: '静态 HTML + Markdown + 步骤截图' },
                 { id: 'both' as Kind, icon: 'layers', title: '视频 + 教程', desc: '同时生成，共享同一份遮挡确认结果' },
               ].map((item) => (
@@ -394,8 +398,7 @@ export function ExportView() {
                   type="button"
                   className={cn('kind-card', kind === item.id && 'is-selected')}
                   aria-pressed={kind === item.id}
-                  onClick={() => setKind(item.id)}
-                  style={item.id === 'both' ? { gridColumn: 'span 2' } : undefined}
+                  onClick={() => { setKind(item.id); resetToIdle(); }}
                 >
                   <span className="kind-icon">
                     <Icon name={item.icon} size={16} />
@@ -431,9 +434,9 @@ export function ExportView() {
                   }}
                   onBlur={() => {
                     // 用户手输路径时补全 .mp4，避免主进程写出没有扩展名的文件
-                    if (outputPath.trim()) setOutputPath(normalizeOutputPath(outputPath));
+                    if (outputPath.trim()) setOutputPath(normalizeOutputPath(outputPath, extension));
                   }}
-                  placeholder="选择 .mp4 输出路径"
+                  placeholder={`选择 .${extension} 输出路径`}
                   disabled={running}
                   aria-invalid={!pathCheck.ok}
                 />
@@ -443,6 +446,7 @@ export function ExportView() {
               </div>
             </Field>
 
+            {kind !== 'audio' && <>
             <Field label="画幅">
               <div className="variant-row">
                 {VARIANTS.map((item) => (
@@ -488,7 +492,10 @@ export function ExportView() {
               <Field label="视频码率">
                 <TextInput value={profile ? formatBitrate(profile.videoBitrate) : '—'} readOnly aria-label="视频码率" />
               </Field>
-              <Field label="音频码率">
+            </div>
+            </>}
+            <div>
+              <Field label="音频码率" hint={kind === 'audio' ? 'AAC · 48 kHz 双声道；使用时间线的音量、静音与变速设置。' : undefined}>
                 <TextInput value={profile ? formatBitrate(profile.audioBitrate) : '—'} readOnly aria-label="音频码率" />
               </Field>
             </div>
@@ -526,7 +533,7 @@ export function ExportView() {
                   indeterminate={status === 'running' && !progress}
                 />
                 <div className="progress-facts">
-                  <span>帧 {progress?.framesDone ?? 0} / {progress?.framesTotal ?? 0}</span>
+                  {kind !== 'audio' && <span>帧 {progress?.framesDone ?? 0} / {progress?.framesTotal ?? 0}</span>}
                   <span>已写 {formatBytes(progress?.bytesWritten ?? 0)}</span>
                   <span>阶段 {progress ? PHASE_TEXT[progress.phase] : '准备'}</span>
                 </div>
@@ -588,9 +595,9 @@ export function ExportView() {
                 )}
                 {result.video && (
                   <div className="result-facts">
-                    <span>视频：{result.video.outputPath ?? '（未返回路径）'}</span>
+                    <span>{kind === 'audio' ? '音频' : '视频'}：{result.video.outputPath ?? '（未返回路径）'}</span>
                     <span>
-                      {formatBytes(result.video.bytes)} · {result.video.frames} 帧 · {formatClock(result.video.durationTicks)} ·{' '}
+                      {formatBytes(result.video.bytes)} · {kind !== 'audio' && `${result.video.frames} 帧 · `}{formatClock(result.video.durationTicks)} ·{' '}
                       {result.video.encoder}
                     </span>
                     <span>完整性校验：{result.video.verified ? '通过' : '未通过'}</span>
@@ -615,7 +622,7 @@ export function ExportView() {
                   )}
                   {result.video?.outputPath && (
                     <Button size="sm" variant="ghost" icon="play" onClick={() => void playOutput(result.video!.outputPath as string)}>
-                      播放视频
+                      播放{kind === 'audio' ? '音频' : '视频'}
                     </Button>
                   )}
                   {result.tutorial?.indexPath && (
@@ -647,7 +654,7 @@ export function ExportView() {
                 <span className="kv-key">预计体积</span>
                 <span className="kv-value">{formatBytes(estimatedBytes)}</span>
               </div>
-              <div className="kv-row">
+              {kind !== 'audio' && <><div className="kv-row">
                 <span className="kv-key">遮挡确认</span>
                 <span className="kv-value">
                   {unconfirmedPrivacy.length === 0 ? (
@@ -660,7 +667,7 @@ export function ExportView() {
               <div className="kv-row">
                 <span className="kv-key">教程步骤</span>
                 <span className="kv-value">{project.steps.length}</span>
-              </div>
+              </div></>}
               <div className="kv-row">
                 <span className="kv-key">输出路径</span>
                 <span className="kv-value">
@@ -676,29 +683,29 @@ export function ExportView() {
                 <span className="kv-value">{systemInfo ? '导出时由主进程检查' : '读取中…'}</span>
               </div>
             </div>
-            <div style={{ marginTop: 10 }}>
+            {kind !== 'audio' && <div style={{ marginTop: 10 }}>
               <InlineNote tone={unconfirmedPrivacy.length > 0 ? 'warn' : 'ok'}>
                 {unconfirmedPrivacy.length > 0
                   ? '未确认的遮挡不会生效。建议先在编辑器里核对并确认，再导出。'
                   : '遮挡全部确认，教程截图与视频会使用同一份遮挡结果。'}
               </InlineNote>
-            </div>
+            </div>}
           </Panel>
 
           <Panel title="产物说明" icon="info">
             <div className="kv-list">
               <div className="kv-row">
-                <span className="kv-key">视频</span>
-                <span className="kv-value">MP4 / H.264 / AAC</span>
+                <span className="kv-key">{kind === 'audio' ? '音频' : '视频'}</span>
+                <span className="kv-value">{kind === 'audio' ? 'M4A / AAC / 48 kHz' : 'MP4 / H.264 / AAC'}</span>
               </div>
-              <div className="kv-row">
+              {kind !== 'audio' && <><div className="kv-row">
                 <span className="kv-key">教程</span>
                 <span className="kv-value">HTML + Markdown + PNG</span>
               </div>
               <div className="kv-row">
                 <span className="kv-key">预览一致</span>
                 <span className="kv-value">与预览同一 drawScene</span>
-              </div>
+              </div></>}
             </div>
             <p className="wcs-field-hint" style={{ marginTop: 8 }}>
               导出使用工程快照，不阻塞继续编辑；导出过程中修改工程不会影响本次产物。
@@ -707,7 +714,7 @@ export function ExportView() {
 
           {apiMode === 'mock' && (
             <InlineNote tone="warn">
-              <strong>示例数据模式：</strong> 导出流程会模拟进度与结果，不会真正写出 MP4 文件。
+              <strong>示例数据模式：</strong> 导出流程会模拟进度与结果，不会真正写出媒体文件。
             </InlineNote>
           )}
         </div>

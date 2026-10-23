@@ -23,6 +23,7 @@ import {
   shell,
   protocol,
   net,
+  desktopCapturer,
   type OpenDialogOptions,
   type SaveDialogOptions,
 } from 'electron';
@@ -30,6 +31,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
+import { execFile } from 'node:child_process';
 
 import { IPC, type CaptureConfig, type CaptureStatus, type ExportProfile, type ExportProgress, type ExportResult, type IpcResponse, type SystemInfo, type CaptureSourceInfo, type DisplayInfo, type AudioDeviceInfo, type VideoDeviceInfo } from '../src/shared/ipc';
 import { QUALITY_PROFILES } from '../src/shared/ipc';
@@ -46,6 +48,17 @@ const isDev = !app.isPackaged;
 // 这里用 __dirname（CJS 全局）而不是 import.meta.url，因为主进程产物是 CommonJS。
 const APP_ROOT = path.resolve(__dirname, '..', '..');
 const RENDERER_DIST = path.join(APP_ROOT, 'dist', 'renderer');
+interface NativeWindowSource { id: string; name: string; x: number; y: number; width: number; height: number; available: boolean }
+const windowSources = new Map<string, NativeWindowSource>();
+function listNativeWindows(): Promise<NativeWindowSource[]> {
+  return new Promise((resolve, reject) => {
+    execFile(resolveWorkerPaths(app.getAppPath(), app.isPackaged).grabberExe, ['--list-windows'],
+      { windowsHide: true, encoding: 'utf8', timeout: 5000, maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
+        if (error) { reject(error); return; }
+        try { resolve(JSON.parse(stdout.replace(/^\uFEFF/, ''))); } catch (error) { reject(error); }
+      });
+  });
+}
 
 // 应用图标（用户确认的白瓷叠帧稿，见 assets/icon-manifest.json）。
 // 开发态直接读源码 assets/；打包后读随包拷贝的 dist/assets/（build-main 前置复制）。
@@ -807,7 +820,7 @@ function freeDiskBytes(target: string): number {
 }
 
 function cursorPoint(): { x: number; y: number } {
-  return screen.getCursorScreenPoint();
+  return screen.dipToScreenPoint(screen.getCursorScreenPoint());
 }
 
 // ---------------------------------------------------------------------------
@@ -973,14 +986,13 @@ function buildEngine(): CaptureEngine {
   created.displayBounds = (index: number) => {
     const displays = screen.getAllDisplays();
     const display = displays[index] ?? screen.getPrimaryDisplay();
-    // GDI 用物理像素坐标；Electron 的 bounds 是 DIP，需要乘 scaleFactor
-    const scale = display.scaleFactor || 1;
-    return {
-      x: Math.round(display.bounds.x * scale),
-      y: Math.round(display.bounds.y * scale),
-      width: Math.round(display.bounds.width * scale),
-      height: Math.round(display.bounds.height * scale),
-    };
+    // Convert the rectangle as a whole: multiplying the origin by the scale is
+    // incorrect on desktops whose displays have different scale factors.
+    return screen.dipToScreenRect(null, display.bounds);
+  };
+  created.windowBounds = (id) => {
+    const source = windowSources.get(id);
+    return source?.available ? source : null;
   };
   return created;
 }
@@ -1503,17 +1515,19 @@ function registerIpc(): void {
         available: true,
       };
     });
-    // 窗口来源：本机 WGC 不可用，如实标注不可用（§9.5 诚实降级）
-    const windows = BrowserWindow.getAllWindows()
-      .filter((win) => !win.isDestroyed() && win !== overlayWindow)
-      .map((win, index) => ({
-        id: `window:${win.id}`,
-        kind: 'window' as const,
-        name: win.getTitle() || `窗口 ${index + 1}`,
-        width: win.getBounds().width,
-        height: win.getBounds().height,
-        available: false,
-      }));
+    const ownHandles = new Set(BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed())
+      .map((w) => { const buffer = w.getNativeWindowHandle(); return `window:${buffer.length >= 8 ? buffer.readBigUInt64LE().toString() : buffer.readUInt32LE().toString()}`; }));
+    const native = await listNativeWindows().catch((error) => { console.warn('[sources] 窗口枚举失败', error); return []; });
+    windowSources.clear();
+    for (const item of native) if (!ownHandles.has(item.id)) windowSources.set(item.id, item);
+    const windows: CaptureSourceInfo[] = [...windowSources.values()].map((item) => ({ ...item, kind: 'window' }));
+    try {
+      const thumbnails = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 480, height: 270 }, fetchWindowIcons: true });
+      for (const source of [...sources, ...windows]) {
+        const thumb = thumbnails.find((t) => source.kind === 'screen' ? t.display_id === source.displayId : t.id.startsWith(source.id + ':'));
+        if (thumb && !thumb.thumbnail.isEmpty()) source.thumbnail = thumb.thumbnail.toDataURL();
+      }
+    } catch (error) { console.warn('[sources] 缩略图不可用', error); }
     return [...sources, ...windows];
   });
 
@@ -1548,6 +1562,11 @@ function registerIpc(): void {
     captureStartInFlight = true;
     try {
       const config = validateCaptureConfig(rawConfig);
+      if (config.sourceKind === 'window') {
+        const fresh = (await listNativeWindows()).find(item => item.id === config.sourceId);
+        if (!fresh?.available || !windowSources.has(config.sourceId)) throw new AppError({ code: 'E_SOURCE_CLOSED', message: '所选窗口已关闭或最小化，请重新选择。', retryable: true, preservedData: true });
+        windowSources.set(fresh.id, fresh);
+      }
       const name = `录制 ${new Date().toLocaleString('zh-CN')}`;
       // 唯一目录：同名录制（同一秒内多次开始）绝不能覆盖已有工程
       const projectPath = store.uniqueProjectPath(name);
@@ -1965,7 +1984,7 @@ function registerIpc(): void {
     if (typeof request.includeTutorial !== 'boolean') invalid('includeTutorial 不是布尔值');
     const outputPath = typeof request.outputPath === 'string' ? request.outputPath.trim() : '';
     if (!outputPath || !path.isAbsolute(outputPath)) invalid('outputPath 必须是绝对路径');
-    if (!/\.mp4$/i.test(outputPath)) invalid('outputPath 必须以 .mp4 结尾');
+    if (!((request.profile as Partial<ExportProfile> | undefined)?.audioOnly ? /\.m4a$/i : /\.mp4$/i).test(outputPath)) invalid('输出扩展名必须与 MP4/M4A 格式匹配');
     const outputAbs = path.resolve(outputPath);
     // 关键修复：输出目录必须落在「用户通过原生对话框选择过的目录」或系统视频/应用数据目录内。
     // 旧实现直接 allowRoot(dirname(渲染进程传入的 outputPath))，等于让渲染进程任意写盘。

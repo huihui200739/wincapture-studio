@@ -24,9 +24,55 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Text;
+using System.Collections.Generic;
 
 internal static class Grabber
 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT { public int Left, Top, Right, Bottom; }
+    private delegate bool EnumWindowCallback(IntPtr hwnd, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int count);
+    [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr hwnd, IntPtr dc, uint flags);
+    [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, uint attribute, out int value, int size);
+
+    private static string JsonString(string value)
+    {
+        StringBuilder json = new StringBuilder("\"");
+        foreach (char c in value) {
+            if (c == '\\' || c == '"') json.Append('\\').Append(c);
+            else if (c < 32) json.Append("\\u").Append(((int)c).ToString("x4"));
+            else json.Append(c);
+        }
+        return json.Append('"').ToString();
+    }
+
+    private static int ListWindows()
+    {
+        List<string> items = new List<string>();
+        EnumWindows(delegate(IntPtr hwnd, IntPtr parameter) {
+            RECT r;
+            if (!IsWindowVisible(hwnd) || !GetWindowRect(hwnd, out r) || r.Right-r.Left < 64 || r.Bottom-r.Top < 64) return true;
+            int cloaked = 0;
+            try { DwmGetWindowAttribute(hwnd, 14, out cloaked, 4); } catch { }
+            if (cloaked != 0) return true;
+            StringBuilder title = new StringBuilder(1024);
+            GetWindowText(hwnd, title, title.Capacity);
+            if (title.Length == 0) return true;
+            items.Add("{\"id\":\"window:" + hwnd.ToInt64() + "\",\"name\":" + JsonString(title.ToString()) +
+                ",\"x\":" + r.Left + ",\"y\":" + r.Top + ",\"width\":" + (r.Right-r.Left) + ",\"height\":" + (r.Bottom-r.Top) +
+                ",\"available\":" + (IsIconic(hwnd) ? "false" : "true") + "}");
+            return true;
+        }, IntPtr.Zero);
+        Console.OutputEncoding = new UTF8Encoding(false);
+        Console.WriteLine("[" + string.Join(",", items.ToArray()) + "]");
+        return 0;
+    }
     // ---- Win32 ----
     [DllImport("user32.dll")]
     private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
@@ -98,6 +144,8 @@ internal static class Grabber
         try { SetProcessDpiAwarenessContext(new IntPtr(-4)); }
         catch { /* 旧系统忽略 */ }
 
+        if (args.Length == 1 && args[0] == "--list-windows") return ListWindows();
+
         QueryPerformanceFrequency(out _qpcFrequency);
         Log("QPCFREQ " + _qpcFrequency);
 
@@ -110,6 +158,7 @@ internal static class Grabber
         int width, height, offsetX, offsetY, quality;
         int fps = 30;
         bool probe = false;
+        IntPtr windowHandle = IntPtr.Zero;
         try
         {
             width = int.Parse(args[0]);
@@ -121,6 +170,7 @@ internal static class Grabber
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "--probe") probe = true;
+                if (args[i].StartsWith("--window=")) windowHandle = new IntPtr(long.Parse(args[i].Substring(9)));
             }
         }
         catch (Exception ex)
@@ -141,12 +191,11 @@ internal static class Grabber
         // 裁剪到虚拟桌面范围内，避免越界导致全黑
         int screenW = GetSystemMetrics(78); // SM_CXVIRTUALSCREEN
         int screenH = GetSystemMetrics(79); // SM_CYVIRTUALSCREEN
-        if (screenW > 0 && screenH > 0)
+        if (windowHandle == IntPtr.Zero && screenW > 0 && screenH > 0)
         {
-            if (offsetX < 0) offsetX = 0;
-            if (offsetY < 0) offsetY = 0;
-            if (offsetX + width > screenW) offsetX = Math.Max(0, screenW - width);
-            if (offsetY + height > screenH) offsetY = Math.Max(0, screenH - height);
+            int screenX = GetSystemMetrics(76), screenY = GetSystemMetrics(77);
+            offsetX = Math.Max(screenX, Math.Min(offsetX, screenX + screenW - width));
+            offsetY = Math.Max(screenY, Math.Min(offsetY, screenY + screenH - height));
         }
 
         _stdout = Console.OpenStandardOutput();
@@ -203,6 +252,8 @@ internal static class Grabber
         int frames = 0;
         int failures = 0;
         Stopwatch clock = Stopwatch.StartNew();
+        Bitmap windowBitmap = null;
+        int lastWindowWidth = 0, lastWindowHeight = 0;
 
         try
         {
@@ -228,7 +279,35 @@ internal static class Grabber
                 bool ok = false;
                 try
                 {
-                    graphics.CopyFromScreen(offsetX, offsetY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+                    if (windowHandle == IntPtr.Zero) {
+                        graphics.CopyFromScreen(offsetX, offsetY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+                    } else {
+                        RECT bounds;
+                        if (!IsWindow(windowHandle) || IsIconic(windowHandle) || !GetWindowRect(windowHandle, out bounds)) {
+                            Log("SOURCE_CLOSED window closed or minimized"); _quit = true; break;
+                        }
+                        int ww = bounds.Right-bounds.Left, wh = bounds.Bottom-bounds.Top;
+                        if (bounds.Left != offsetX || bounds.Top != offsetY || ww != lastWindowWidth || wh != lastWindowHeight) {
+                            offsetX = bounds.Left; offsetY = bounds.Top; lastWindowWidth = ww; lastWindowHeight = wh;
+                            Log("WINDOW_BOUNDS " + offsetX + " " + offsetY + " " + ww + " " + wh);
+                        }
+                        if (ww <= 0 || wh <= 0) throw new Exception("Invalid window bounds");
+                        if (windowBitmap == null || windowBitmap.Width != ww || windowBitmap.Height != wh) {
+                            if (windowBitmap != null) windowBitmap.Dispose();
+                            windowBitmap = new Bitmap(ww, wh, PixelFormat.Format24bppRgb);
+                        }
+                        using (Graphics wg = Graphics.FromImage(windowBitmap)) {
+                            IntPtr dc = wg.GetHdc();
+                            bool captured;
+                            try { captured = PrintWindow(windowHandle, dc, 2); }
+                            finally { wg.ReleaseHdc(dc); }
+                            if (!captured) { Log("SOURCE_CLOSED PrintWindow rejected"); _quit = true; break; }
+                        }
+                        graphics.Clear(Color.Black);
+                        double fit = Math.Min(width/(double)ww, height/(double)wh);
+                        int dw = Math.Max(1, (int)Math.Round(ww*fit)), dh = Math.Max(1, (int)Math.Round(wh*fit));
+                        graphics.DrawImage(windowBitmap, (width-dw)/2, (height-dh)/2, dw, dh);
+                    }
                     ok = true;
                 }
                 catch (Exception ex)
@@ -275,6 +354,7 @@ internal static class Grabber
         }
         finally
         {
+            if (windowBitmap != null) windowBitmap.Dispose();
             timeEndPeriod(1);
             try { graphics.Dispose(); } catch { }
             try { bitmap.Dispose(); } catch { }

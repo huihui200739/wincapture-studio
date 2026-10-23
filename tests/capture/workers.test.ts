@@ -110,6 +110,17 @@ const grabberOptions = { width: 1920, height: 1080, offsetX: 0, offsetY: 0, qual
 const nextTick = () => new Promise<void>((resolve) => setTimeout(resolve, 5));
 
 describe('GrabberWorker: 启动握手', () => {
+  it('window capture passes HWND and tracks physical bounds across split stderr chunks', async () => {
+    const child = new FakeChild(); remember(child);
+    const spawn = vi.fn(() => child.asChildProcess());
+    const worker = new GrabberWorker('grabber.exe', { ...grabberOptions, windowHandle: '12345' }, spawn as unknown as SpawnFn);
+    const ready = worker.start(); child.stderr.write('READY\nWINDOW_BOUNDS -100 40 800');
+    child.stderr.write(' 600\n'); await ready;
+    expect(spawn.mock.calls[0][1]).toContain('--window=12345');
+    expect(worker.captureBounds).toEqual({ x: -100, y: 40, width: 800, height: 600 });
+    child.stderr.write('WINDOW_BOUNDS 200 -50 400 300\n');
+    expect(worker.captureBounds).toEqual({ x: 200, y: -50, width: 400, height: 300 });
+  });
   it('stderr 被拆成多个 chunk 时仍能识别 QPCFREQ 与 READY', async () => {
     const child = new FakeChild();
     remember(child);

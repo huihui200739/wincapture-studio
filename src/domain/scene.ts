@@ -17,6 +17,7 @@ import { TimeMap as TimeMapClass } from './timeMap';
 import type { Ticks, TickRange } from './timebase';
 import { clampTicks } from './timebase';
 import { evaluateZoom } from './zoom';
+import { evaluateMotion, projectScreenPoint, type ScreenMotion } from './projection';
 import { stepTimelineRange } from './tutorial';
 
 export interface NormalizedRect {
@@ -91,6 +92,7 @@ export interface FrameScene {
   /** 源画面裁切（运镜由 zoom 决定） */
   sourceCrop: SourceCrop;
   zoom: { scale: number; focusX: number; focusY: number };
+  screenMotion?: ScreenMotion;
   /** 源坐标遮挡（先于运镜应用） */
   screenPrivacy: PrivacyScene[];
   cursor: CursorScene;
@@ -192,6 +194,7 @@ export function evaluateScene(project: Project, tick: Ticks, options: SceneOptio
   // 运镜只对当前时间线时间生效（效果区间按时间线时间记录）
   const zoomEffects = project.effects.filter((e) => e.kind === 'zoom');
   const zoom = evaluateZoom(zoomEffects, tick);
+  const screenMotion = evaluateMotion(zoomEffects, tick);
 
   const sourceAspect = mainHit
     ? (() => {
@@ -294,6 +297,7 @@ export function evaluateScene(project: Project, tick: Ticks, options: SceneOptio
     screenRect,
     sourceCrop: { x: 0, y: 0, width: 1, height: 1 },
     zoom,
+    screenMotion,
     screenPrivacy,
     cursor,
     camera,
@@ -336,7 +340,7 @@ export function sourceToOutput(
   const viewY = clampTicks(Math.round((focusY - viewH / 2) * 1e6), 0, Math.round((1 - viewH) * 1e6)) / 1e6;
   const u = (nx - viewX) / viewW;
   const v = (ny - viewY) / viewH;
-  return { x: r.x + u * r.width, y: r.y + v * r.height };
+  return projectScreenPoint(scene, { x: r.x + u * r.width, y: r.y + v * r.height });
 }
 
 /** 当前时间点命中的运镜效果（供界面显示「依据/置信度」，§12.3）。 */

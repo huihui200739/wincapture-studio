@@ -39,7 +39,8 @@ interface EngineInternals {
   micPackets: AudioPacket[];
   systemPackets: AudioPacket[];
   pendingSegments: SegmentView[];
-  grabber: { frequency: bigint; stop: () => Promise<void> } | null;
+  grabber: { frequency: bigint; stop: () => Promise<void>; captureBounds?: { x: number; y: number; width: number; height: number } } | null;
+  normalizedPointer(x: number, y: number): { x: number; y: number };
   audio: null;
   stopping: boolean;
   handleVideoFrame(frame: VideoFramePacket): void;
@@ -349,6 +350,21 @@ describe('CaptureEngine: 摄像头分段不阻塞屏幕编码队列', () => {
 });
 
 describe('CaptureEngine: 状态机复位（第二场录制可开始）', () => {
+  it('窗口指针扣除物理原点并跟随 letterbox；离开窗口时隐藏', () => {
+    const { internals } = makeEngine();
+    internals.session = makeSession('C:\\test', { sourceKind: 'window' });
+    internals.grabber = { frequency: FREQ, stop: async () => {}, captureBounds: { x: -100, y: 200, width: 960, height: 1080 } };
+    expect(internals.normalizedPointer(380, 740)).toEqual({ x: 0.5, y: 0.5 });
+    expect(internals.normalizedPointer(-101, 740)).toEqual({ x: -1, y: -1 });
+    internals.grabber.captureBounds = { x: 100, y: -100, width: 1920, height: 1080 };
+    expect(internals.normalizedPointer(1060, 440)).toEqual({ x: 0.5, y: 0.5 });
+  });
+
+  it('屏幕指针使用采集区域尺寸，不使用输出质量档位的尺寸', () => {
+    const { internals } = makeEngine(); internals.session = makeSession('C:\\test', { sourceKind: 'screen' });
+    internals.grabber = { frequency: FREQ, stop: async () => {}, captureBounds: { x: 200, y: 300, width: 800, height: 600 } };
+    expect(internals.normalizedPointer(600, 600)).toEqual({ x: 0.5, y: 0.5 });
+  });
   it('ReadyToEdit 会被复位到 Idle', async () => {
     const projectPath = await makeProjectDir();
     const { engine, internals } = makeEngine();
