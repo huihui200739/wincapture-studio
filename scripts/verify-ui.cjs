@@ -255,14 +255,17 @@ async function verifyNewControls(win) {
     input.dispatchEvent(new PointerEvent('pointerup', { bubbles: true })); return !!input;
   })()`);
   await settle(win, 150);
-  await win.webContents.executeJavaScript(`(() => {
+  const seekPosition = await win.webContents.executeJavaScript(`(() => {
     const input = document.querySelector('input[aria-label="播放进度"]');
-    if (input) {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '50000000');
-      input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true }));
-    }
+    const rect = input.getBoundingClientRect();
+    return { x: Math.round(rect.left + rect.width / 6), y: Math.round(rect.top + rect.height / 2) };
   })()`);
+  win.focus();
+  win.webContents.sendInputEvent({ type: 'mouseDown', ...seekPosition, button: 'left', clickCount: 1 });
+  win.webContents.sendInputEvent({ type: 'mouseUp', ...seekPosition, button: 'left', clickCount: 1 });
   await settle(win, 150);
+  const motionTick = await win.webContents.executeJavaScript(`Number(document.querySelector('input[aria-label="播放进度"]').value)`);
+  if (motionTick < 40000000 || motionTick > 60000000) throw new Error('3D 截图播放头未进入镜头区间：' + motionTick);
   await capture(win, '17-motion3d', '3D 运镜属性与共用预览');
   const audioToggle = await win.webContents.executeJavaScript(`(() => {
     const button = document.querySelector('[aria-label="关闭音频试听"]'); button.click(); return !!button;
@@ -270,7 +273,7 @@ async function verifyNewControls(win) {
   await settle(win, 100);
   const audioOff = await win.webContents.executeJavaScript(`!!document.querySelector('[aria-label="开启音频试听"]')`);
   if (!motion || !audioToggle || !audioOff) throw new Error('3D/试听控件交互失败');
-  return { exportSettings, presetCount, presetApplied, presetUndone, clipboard, audio, motion, audioOff };
+  return { exportSettings, presetCount, presetApplied, presetUndone, clipboard, audio, motion, motionTick, audioOff };
 }
 
 app.whenReady().then(async () => {

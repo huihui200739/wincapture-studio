@@ -55,6 +55,13 @@ export function projectScreenPoint(scene: FrameScene, point: Point): Point {
   return { x: g.ox + (g.a * x + g.b * y) / w, y: g.oy + (g.c * x + g.d * y) / w };
 }
 
+/** Homogeneous weight, used for perspective-correct GPU texture interpolation. */
+export function screenProjectionWeight(scene: FrameScene, point: Point): number {
+  if (!hasMotion(scene)) return 1;
+  const g = geometry(scene);
+  return 1 - (g.e * (point.x - g.ox) + g.f * (point.y - g.oy)) / g.distance;
+}
+
 export function unprojectScreenPoint(scene: FrameScene, point: Point): Point {
   if (!hasMotion(scene)) return point;
   const g = geometry(scene), u = point.x - g.ox, v = point.y - g.oy;

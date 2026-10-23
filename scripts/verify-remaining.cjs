@@ -6,14 +6,14 @@ const path = require('node:path');
 const ROOT = path.resolve(__dirname, '..');
 const OUT = path.join(ROOT, 'dist', 'verify');
 app.setPath('userData', path.join(ROOT, '.tmp', 'remaining-data'));
-app.disableHardwareAcceleration();
+if (process.env.WCS_SOFTWARE === '1') app.disableHardwareAcceleration();
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 const assert = (ok, message) => { if (!ok) throw new Error(message); };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function browserProbe() {
   const { mb, createEmptyProject, VideoFrameSource, exportProject, createExportProfile, evaluateScene, sourceToOutput, unprojectScreenPoint,
-    drawScene, TimelineAudioMixer, buildExportPlan, AudioPreviewScheduler } = Features;
+    drawScene, drawProjectedScreen, projectGpuSurface, TimelineAudioMixer, buildExportPlan, AudioPreviewScheduler } = Features;
   const assert = (ok, message) => { if (!ok) throw new Error(message); };
   const S = 10_000_000, sr = 48_000;
   // Real PCM WAV input; both the preview mixer and M4A exporter decode these bytes.
@@ -125,11 +125,39 @@ async function browserProbe() {
     if (u > 0.05 && u < 0.95 && v > 0.05 && v < 0.95 && whitePixels[(y * 640 + x) * 4] < 250) seams++;
   }
   assert(seams === 0, '白底 3D 网格出现暗色接缝：' + seams);
+  const alpha = new OffscreenCanvas(640, 360), alphaCtx = alpha.getContext('2d');
+  alphaCtx.fillStyle = 'rgba(255,255,255,0.5)'; alphaCtx.fillRect(0, 0, 640, 360);
+  draw.fillStyle = '#000000'; draw.fillRect(0, 0, 640, 360); drawProjectedScreen(draw, alpha, scene);
+  const alphaPixels = draw.getImageData(0, 0, 640, 360).data;
+  let alphaOverlaps = 0;
+  for (let y = 0; y < 360; y++) for (let x = 0; x < 640; x++) {
+    const point = unprojectScreenPoint(scene, { x: x + 0.5, y: y + 0.5 });
+    const value = alphaPixels[(y * 640 + x) * 4];
+    if (point.x > 40 && point.x < 600 && point.y > 40 && point.y < 320 && (value < 125 || value > 131)) alphaOverlaps++;
+  }
+  assert(alphaOverlaps === 0, '透明 3D 网格被重复混合：' + alphaOverlaps);
+  const gpuAvailable = !!projectGpuSurface(alpha, scene);
+  const originalGetContext = OffscreenCanvas.prototype.getContext;
+  let softwareAnomalies = 0;
+  try {
+    OffscreenCanvas.prototype.getContext = function(kind, options) { return kind === 'webgl' ? null : originalGetContext.call(this, kind, options); };
+    for (const opacity of [1, 0.5]) {
+      const layer = new OffscreenCanvas(640, 360), context = layer.getContext('2d');
+      context.fillStyle = `rgba(255,255,255,${opacity})`; context.fillRect(0, 0, 640, 360);
+      draw.fillStyle = '#000000'; draw.fillRect(0, 0, 640, 360); drawProjectedScreen(draw, layer, scene);
+      const pixels = draw.getImageData(0, 0, 640, 360).data;
+      for (let y = 0; y < 360; y++) for (let x = 0; x < 640; x++) {
+        const point = unprojectScreenPoint(scene, { x: x + 0.5, y: y + 0.5 }), value = pixels[(y * 640 + x) * 4];
+        if (point.x > 40 && point.x < 600 && point.y > 40 && point.y < 320 && Math.abs(value - Math.round(opacity * 255)) > 3) softwareAnomalies++;
+      }
+    }
+  } finally { OffscreenCanvas.prototype.getContext = originalGetContext; }
+  assert(softwareAnomalies === 0, '软件回退出现网格接缝/透明叠加：' + softwareAnomalies);
   decoder.close();
   return { m4a: { bytes: result.bytes, frames: result.frames, duration: result.durationTicks / S, checks: result.verifiedDetail.checks,
     nonSilentDecode: true, cancellationCleanup: true, noVideoEncoder: true }, audioPreview: { gain: peak(0), channels: 2, doubledToneCrossings: crossings,
     mute: true, realtimeContext: true }, motion3D: { changedPixels: changed, frames: video.frames, verified: video.verified,
-      previewExportMeanError: difference, privacy: true, whiteMeshSeams: seams },
+      previewExportMeanError: difference, privacy: true, whiteMeshSeams: seams, alphaMeshOverlaps: alphaOverlaps, gpuAvailable, softwareAnomalies },
     artifacts: { 'remaining-tone.m4a': Array.from(outputBytes), 'remaining-3d.mp4': Array.from(files.get('3d.mp4')), 'remaining-3d.png': Array.from(motionPng) } };
 }
 
@@ -181,6 +209,8 @@ app.whenReady().then(async () => {
       export { evaluateScene, sourceToOutput } from './src/domain/scene';
       export { unprojectScreenPoint } from './src/domain/projection';
       export { drawScene } from './src/media/compositor';
+      export { drawProjectedScreen } from './src/media/projectedScreen';
+      export { projectGpuSurface } from './src/media/perspectiveGpu';
       export { createExportProfile } from './src/renderer/lib/exportSettings';
       export { exportProject, TimelineAudioMixer } from './src/media/exporter';
       export { buildExportPlan } from './src/domain/exportPlan';

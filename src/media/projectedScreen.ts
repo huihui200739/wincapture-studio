@@ -1,7 +1,9 @@
 import type { FrameScene } from '../domain/scene';
 import { projectScreenPoint, type Point } from '../domain/projection';
+import { projectGpuSurface } from './perspectiveGpu';
 type Context = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 const layers = new WeakMap<Context, OffscreenCanvas>();
+const projectedLayers = new WeakMap<OffscreenCanvas, OffscreenCanvas>();
 export function screenLayer(ctx: Context, width: number, height: number): OffscreenCanvas {
   let layer = layers.get(ctx);
   if (!layer || layer.width !== width || layer.height !== height) {
@@ -13,6 +15,21 @@ export function screenLayer(ctx: Context, width: number, height: number): Offscr
 
 /** Piecewise affine textured mesh approximates perspective in the shared 2D renderer. */
 export function drawProjectedScreen(ctx: Context, layer: OffscreenCanvas, scene: FrameScene): void {
+  const gpu = projectGpuSurface(layer, scene);
+  if (gpu) { ctx.drawImage(gpu, 0, 0); return; }
+  const destination = ctx;
+  let projected = projectedLayers.get(layer);
+  if (!projected || projected.width !== layer.width || projected.height !== layer.height) {
+    projected = new OffscreenCanvas(layer.width, layer.height); projectedLayers.set(layer, projected);
+  }
+  // Software rasterization is also used when WebGL is unavailable. GPU Canvas2D
+  // copy+clip has different edge coverage and can leave dark triangle boundaries.
+  ctx = projected.getContext('2d', { willReadFrequently: true })!;
+  ctx.clearRect(0, 0, projected.width, projected.height);
+  ctx.save();
+  // Raster overlaps must replace alpha, not accumulate it. Otherwise the
+  // translucent shadow becomes darker along every triangle boundary.
+  ctx.globalCompositeOperation = 'copy';
   const triangle = (a: Point, b: Point, c: Point) => {
     const A = projectScreenPoint(scene, a), B = projectScreenPoint(scene, b), C = projectScreenPoint(scene, c);
     const det = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
@@ -43,4 +60,6 @@ export function drawProjectedScreen(ctx: Context, layer: OffscreenCanvas, scene:
     const d = { x: b.x, y: c.y };
     triangle(a, b, c); triangle(b, d, c);
   }
+  ctx.restore();
+  destination.drawImage(projected, 0, 0);
 }
