@@ -23,7 +23,13 @@ export function drawProjectedScreen(ctx: Context, layer: OffscreenCanvas, scene:
     ctx.save();
     // Slightly overlap the raster clip to avoid transparent antialiasing seams.
     const ox = (A.x + B.x + C.x) / 3, oy = (A.y + B.y + C.y) / 3;
-    const expand = (p: Point) => { const n = Math.hypot(p.x - ox, p.y - oy); return { x: p.x + (p.x - ox) * 0.65 / n, y: p.y + (p.y - oy) * 0.65 / n }; };
+    // Expanding each vertex by a fixed radial distance barely moves the long
+    // diagonal edge of a thin triangle. Expand by its altitude instead so every
+    // raster edge overlaps by at least one output pixel, including white fills.
+    const area2 = Math.abs((B.x - A.x) * (C.y - A.y) - (C.x - A.x) * (B.y - A.y));
+    const longest = Math.max(Math.hypot(B.x - A.x, B.y - A.y), Math.hypot(C.x - A.x, C.y - A.y), Math.hypot(C.x - B.x, C.y - B.y));
+    const factor = 1 + 1.1 / Math.max(0.01, area2 / (3 * longest));
+    const expand = (p: Point) => ({ x: ox + (p.x - ox) * factor, y: oy + (p.y - oy) * factor });
     const aa = expand(A), bb = expand(B), cc = expand(C);
     ctx.beginPath(); ctx.moveTo(aa.x, aa.y); ctx.lineTo(bb.x, bb.y); ctx.lineTo(cc.x, cc.y); ctx.closePath(); ctx.clip();
     ctx.setTransform(xx, yx, xy, yy, A.x - xx * a.x - xy * a.y, A.y - yx * a.x - yy * a.y);

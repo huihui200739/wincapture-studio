@@ -336,7 +336,10 @@ export function drawScene(
   // 2. 屏幕内容：圆角裁剪 + 阴影
   const outputContext = ctx;
   const layer = hasMotion(scene) ? screenLayer(ctx, W, H) : null;
-  if (layer) { ctx = layer.getContext('2d')!; ctx.save(); }
+  if (layer) {
+    ctx = layer.getContext('2d')!; ctx.save();
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  }
   if (scene.shadowBlur > 0 && scene.shadowOpacity > 0) {
     ctx.save();
     ctx.shadowColor = `rgba(0,0,0,${scene.shadowOpacity})`;

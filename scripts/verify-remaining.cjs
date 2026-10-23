@@ -12,7 +12,7 @@ const assert = (ok, message) => { if (!ok) throw new Error(message); };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function browserProbe() {
-  const { mb, createEmptyProject, VideoFrameSource, exportProject, createExportProfile, evaluateScene, sourceToOutput,
+  const { mb, createEmptyProject, VideoFrameSource, exportProject, createExportProfile, evaluateScene, sourceToOutput, unprojectScreenPoint,
     drawScene, TimelineAudioMixer, buildExportPlan, AudioPreviewScheduler } = Features;
   const assert = (ok, message) => { if (!ok) throw new Error(message); };
   const S = 10_000_000, sr = 48_000;
@@ -113,11 +113,23 @@ async function browserProbe() {
   let difference = 0; for (let i = 0; i < actual.length; i++) if (i % 4 !== 3) difference += Math.abs(actual[i] - expected[i]);
   difference /= 640 * 360 * 3;
   assert(difference < 10 && actual[centerIndex] < 10, '3D 导出与预览或隐私遮挡不一致'); videoDecoder.close();
+  const white = new OffscreenCanvas(640, 360); white.getContext('2d').fillStyle = '#ffffff'; white.getContext('2d').fillRect(0, 0, 640, 360);
+  const whiteScene = { ...scene, screenPrivacy: [], cursor: { ...scene.cursor, visible: false } };
+  drawScene(draw, whiteScene, { ...resources, screen: white });
+  const whitePixels = draw.getImageData(0, 0, 640, 360).data;
+  let seams = 0;
+  for (let y = 0; y < 360; y++) for (let x = 0; x < 640; x++) {
+    const point = unprojectScreenPoint(scene, { x: x + 0.5, y: y + 0.5 });
+    const u = (point.x / 640 - scene.screenRect.x) / scene.screenRect.width;
+    const v = (point.y / 360 - scene.screenRect.y) / scene.screenRect.height;
+    if (u > 0.05 && u < 0.95 && v > 0.05 && v < 0.95 && whitePixels[(y * 640 + x) * 4] < 250) seams++;
+  }
+  assert(seams === 0, '白底 3D 网格出现暗色接缝：' + seams);
   decoder.close();
   return { m4a: { bytes: result.bytes, frames: result.frames, duration: result.durationTicks / S, checks: result.verifiedDetail.checks,
     nonSilentDecode: true, cancellationCleanup: true, noVideoEncoder: true }, audioPreview: { gain: peak(0), channels: 2, doubledToneCrossings: crossings,
     mute: true, realtimeContext: true }, motion3D: { changedPixels: changed, frames: video.frames, verified: video.verified,
-      previewExportMeanError: difference, privacy: true },
+      previewExportMeanError: difference, privacy: true, whiteMeshSeams: seams },
     artifacts: { 'remaining-tone.m4a': Array.from(outputBytes), 'remaining-3d.mp4': Array.from(files.get('3d.mp4')), 'remaining-3d.png': Array.from(motionPng) } };
 }
 
@@ -167,6 +179,7 @@ app.whenReady().then(async () => {
       export { VideoFrameSource } from './src/media/decoder';
       export { createEmptyProject } from './src/domain/project';
       export { evaluateScene, sourceToOutput } from './src/domain/scene';
+      export { unprojectScreenPoint } from './src/domain/projection';
       export { drawScene } from './src/media/compositor';
       export { createExportProfile } from './src/renderer/lib/exportSettings';
       export { exportProject, TimelineAudioMixer } from './src/media/exporter';
