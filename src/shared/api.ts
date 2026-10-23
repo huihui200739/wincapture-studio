@@ -14,6 +14,7 @@ import type {
   ExportProgress,
   ExportResult,
   IpcResponse,
+  OverlayUpdate,
   QualityProfile,
   RecentProject,
   RecoverableSession,
@@ -71,13 +72,8 @@ export interface DiagnosticsReport {
 }
 
 export interface OverlayApi {
-  update(payload: {
-    state: string;
-    mediaTick: number;
-    markerCount: number;
-    levels: { mic: number; system: number };
-    paused: boolean;
-  }): void;
+  /** 与主进程共享同一份 OverlayUpdate 结构，避免两处字段漂移 */
+  update(payload: OverlayUpdate): void;
   onCommand(cb: (command: 'pause' | 'resume' | 'stop' | 'mark') => void): () => void;
   ready(): void;
 }
@@ -88,7 +84,7 @@ export interface WcsApi {
   listDisplays(): Promise<IpcResponse<DisplayInfo[]>>;
   listDevices(): Promise<IpcResponse<{ audio: AudioDeviceInfo[]; video: VideoDeviceInfo[] }>>;
   qualityProfiles(): Promise<IpcResponse<QualityProfile[]>>;
-  startCapture(config: CaptureConfig): Promise<IpcResponse<{ sessionId: string; projectPath: string }>>;
+  startCapture(config: CaptureConfig): Promise<IpcResponse<{ sessionId: string; projectPath: string; cameraNote?: string | null }>>;
   pauseCapture(): Promise<IpcResponse<CaptureStatus>>;
   resumeCapture(): Promise<IpcResponse<CaptureStatus>>;
   stopCapture(): Promise<IpcResponse<{ projectPath: string; status: CaptureStatus }>>;
@@ -99,7 +95,8 @@ export interface WcsApi {
 
   // ---- 工程 ----
   createProject(name?: string): Promise<IpcResponse<ProjectHandle>>;
-  openProject(path?: string): Promise<IpcResponse<ProjectHandle>>;
+  /** 打开工程；用户在系统对话框取消时 data 为 null（不是错误）。 */
+  openProject(path?: string): Promise<IpcResponse<ProjectHandle | null>>;
   saveProject(project: Project): Promise<IpcResponse<SaveResult>>;
   saveProjectAs(project: Project, targetPath?: string): Promise<IpcResponse<SaveResult>>;
   listRecentProjects(): Promise<IpcResponse<RecentProject[]>>;

@@ -84,6 +84,11 @@ export interface MediabunnyLike {
   Input: new (options: { source: unknown; formats: unknown[]; initInput?: unknown }) => MediabunnyInput;
   ALL_FORMATS: unknown[];
   BlobSource: new (blob: Blob) => unknown;
+  /**
+   * 直接以 Uint8Array/ArrayBuffer 为数据源（不复制）。
+   * 校验整片 MP4 时用它替代 BlobSource，可少一份整片副本。
+   */
+  BufferSource?: new (buffer: ArrayBuffer | ArrayBufferView) => unknown;
   FilePathSource?: new (path: string) => unknown;
   VideoSampleSink: new (track: MediabunnyVideoTrack) => MediabunnyVideoSink;
   AudioBufferSink: new (track: MediabunnyAudioTrack) => MediabunnyAudioSink;
@@ -342,6 +347,8 @@ export class VideoFrameSource {
   private readonly useNodePaths: boolean;
 
   private readonly entries = new Map<number, SegmentEntry>();
+  /** 正在打开中的段：同一段的并发 `ensureOpen` 复用同一个 Promise，避免重复创建 Input 泄漏 */
+  private readonly opening = new Map<number, Promise<SegmentEntry>>();
   private readonly failed = new Set<number>();
   private opened = false;
   private clock = 0;
@@ -374,8 +381,31 @@ export class VideoFrameSource {
         detail: 'decoder.ts: SegmentSet 为空',
       });
     }
-    // 预热第一段：尽早暴露「素材缺失 / 编解码器不可用」这类问题
-    await this.ensureOpen(0).catch(() => undefined);
+    // 预热：尽早暴露「素材缺失 / 编解码器不可用」这类问题，而不是等逐帧渲染时
+    // 静默拿到 null、最终导出一部黑屏视频。首段损坏时继续探测后续段（上限 5 段），
+    // 全部打不开才算素材不可用。
+    let firstError: unknown = null;
+    const probeLimit = Math.min(this.set.length, 5);
+    for (let i = 0; i < probeLimit; i++) {
+      try {
+        await this.ensureOpen(i);
+        firstError = null;
+        break;
+      } catch (error) {
+        this.failed.add(i);
+        if (firstError === null) firstError = error;
+      }
+    }
+    if (this.entries.size === 0) {
+      const detail = firstError instanceof Error ? firstError.message : String(firstError ?? '未知原因');
+      throw new AppError({
+        code: 'E_MEDIA_MISSING',
+        message: '素材的所有分段都无法打开。',
+        retryable: true,
+        preservedData: true,
+        detail: `decoder.ts: ${detail}`,
+      });
+    }
   }
 
   get segmentSet(): SegmentSet {
@@ -413,6 +443,9 @@ export class VideoFrameSource {
   /**
    * 取 tick 时刻应显示的画面：**最近的前一帧**。
    * 只有整条素材都没有可用帧时才返回 null（会向前回溯到更早的段）。
+   *
+   * 分段录制里任意一段损坏不应让整次导出失败（§9.5 分段自包含的恢复意义）：
+   * 当前段解码异常时把它标记为失败并回溯到更早的段，用上一段的末帧兜底。
    */
   async getFrameAt(tick: Ticks): Promise<OffscreenCanvas | null> {
     this.requireOpen();
@@ -420,8 +453,13 @@ export class VideoFrameSource {
     if (index < 0) return null;
     for (let i = index; i >= 0; i--) {
       if (this.failed.has(i)) continue;
-      const frame = await this.frameInSegment(i, tick);
-      if (frame) return frame;
+      try {
+        const frame = await this.frameInSegment(i, tick);
+        if (frame) return frame;
+      } catch {
+        // 段损坏 / 解码器异常：释放该段资源并回溯，不再对同一段反复重试
+        this.markSegmentFailed(i);
+      }
     }
     return null;
   }
@@ -545,6 +583,20 @@ export class VideoFrameSource {
       existing.lastUsed = ++this.clock;
       return existing;
     }
+    // 同一段的并发打开必须合并：两次并发各建一个 Input 时，后写入 entries 的会
+    // 覆盖前一个，被覆盖的 Input/解码器永远拿不到 dispose（文件句柄 + 解码上下文泄漏）。
+    const inflight = this.opening.get(index);
+    if (inflight) return inflight;
+    const promise = this.openEntry(index);
+    this.opening.set(index, promise);
+    try {
+      return await promise;
+    } finally {
+      this.opening.delete(index);
+    }
+  }
+
+  private async openEntry(index: number): Promise<SegmentEntry> {
     const segment = this.set.segments[index];
     if (!segment) {
       throw new AppError({
@@ -626,6 +678,20 @@ export class VideoFrameSource {
     return entry;
   }
 
+  /** 已判定损坏并跳过的分段索引（导出侧据此如实报告降级）。 */
+  failedSegmentIndexes(): number[] {
+    return [...this.failed].sort((a, b) => a - b);
+  }
+
+  /** 标记某段不可用并立即释放它的解码器/文件句柄（损坏段不再占用资源）。 */
+  private markSegmentFailed(index: number): void {
+    this.failed.add(index);
+    const entry = this.entries.get(index);
+    if (!entry) return;
+    this.entries.delete(index);
+    this.disposeEntry(entry);
+  }
+
   private evictIfNeeded(keep: number): void {
     if (this.entries.size <= this.maxOpen) return;
     const candidates = [...this.entries.values()]
@@ -640,6 +706,11 @@ export class VideoFrameSource {
 
   private disposeEntry(entry: SegmentEntry): void {
     this.closeVideoCursor(entry);
+    // 音频游标是一个挂起的 async generator，不 return 会一直持有 mediabunny 的
+    // 解码器与文件读取器引用，直到 GC；长录制里 LRU 反复驱逐段时会累积句柄。
+    if (entry.audioCursor?.iter && typeof entry.audioCursor.iter.return === 'function') {
+      void Promise.resolve(entry.audioCursor.iter.return()).catch(() => undefined);
+    }
     entry.audioCursor = null;
     entry.frame = null;
     entry.canvas = null;
@@ -656,6 +727,8 @@ export class VideoFrameSource {
   private closeEntries(): void {
     for (const entry of this.entries.values()) this.disposeEntry(entry);
     this.entries.clear();
+    // 打开中的段无法取消，但清空记录避免 open() 后残留旧 Promise
+    this.opening.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -778,6 +851,12 @@ export class VideoFrameSource {
     let cursor = entry.audioCursor;
     const sequential = cursor && aSec + TIME_EPS >= cursor.pos && aSec - cursor.pos <= this.seekWindow;
     if (!sequential) {
+      // 重建游标前必须关掉旧的 async generator：disposeEntry 里已经写明「不 return
+      // 会一直持有解码器与文件读取器，直到 GC」，但这条重建路径过去漏了。
+      // 时间线来回 seek/重排时每次都泄漏一个仍持有句柄的 generator。
+      if (cursor?.iter && typeof cursor.iter.return === 'function') {
+        void Promise.resolve(cursor.iter.return()).catch(() => undefined);
+      }
       cursor = { iter: null, next: null, pos: Math.max(0, aSec - 0.5) };
       entry.audioCursor = cursor;
     }
@@ -841,7 +920,6 @@ export class VideoFrameSource {
       else map.push({ a: srcData[Math.min(ch, srcChCount - 1)], b: null });
     }
 
-    const step = srcRate / outSampleRate;
     for (let j = outFrom; j < outTo; j++) {
       const relOut = j - outFrom;
       // 该输出采样在源块内的精确位置
@@ -872,16 +950,27 @@ export class VideoFrameSource {
 // 便捷工厂
 // ---------------------------------------------------------------------------
 
-/** 按「素材 → 分段列表」的映射一次性打开多个素材。 */
+/** 按「素材 → 分段列表」的映射一次性打开多个素材。任一素材失败时关闭已打开的源，不泄漏句柄。 */
 export async function openFrameSources(
   map: Record<string, readonly MediaSegment[]>,
   options: VideoFrameSourceOptions = {},
 ): Promise<Map<string, VideoFrameSource>> {
   const out = new Map<string, VideoFrameSource>();
-  for (const [assetId, segments] of Object.entries(map)) {
-    const source = new VideoFrameSource(options, segments);
-    await source.open();
-    out.set(assetId, source);
+  try {
+    for (const [assetId, segments] of Object.entries(map)) {
+      const source = new VideoFrameSource(options, segments);
+      await source.open();
+      out.set(assetId, source);
+    }
+    return out;
+  } catch (error) {
+    for (const source of out.values()) {
+      try {
+        source.close();
+      } catch {
+        // 忽略关闭异常
+      }
+    }
+    throw error;
   }
-  return out;
 }

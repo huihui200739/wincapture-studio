@@ -301,3 +301,35 @@ describe('writeProject', () => {
     expect(result.project.id).toBe(written.id);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 回归：未来版本只读读取也必须给出完整结构
+// ---------------------------------------------------------------------------
+
+describe('回归：未来版本只读读取的结构规整', () => {
+  it('缺少集合字段时补全为空结构，同时保留未来新增字段', () => {
+    const result = readProject({
+      schemaVersion: PROJECT_SCHEMA_VERSION + 1,
+      id: 'future',
+      name: '未来工程',
+      futureFeature: { a: 1 },
+    });
+    expect(result.readOnlyNotice).not.toBeNull();
+    expect(result.project.tracks).toHaveLength(4);
+    expect(result.project.assets).toEqual([]);
+    expect(result.project.effects).toEqual([]);
+    expect(result.project.steps).toEqual([]);
+    expect(result.project.markers).toEqual([]);
+    expect(result.project.variants.length).toBeGreaterThan(0);
+    expect(result.project.settings.fps.num).toBeGreaterThan(0);
+    // 只读模式不能把版本号降到当前版本（否则后续写入会以为可覆盖）
+    expect(result.project.schemaVersion).toBe(PROJECT_SCHEMA_VERSION + 1);
+    // 未来版本新增的字段不能被丢弃
+    expect((result.project as unknown as { futureFeature?: unknown }).futureFeature).toEqual({ a: 1 });
+  });
+
+  it('对同一输入读取两次结果一致（幂等）', () => {
+    const raw = { schemaVersion: PROJECT_SCHEMA_VERSION + 1, id: 'future', name: 'x' };
+    expect(readProject(raw).project).toEqual(readProject(raw).project);
+  });
+});

@@ -45,6 +45,19 @@ export interface SessionClockOptions {
  * 所有入参/出参都是 QPC tick（100ns 整数）。纯逻辑，不读取系统时钟：
  * 调用方把 QPC 时间传进来，便于单元测试与故障注入复现。
  */
+
+/**
+ * 规整 QPC 入参：NaN/Infinity 返回 null。
+ *
+ * 采样时间来自系统 API 与设备回调，异常时可能给出非有限值；如果直接参与运算，
+ * 零点/暂停点会被永久写成 NaN，之后所有媒体时间、时长、恢复估算全部失效。
+ * 因此无效时刻一律视为「本次调用无效果」，而不是污染内部状态。
+ */
+function finiteRounded(value: number): Ticks | null {
+  const at = Math.round(value);
+  return Number.isFinite(at) ? at : null;
+}
+
 export class SessionClock {
   private zeroQpc: Ticks | null = null;
   /** 共享暂停区间表（QPC 时间，[start, end)） */
@@ -60,8 +73,9 @@ export class SessionClock {
 
   /** 首次有效屏幕帧到达：确定会话零点。重复调用保持第一次的零点（幂等）。 */
   setZero(qpcTick: Ticks): Ticks {
-    if (this.zeroQpc === null) this.zeroQpc = Math.round(qpcTick);
-    return this.zeroQpc;
+    const at = finiteRounded(qpcTick);
+    if (this.zeroQpc === null && at !== null) this.zeroQpc = at;
+    return this.zeroQpc ?? 0;
   }
 
   get zero(): Ticks | null {
@@ -87,9 +101,12 @@ export class SessionClock {
 
   /** 注册/更新一条轨道的源时钟偏移（音频、摄像头、指针各自建立映射）。 */
   setTrackOffset(trackId: string, offsetQpcTicks: Ticks, startMediaTick: Ticks = 0): void {
+    const offset = finiteRounded(offsetQpcTicks);
+    const start = finiteRounded(startMediaTick);
+    if (offset === null || start === null) return;
     this.trackOffsets.set(trackId, {
-      offsetQpcTicks: Math.round(offsetQpcTicks),
-      startMediaTick: Math.max(0, Math.round(startMediaTick)),
+      offsetQpcTicks: offset,
+      startMediaTick: Math.max(0, start),
     });
   }
 
@@ -99,18 +116,24 @@ export class SessionClock {
 
   /** 暂停：重复暂停不产生新的暂停区间（幂等）。 */
   pause(qpcTick: Ticks): boolean {
+    const at = finiteRounded(qpcTick);
+    if (at === null) return false;
     if (this.stoppedAt !== null) return false;
     if (this.pausedAt !== null) return false;
-    this.pausedAt = Math.round(qpcTick);
+    this.pausedAt = at;
     return true;
   }
 
   /** 恢复：未处于暂停时无副作用（幂等）；恢复时闭合一条暂停区间。 */
   resume(qpcTick: Ticks): boolean {
+    const at = finiteRounded(qpcTick);
+    if (at === null) return false;
     if (this.stoppedAt !== null) return false;
     if (this.pausedAt === null) return false;
-    const at = Math.round(qpcTick);
     const start = this.pausedAt;
+    // 恢复时刻早于暂停时刻（QPC 回跳/日志乱序）：忽略本次调用，保持暂停状态，
+    // 否则这段暂停会被静默丢弃、媒体时间凭空前进。
+    if (at < start) return false;
     this.pausedAt = null;
     if (at > start) {
       this.pauseRanges.push({ start, end: at });
@@ -122,7 +145,8 @@ export class SessionClock {
   /** 停止：重复停止返回第一次停止时刻（幂等）。若正在暂停则先闭合暂停区间。 */
   stop(qpcTick: Ticks): Ticks {
     if (this.stoppedAt !== null) return this.stoppedAt;
-    const at = Math.round(qpcTick);
+    const at = finiteRounded(qpcTick);
+    if (at === null) return this.zeroQpc ?? 0;
     if (this.pausedAt !== null) {
       if (at > this.pausedAt) this.pauseRanges.push({ start: this.pausedAt, end: at });
       this.pausedAt = null;
@@ -135,7 +159,8 @@ export class SessionClock {
   pauseTable(nowQpc?: Ticks): TickRange[] {
     const table = this.pauseRanges.map((r) => ({ ...r }));
     if (this.pausedAt !== null) {
-      const end = nowQpc !== undefined ? Math.max(this.pausedAt, Math.round(nowQpc)) : this.pausedAt;
+      const now = nowQpc !== undefined ? finiteRounded(nowQpc) : null;
+      const end = now !== null ? Math.max(this.pausedAt, now) : this.pausedAt;
       if (end > this.pausedAt) table.push({ start: this.pausedAt, end });
     }
     return table;
@@ -144,7 +169,8 @@ export class SessionClock {
   /** 截至 qpcTick 的累计暂停时间。 */
   pausedTicksAt(qpcTick: Ticks): Ticks {
     if (this.zeroQpc === null) return 0;
-    const at = Math.round(qpcTick);
+    const at = finiteRounded(qpcTick);
+    if (at === null) return 0;
     let total = 0;
     for (const r of this.pauseRanges) {
       const start = Math.max(r.start, this.zeroQpc);
@@ -160,10 +186,11 @@ export class SessionClock {
 
   /**
    * QPC 时间 → 会话媒体时间。
-   * 会话零点之前返回负数（调用方据此裁掉较早样本）。
+   * 会话零点之前返回负数（调用方据此裁掉较早样本）；非法时刻返回 0。
    */
   mediaTickAt(qpcTick: Ticks): Ticks {
-    const at = Math.round(qpcTick);
+    const at = finiteRounded(qpcTick);
+    if (at === null) return 0;
     if (this.zeroQpc === null) return 0;
     const raw = at - this.zeroQpc;
     if (raw <= 0) return raw;
@@ -172,11 +199,13 @@ export class SessionClock {
 
   /**
    * 轨道源时间 → 会话媒体时间（先按轨道偏移映射到会话 QPC）。
-   * 返回 null 表示样本早于会话零点，必须裁掉。
+   * 返回 null 表示样本早于会话零点或时间非法，必须裁掉。
    */
   trackMediaTickAt(trackId: string, trackQpcTick: Ticks): Ticks | null {
+    const at = finiteRounded(trackQpcTick);
+    if (at === null) return null;
     const track = this.trackOffsets.get(trackId);
-    const qpc = Math.round(trackQpcTick) + (track?.offsetQpcTicks ?? 0);
+    const qpc = at + (track?.offsetQpcTicks ?? 0);
     const media = this.mediaTickAt(qpc);
     const minMedia = track?.startMediaTick ?? 0;
     if (this.zeroQpc === null) return 0;
@@ -186,13 +215,15 @@ export class SessionClock {
 
   /**
    * 放置一个轨道样本：返回媒体时间、需要的补空白与原因。
-   * 早于会话零点 → mediaTick=null（裁掉）；晚于轨道应起点 → 补空白（记录原因）。
+   * 早于会话零点（或时刻非法）→ mediaTick=null（裁掉）；晚于轨道应起点 → 补空白（记录原因）。
    */
   placeSample(trackId: string, trackQpcTick: Ticks, expectedMediaTick?: Ticks): SamplePlacement {
+    const at = finiteRounded(trackQpcTick);
+    if (at === null) return { mediaTick: null, padTicks: 0, padReason: null, duringPause: false };
     const track = this.trackOffsets.get(trackId);
-    const qpc = Math.round(trackQpcTick) + (track?.offsetQpcTicks ?? 0);
+    const qpc = at + (track?.offsetQpcTicks ?? 0);
     const duringPause = this.isDuringPause(qpc);
-    const mediaTick = this.trackMediaTickAt(trackId, trackQpcTick);
+    const mediaTick = this.trackMediaTickAt(trackId, at);
     if (mediaTick === null) {
       return { mediaTick: null, padTicks: 0, padReason: null, duringPause };
     }
@@ -205,9 +236,10 @@ export class SessionClock {
     return { mediaTick, padTicks: 0, padReason: null, duringPause };
   }
 
-  /** 某个 QPC 时刻是否落在暂停区间内（暂停期间的样本不写入）。 */
+  /** 某个 QPC 时刻是否落在暂停区间内（暂停期间的样本不写入）。非法时刻返回 false。 */
   isDuringPause(qpcTick: Ticks): boolean {
-    const at = Math.round(qpcTick);
+    const at = finiteRounded(qpcTick);
+    if (at === null) return false;
     for (const r of this.pauseRanges) {
       if (at >= r.start && at < r.end) return true;
     }
@@ -218,8 +250,9 @@ export class SessionClock {
   /** 会话媒体总时长（停止后为定值；未停止时按当前 QPC 计算）。 */
   durationTicks(nowQpc?: Ticks): Ticks {
     if (this.zeroQpc === null) return 0;
-    const at = this.stoppedAt ?? (nowQpc !== undefined ? Math.round(nowQpc) : this.zeroQpc);
-    return Math.max(0, this.mediaTickAt(at));
+    if (this.stoppedAt !== null) return Math.max(0, this.mediaTickAt(this.stoppedAt));
+    const now = nowQpc !== undefined ? finiteRounded(nowQpc) : null;
+    return Math.max(0, this.mediaTickAt(now ?? this.zeroQpc));
   }
 
   /** 累计暂停时长（全部已闭合区间 + 当前暂停）。 */

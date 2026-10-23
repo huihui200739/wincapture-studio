@@ -346,3 +346,30 @@ describe('timebase: 时间显示与解析', () => {
     expect(Math.abs((back as number) - ticks)).toBeLessThanOrEqual(TICKS_PER_MS * 10);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 回归：非法有理数与非法时长的边界
+// ---------------------------------------------------------------------------
+
+describe('回归：makeRational 不得返回 den = 0', () => {
+  it('分母舍入为 0 的小数输入抛错，而不是返回非法有理数', () => {
+    // 旧实现：gcd 用舍入后的值、分子用原始值，0.5/0.25 → { num: 1, den: 0 }
+    expect(() => makeRational(0.5, 0.25)).toThrow();
+    expect(() => makeRational(1, 0.4)).toThrow();
+  });
+
+  it('正常整数与负分母仍正确约分', () => {
+    expect(makeRational(-1, -2)).toEqual({ num: 1, den: 2 });
+    expect(makeRational(3, -6)).toEqual({ num: -1, den: 2 });
+  });
+});
+
+describe('回归：ticksToFrameCount 对非法输入返回 0', () => {
+  it('NaN / Infinity 时长不会把总帧数变成 NaN', () => {
+    const fps = makeFrameRate(30, 1);
+    expect(ticksToFrameCount(NaN, fps)).toBe(0);
+    expect(ticksToFrameCount(Infinity, fps)).toBe(0);
+    expect(ticksToFrameCount(S, { num: 0, den: 0 })).toBe(0);
+    expect(ticksToFrameCount(S, { num: NaN, den: 1 })).toBe(0);
+  });
+});

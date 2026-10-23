@@ -54,6 +54,12 @@ internal static class Grabber
 
     private static long _qpcFrequency;
 
+    /// <summary>
+    /// 退出标志。必须是 volatile 静态字段：读线程与采集循环跨线程共享，
+    /// 若用被闭包捕获的局部 bool，JIT 没有义务在循环里重新读取，极端情况下按 q 后不退出。
+    /// </summary>
+    private static volatile bool _quit;
+
     private static double NowSeconds()
     {
         long counter;
@@ -173,7 +179,6 @@ internal static class Grabber
         }
 
         // 用后台线程读 stdin，主线程专注采集
-        bool quit = false;
         Thread reader = new Thread(delegate()
         {
             try
@@ -181,11 +186,11 @@ internal static class Grabber
                 string line;
                 while ((line = Console.In.ReadLine()) != null)
                 {
-                    if (line.Trim() == "q") { quit = true; break; }
+                    if (line.Trim() == "q") { _quit = true; break; }
                 }
             }
             catch { /* 父进程关闭管道 */ }
-            quit = true;
+            _quit = true;
         });
         reader.IsBackground = true;
         reader.Start();
@@ -201,16 +206,22 @@ internal static class Grabber
 
         try
         {
-            while (!quit)
+            while (!_quit)
             {
                 long qpc;
                 QueryPerformanceCounter(out qpc);
                 long nowUs = clock.ElapsedTicks * 1000000L / Stopwatch.Frequency;
 
-                if (frames > 0 && nowUs < nextDeadlineUs)
+                if (nowUs < nextDeadlineUs)
                 {
-                    long waitMs = (nextDeadlineUs - nowUs) / 1000;
-                    if (waitMs > 0) Thread.Sleep((int)Math.Min(waitMs, 50));
+                    // 不要忙等：旧实现在剩余时间不足 1ms 时 waitMs 取整为 0，
+                    // 于是 while 循环原地空转烧掉一个核（每帧最多 1ms，约占 3% CPU）。
+                    // 向上取整并至少睡 1ms；上限 50ms 以便及时响应 stdin 的 q。
+                    long remainUs = nextDeadlineUs - nowUs;
+                    int waitMs = (int)((remainUs + 999) / 1000);
+                    if (waitMs > 50) waitMs = 50;
+                    if (waitMs < 1) waitMs = 1;
+                    Thread.Sleep(waitMs);
                     continue;
                 }
 
@@ -268,6 +279,7 @@ internal static class Grabber
             try { graphics.Dispose(); } catch { }
             try { bitmap.Dispose(); } catch { }
             try { buffer.Dispose(); } catch { }
+            try { encoderParams.Dispose(); } catch { }
         }
 
         Log("DONE frames=" + frames + " failures=" + failures);

@@ -9,13 +9,18 @@
  * - 可折叠，默认折叠保持悬浮条紧凑；展开时用绝对定位浮层，不撑开 460×132 主布局。
  * - 内容只存本机（localStorage），不做任何网络同步。
  * - 录制中按 Ctrl+Alt+M 添加标记时，若备忘录有内容，把当前行作为标记 note 传给 addMarker。
+ *
+ * 状态同步（本轮修复）：
+ * - 主进程的 capture:status 是「推送 + 可丢失」的：窗口刚创建、主进程忙、窗口重载时都可能漏。
+ *   这里对推送做 100ms 合并（§14.3 最多 10 次/秒），并用 1.5s 轮询兜底纠偏；
+ *   同时按钮操作的结果会 await IPC 返回值，失败时在状态文字里明确提示，不再「假装成功」。
  */
 
-import { useEffect, useRef, useState, type CSSProperties } from 'react';
-import type { CaptureStatus, CaptureState } from '@shared/ipc';
-import { formatBytes, formatClock } from '../lib/format';
-import { Icon, Kbd } from '../components/ui';
-import { cn } from '../lib/format';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+import type { CaptureState, CaptureStatus, IpcResponse } from '@shared/ipc';
+import { cn, formatBytes, formatClock } from '../lib/format';
+import { Icon } from '../components/ui';
+import { createStatusCoalescer, memoMarkNote, type StatusCoalescer } from '../uiSync';
 
 const MEMO_TEXT_KEY = 'wcs.overlay.memoText';
 const MEMO_OPEN_KEY = 'wcs.overlay.memoOpen';
@@ -38,30 +43,25 @@ function loadMemoOpen(): boolean {
   }
 }
 
-/**
- * 取备忘录中作为标记 note 的内容：优先「当前光标所在行」，
- * 该行为空时回退为最后一行非空内容，均为空则返回空串。
- */
-function memoMarkNote(text: string, caretIndex: number): string {
-  const around = text.slice(0, caretIndex);
-  const lineStart = around.lastIndexOf('\n');
-  const currentLine = around.slice(lineStart + 1).trim();
-  if (currentLine) return currentLine;
-  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-  return lines.length > 0 ? lines[lines.length - 1] : '';
-}
-
-/** 窄窗口下的按钮内联样式（styles.css 不在本任务写入范围内，故用内联）。 */
+/** 窄窗口下的按钮内联样式（styles.css 里 .rec-bar.is-narrow 已有兜底，这里保留密度微调）。 */
 function narrowBtnStyle(narrow: boolean | undefined): CSSProperties | undefined {
   return narrow ? { height: 27, padding: '0 8px', fontSize: 11, gap: 4 } : undefined;
 }
 
+/** 命令结果：按钮操作必须知道自己成没成功，而不是无条件显示「暂停中」。 */
+export interface CommandOutcome {
+  ok: boolean;
+  message?: string;
+}
+
+export type CommandHandler = () => Promise<CommandOutcome> | CommandOutcome | void | Promise<void>;
+
 export interface OverlayBarProps {
   status: CaptureStatus | null;
-  onPause?: () => void;
-  onResume?: () => void;
-  onStop?: () => void;
-  onMark?: () => void;
+  onPause?: CommandHandler;
+  onResume?: CommandHandler;
+  onStop?: CommandHandler;
+  onMark?: CommandHandler;
   onOpenEditor?: () => void;
   compact?: boolean;
   /**
@@ -71,7 +71,6 @@ export interface OverlayBarProps {
   narrow?: boolean;
   /** 备忘录当前文本（R12，只存本机）。 */
   memoText?: string;
-  onMemoTextChange?: (text: string) => void;
   /** 备忘录展开状态（默认折叠）。 */
   memoOpen?: boolean;
   onMemoOpenChange?: (open: boolean) => void;
@@ -136,7 +135,6 @@ export function OverlayBar({
   compact,
   narrow,
   memoText = '',
-  onMemoTextChange,
   memoOpen = false,
   onMemoOpenChange,
 }: OverlayBarProps) {
@@ -145,11 +143,15 @@ export function OverlayBar({
   const paused = state === 'Paused' || state === 'Pausing';
   const canPause = state === 'Recording';
   const canResume = state === 'Paused';
+  const canMark = state === 'Recording' || state === 'Paused' || state === 'Pausing' || state === 'Resuming';
   const canStop = !!state && !['Idle', 'ReadyToEdit', 'Cancelled', 'RecoveryReady'].includes(state);
   const levels = status?.levels ?? { mic: 0, system: 0 };
   const memoLines = memoText.split('\n').filter((line) => line.trim()).length;
 
   const [flash, setFlash] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  // 用 ref 同步挡重入：state 更新是异步的，同一 tick 内连点两次会都通过检查
+  const pendingRef = useRef<string | null>(null);
   const flashTimer = useRef<number | null>(null);
   useEffect(
     () => () => {
@@ -158,22 +160,48 @@ export function OverlayBar({
     [],
   );
 
-  const pulse = (text: string) => {
-    setFlash(text);
+  const pulse = useCallback((text: string, tone: 'info' | 'ok' | 'error' = 'info') => {
+    const label = tone === 'error' ? `失败 · ${text}` : text;
+    setFlash(label);
     if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
-    flashTimer.current = window.setTimeout(() => setFlash(null), 1600);
-  };
+    flashTimer.current = window.setTimeout(() => setFlash(null), tone === 'error' ? 2600 : 1600);
+  }, []);
+
+  /**
+   * 执行一次命令：先乐观显示「进行中」，再 await 真实 IPC 结果。
+   * 失败时把原因写进状态文字（悬浮窗没有 toast，这是唯一的错误出口），
+   * 不再出现「点暂停后显示暂停中、实际还在录」的假反馈。
+   */
+  const runAction = useCallback(
+    async (key: string, pendingText: string, okText: string, handler: CommandHandler | undefined) => {
+      if (!handler || pendingRef.current !== null) return;
+      pendingRef.current = key;
+      setPendingAction(key);
+      pulse(pendingText);
+      try {
+        const outcome = await handler();
+        if (outcome && outcome.ok === false) {
+          pulse(outcome.message?.slice(0, 10) || '操作未生效', 'error');
+        } else {
+          pulse(okText, 'ok');
+        }
+      } catch (error) {
+        console.error(`[overlay] ${key} 失败`, error);
+        pulse('操作未生效', 'error');
+      } finally {
+        pendingRef.current = null;
+        setPendingAction(null);
+      }
+    },
+    [pulse],
+  );
 
   return (
     <div
       className={cn('rec-bar', narrow && 'is-narrow')}
       role="toolbar"
       aria-label="录制控制条"
-      style={
-        narrow
-          ? { minWidth: 0, width: '100%', gap: 7, padding: '6px 8px' }
-          : undefined
-      }
+      style={narrow ? { minWidth: 0, width: '100%', gap: 7, padding: '6px 8px' } : undefined}
     >
       <div
         className={cn('rec-state', visual.className)}
@@ -183,7 +211,9 @@ export function OverlayBar({
       >
         <span className="rec-state-dot" aria-hidden="true" />
         <Icon name={visual.icon} size={13} />
-        <span className="rec-state-text">{flash ?? visual.label}</span>
+        <span className="rec-state-text" title={flash ?? visual.label}>
+          {flash ?? visual.label}
+        </span>
       </div>
 
       <div
@@ -232,18 +262,13 @@ export function OverlayBar({
         <button
           type="button"
           className="rec-btn"
-          disabled={!canPause && !canResume}
+          disabled={(!canPause && !canResume) || pendingAction !== null}
           aria-label={canResume ? '继续录制' : '暂停录制'}
           title={canResume ? '继续录制（Ctrl+Alt+P）' : '暂停录制（Ctrl+Alt+P）'}
           style={narrowBtnStyle(narrow)}
           onClick={() => {
-            if (canResume) {
-              pulse('继续中');
-              onResume?.();
-            } else {
-              pulse('暂停中');
-              onPause?.();
-            }
+            if (canResume) void runAction('resume', '继续中', '已继续', onResume);
+            else void runAction('pause', '暂停中', '已暂停', onPause);
           }}
         >
           <Icon name={canResume ? 'play' : 'pause'} size={12} />
@@ -252,13 +277,11 @@ export function OverlayBar({
         <button
           type="button"
           className="rec-btn"
+          disabled={!canMark || pendingAction !== null}
           aria-label="添加标记"
           title="添加标记（Ctrl+Alt+M），之后可生成教程步骤"
           style={narrowBtnStyle(narrow)}
-          onClick={() => {
-            pulse('已标记');
-            onMark?.();
-          }}
+          onClick={() => void runAction('mark', '标记中', '已标记', onMark)}
         >
           <Icon name="flag" size={12} />
           标记
@@ -268,11 +291,7 @@ export function OverlayBar({
           className="rec-btn"
           aria-label={memoOpen ? '收起备忘录' : '展开备忘录'}
           aria-expanded={memoOpen}
-          title={
-            memoOpen
-              ? '收起备忘录'
-              : `展开备忘录${memoLines > 0 ? `（已记录 ${memoLines} 条）` : ''}`
-          }
+          title={memoOpen ? '收起备忘录' : `展开备忘录${memoLines > 0 ? `（已记录 ${memoLines} 条）` : ''}`}
           style={{
             ...(narrowBtnStyle(narrow) ?? {}),
             ...(memoLines > 0 ? { borderColor: 'rgba(76, 141, 255, 0.55)', color: '#b9d3ff' } : {}),
@@ -285,14 +304,11 @@ export function OverlayBar({
         <button
           type="button"
           className="rec-btn is-stop"
-          disabled={!canStop}
+          disabled={!canStop || pendingAction !== null}
           aria-label="停止录制"
           title="停止录制（Ctrl+Alt+R）"
           style={narrowBtnStyle(narrow)}
-          onClick={() => {
-            pulse('停止中');
-            onStop?.();
-          }}
+          onClick={() => void runAction('stop', '停止中', '已停止', onStop)}
         >
           <Icon name="stop" size={12} />
           停止
@@ -305,6 +321,13 @@ export function OverlayBar({
       </div>
     </div>
   );
+}
+
+/** 把 IPC 响应折叠成按钮需要的成败信息（错误信息截断，避免撑破悬浮条）。 */
+function toOutcome(response: IpcResponse<unknown> | null | undefined): CommandOutcome {
+  if (!response) return { ok: false, message: '主进程无响应' };
+  if (response.ok) return { ok: true };
+  return { ok: false, message: response.error?.message ?? '操作未生效' };
 }
 
 /** 录制悬浮窗窗口（window.wcs.role === 'overlay' 时渲染）。 */
@@ -339,25 +362,58 @@ export function OverlayWindow() {
     const api = typeof window !== 'undefined' ? window.wcs : undefined;
     if (!api) return;
     let mounted = true;
-    void api.captureStatus().then((response) => {
-      if (mounted && response.ok && response.data) setStatus(response.data);
+
+    // 100ms 合并：主进程的 force 推送 + 高频电平叠加时可能超过 10 次/秒，
+    // 直接 setState 会让常驻悬浮窗在长录制里反复整窗重渲染。
+    const coalescer: StatusCoalescer<CaptureStatus> = createStatusCoalescer<CaptureStatus>({
+      intervalMs: 100,
+      emit: (next) => {
+        if (mounted) setStatus(next);
+      },
     });
-    const off = api.onCaptureStatus((next) => setStatus(next));
+
+    void api.captureStatus().then((response) => {
+      if (mounted && response.ok && response.data) coalescer.push(response.data);
+    });
+    const off = api.onCaptureStatus((next) => coalescer.push(next));
+
+    // 兜底轮询：事件通道没有序列号，丢一条就永远不知道。
+    // 1.5s 拉一次状态把计时/状态纠回来，代价可忽略。
+    const poll = window.setInterval(() => {
+      void api.captureStatus().then((response) => {
+        if (mounted && response.ok && response.data) coalescer.push(response.data);
+      });
+    }, 1500);
+
     const offCommand = api.overlay?.onCommand((command) => {
-      if (command === 'pause') void api.pauseCapture();
-      else if (command === 'resume') void api.resumeCapture();
-      else if (command === 'stop') void api.stopCapture();
-      // Ctrl+Alt+M 添加标记：备忘录有内容时把当前行作为标记 note
+      // 说明：主进程当前没有发送 'overlay:command' 的代码（协议未接通）。
+      // 这里保留订阅，等 main 侧补齐「快捷键 → 悬浮窗命令」后即可生效；
+      // 不依赖它工作，按钮走的是下面的直接 IPC。
+      const run = async (promise: Promise<IpcResponse<unknown>>, label: string): Promise<void> => {
+        try {
+          const response = await promise;
+          if (!response.ok) console.warn(`[overlay] 命令 ${label} 未生效：${response.error?.message ?? '未知原因'}`);
+        } catch (error) {
+          console.warn(`[overlay] 命令 ${label} 失败`, error);
+        }
+      };
+      if (command === 'pause') void run(api.pauseCapture(), 'pause');
+      else if (command === 'resume') void run(api.resumeCapture(), 'resume');
+      else if (command === 'stop') void run(api.stopCapture(), 'stop');
       else if (command === 'mark') {
         const textarea = memoRef.current;
         const caret = textarea ? textarea.selectionStart : memoTextRef.current.length;
         const note = memoMarkNote(memoTextRef.current, caret);
-        void api.addMarker(note);
+        void run(api.addMarker(note), 'mark');
       }
     });
     api.overlay?.ready();
+
     return () => {
       mounted = false;
+      window.clearInterval(poll);
+      coalescer.flush();
+      coalescer.dispose();
       off();
       offCommand?.();
     };
@@ -387,12 +443,13 @@ export function OverlayWindow() {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  const markNow = () => {
+  const markNow = useCallback(async (): Promise<CommandOutcome> => {
     const textarea = memoRef.current;
-    const caret = textarea ? textarea.selectionStart : memoText.length;
-    const note = memoMarkNote(memoText, caret);
-    void api?.addMarker(note);
-  };
+    const caret = textarea ? textarea.selectionStart : memoTextRef.current.length;
+    const note = memoMarkNote(memoTextRef.current, caret);
+    if (!api) return { ok: false, message: '接口不可用' };
+    return toOutcome(await api.addMarker(note));
+  }, [api]);
 
   return (
     <div
@@ -410,12 +467,11 @@ export function OverlayWindow() {
         status={status}
         compact
         narrow={narrow}
-        onPause={() => void api?.pauseCapture()}
-        onResume={() => void api?.resumeCapture()}
-        onStop={() => void api?.stopCapture()}
+        onPause={async () => (api ? toOutcome(await api.pauseCapture()) : { ok: false, message: '接口不可用' })}
+        onResume={async () => (api ? toOutcome(await api.resumeCapture()) : { ok: false, message: '接口不可用' })}
+        onStop={async () => (api ? toOutcome(await api.stopCapture()) : { ok: false, message: '接口不可用' })}
         onMark={markNow}
         memoText={memoText}
-        onMemoTextChange={setMemoTextPersist}
         memoOpen={memoOpen}
         onMemoOpenChange={setMemoOpenPersist}
       />

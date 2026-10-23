@@ -4,6 +4,7 @@ node_modules/
 # 构建产物
 dist/
 *.tsbuildinfo
+coverage/
 
 # 打包产物（安装包约 110MB，不入库；用 npm run pack 重新生成）
 release/
@@ -31,6 +32,7 @@ run-out.txt
 # 编辑器与系统
 .vscode/
 .idea/
+.workbuddy/
 Thumbs.db
 desktop.ini
 *.swp

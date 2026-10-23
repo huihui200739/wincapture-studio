@@ -6,10 +6,12 @@
  * 用户可以合并、拆分、删除或替换截图。
  */
 
-import type { TutorialStep } from './project';
+import type { Project, TutorialStep } from './project';
+import { findTrack } from './project';
 import type { RecordingMarker, PointerEventLike } from './types';
 import type { Ticks, TickRange } from './timebase';
 import { secondsToTicks } from './timebase';
+import { TimeMap } from './timeMap';
 
 export interface StepBuilderInput {
   markers: readonly RecordingMarker[];
@@ -33,6 +35,37 @@ export const DEFAULT_STEP_OPTIONS: StepDraftOptions = {
 };
 
 /**
+ * 合法录制时长：非有限值或 <= 0 视为没有可截图的画面。
+ * 最后可用 tick 是 duration - 1（区间右开），因此所有时间都要夹紧到 [0, duration)。
+ */
+function usableDuration(value: Ticks): Ticks {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.floor(value);
+}
+
+function safeDelay(value: Ticks | undefined): Ticks {
+  const fallback = secondsToTicks(0.55);
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.round(value));
+}
+
+/**
+ * 由事件时间生成合法的步骤窗口。
+ * 必须保证 sourceRange 非空（start < end 且 start < duration），
+ * 且 imageTick 落在 sourceRange 内——否则会生成无法截图/无法通过校验的步骤。
+ */
+function stepWindow(
+  duration: Ticks,
+  eventTick: Ticks,
+  delay: Ticks,
+): { start: Ticks; end: Ticks; imageTick: Ticks } {
+  const start = Math.min(duration - 1, Math.max(0, Math.round(eventTick)));
+  const end = Math.min(duration, Math.max(start + 1, start + delay * 2));
+  const imageTick = Math.min(end - 1, Math.max(start, start + delay));
+  return { start, end, imageTick };
+}
+
+/**
  * 由标记生成步骤草稿。
  * 标题使用模板填空，没有读到控件名称时显示「步骤 N 待补充说明」，不编造页面功能。
  */
@@ -41,11 +74,15 @@ export function buildStepDrafts(
   options: Partial<StepDraftOptions> = {},
 ): TutorialStep[] {
   const opt = { ...DEFAULT_STEP_OPTIONS, ...options };
-  const delay = input.screenshotDelayTicks ?? secondsToTicks(0.55);
-  const marks = input.markers
-    .filter((m) => m.mediaTick >= 0 && m.mediaTick <= input.durationTicks)
-    .slice()
-    .sort((a, b) => a.mediaTick - b.mediaTick);
+  const delay = safeDelay(input.screenshotDelayTicks);
+  const duration = usableDuration(input.durationTicks);
+  const marks =
+    duration <= 0
+      ? []
+      : input.markers
+          .filter((m) => m && Number.isFinite(m.mediaTick) && m.mediaTick >= 0 && m.mediaTick <= duration)
+          .slice()
+          .sort((a, b) => a.mediaTick - b.mediaTick);
 
   const steps: TutorialStep[] = [];
   for (let i = 0; i < marks.length; i++) {
@@ -54,27 +91,30 @@ export function buildStepDrafts(
     // 与上一个标记过近：视为同一操作阶段，合并（保留后一个的时间点，note 拼接）
     if (prev && mark.mediaTick - prev.mediaTick <= opt.mergeGapTicks && steps.length > 0) {
       const last = steps[steps.length - 1];
-      last.sourceRange = { start: last.sourceRange.start, end: Math.max(last.sourceRange.end, mark.mediaTick) };
+      const end = Math.min(duration, Math.max(last.sourceRange.end, mark.mediaTick));
+      last.sourceRange = { start: last.sourceRange.start, end: Math.max(last.sourceRange.start + 1, end) };
+      last.imageTick = Math.min(last.sourceRange.end - 1, Math.max(last.sourceRange.start, last.imageTick));
       if (mark.note && !last.description.includes(mark.note)) {
         last.description = last.description ? `${last.description} ${mark.note}` : mark.note;
       }
       continue;
     }
+    const window = stepWindow(duration, mark.mediaTick, delay);
     const title = mark.note.trim() ? mark.note.trim() : `步骤 ${steps.length + 1} 待补充说明`;
     steps.push({
       id: `step-${i + 1}-${Math.random().toString(36).slice(2, 6)}`,
-      sourceRange: { start: mark.mediaTick, end: Math.min(input.durationTicks, mark.mediaTick + delay * 2) },
+      sourceRange: { start: window.start, end: window.end },
       title,
       description: '',
-      imageTick: Math.min(input.durationTicks - 1, mark.mediaTick + delay),
+      imageTick: window.imageTick,
       actionRect: null,
       source: 'marker',
       privacyVersion: 0,
     });
   }
 
-  if (opt.includeClicks) {
-    const clickSteps = buildClickSteps(input.clicks, input.durationTicks, delay, steps.length);
+  if (opt.includeClicks && duration > 0) {
+    const clickSteps = buildClickSteps(input.clicks, duration, delay, steps.length);
     steps.push(...clickSteps);
     steps.sort((a, b) => a.sourceRange.start - b.sourceRange.start);
   }
@@ -89,19 +129,22 @@ function buildClickSteps(
   delay: Ticks,
   startIndex: number,
 ): TutorialStep[] {
-  const sorted = clicks.filter((c) => c.kind === 'down').sort((a, b) => a.tick - b.tick);
+  const sorted = clicks
+    .filter((c) => c && c.kind === 'down' && Number.isFinite(c.tick) && c.tick >= 0 && c.tick < durationTicks)
+    .sort((a, b) => a.tick - b.tick);
   const steps: TutorialStep[] = [];
   let lastTick = -Infinity;
   for (const click of sorted) {
     if (click.tick - lastTick < secondsToTicks(0.8)) continue;
     lastTick = click.tick;
     const rect = click.controlRect ?? null;
+    const window = stepWindow(durationTicks, click.tick, delay);
     steps.push({
       id: `step-click-${steps.length + 1}`,
-      sourceRange: { start: click.tick, end: Math.min(durationTicks, click.tick + delay * 2) },
+      sourceRange: { start: window.start, end: window.end },
       title: click.controlName ? `点击 ${click.controlName}` : `步骤 ${startIndex + steps.length + 1} 待补充说明`,
       description: '',
-      imageTick: Math.min(Math.max(0, durationTicks - 1), click.tick + delay),
+      imageTick: window.imageTick,
       actionRect: rect,
       source: 'click',
       privacyVersion: 0,
@@ -129,6 +172,83 @@ export function mapStepsToTimeline(
     const mapped = mapSource(step.sourceRange.start);
     return { step, timelineTick: mapped, dangling: mapped === null };
   });
+}
+
+/**
+ * 源/媒体时间 → 成片时间线时间。
+ *
+ * 步骤记录的是「源时间」（标记、点击都出现在录制素材的媒体时间轴上），
+ * 而播放头、预览、导出都用成片时间线时间。修剪/删除/重排之后两者不再相等，
+ * 渲染前必须过这一层映射，否则步骤缩略图会拍到错位的画面。
+ *
+ * @returns null 表示该源时刻已经不在成片里（被剪掉），调用方应标为 dangling
+ */
+export function sourceTickToTimeline(
+  project: Project,
+  sourceTick: Ticks,
+  map: TimeMap = new TimeMap(project),
+): Ticks | null {
+  const track = findTrack(project, 'primaryVideo');
+  if (!track || !Number.isFinite(sourceTick)) return null;
+  const tick = Math.round(sourceTick);
+  let best: Ticks | null = null;
+  for (const clip of track.clips) {
+    for (const hit of map.toTimeline('primaryVideo', clip.assetId, tick)) {
+      // 同一段源画面可能被引用多次：取成片里最靠前的那个位置，行为确定可复现
+      if (best === null || hit.timelineTick < best) best = hit.timelineTick;
+    }
+  }
+  return best;
+}
+
+/** 步骤截图时刻映射到成片时间；该时刻已被剪掉时返回 null。 */
+export function stepTimelineTick(
+  project: Project,
+  step: TutorialStep,
+  map: TimeMap = new TimeMap(project),
+): Ticks | null {
+  return sourceTickToTimeline(project, step.imageTick, map);
+}
+
+/** Map one surviving step region; never span unrelated clips after reordering. */
+export function stepTimelineRange(
+  project: Project,
+  step: TutorialStep,
+  map: TimeMap = new TimeMap(project),
+): TickRange | null {
+  const candidates: { range: TickRange; containsImage: boolean }[] = [];
+  for (const clip of findTrack(project, 'primaryVideo')?.clips ?? []) {
+    const a = Math.max(step.sourceRange.start, clip.sourceInTicks);
+    const b = Math.min(step.sourceRange.end, clip.sourceInTicks + clip.sourceDurationTicks);
+    if (b <= a) continue;
+    const start = map.toTimeline('primaryVideo', clip.assetId, a)
+      .find((hit) => hit.clip.id === clip.id)?.timelineTick;
+    if (start === undefined) continue;
+    const end = clip.timelineInTicks + Math.round((b - clip.sourceInTicks) * clip.rate.den / clip.rate.num);
+    candidates.push({ range: { start, end: Math.max(start + 1, end) },
+      containsImage: step.imageTick >= a && step.imageTick < b });
+  }
+  candidates.sort((a, b) => Number(b.containsImage) - Number(a.containsImage) ||
+    (b.range.end - b.range.start) - (a.range.end - a.range.start) || a.range.start - b.range.start);
+  return candidates[0]?.range ?? null;
+}
+
+/**
+ * 成片时间 → 步骤区间内的源时间（编辑「截图时间」时把用户输入换算回存储字段）。
+ * 目标时刻不在主轨片段内时返回 null。
+ */
+export function timelineTickToStepSource(
+  project: Project,
+  step: TutorialStep,
+  timelineTick: Ticks,
+  map: TimeMap = new TimeMap(project),
+): Ticks | null {
+  if (!Number.isFinite(timelineTick)) return null;
+  const hit = map.toSource('primaryVideo', Math.round(timelineTick));
+  if (!hit) return null;
+  const lower = step.sourceRange.start;
+  const upper = Math.max(lower, step.sourceRange.end - 1);
+  return Math.min(upper, Math.max(lower, hit.sourceTick));
 }
 
 /** 步骤截图时间夹紧到有效范围，避免取到已删除区间。 */

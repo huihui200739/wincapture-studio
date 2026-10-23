@@ -11,7 +11,7 @@
  * 注意文案：这里删除的是「时间线片段」，与「删除源素材」是两件事。
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type {
   CanvasStyle,
   CursorParameters,
@@ -19,15 +19,16 @@ import type {
   PrivacyParameters,
   PrivacyStyle,
   Project,
-  TrackKind,
   ZoomParameters,
 } from '@domain/project';
 import type { SetEffectCommand, SetCanvasStyleCommand, SetTrackAudioCommand, TrimClipCommand, MoveClipCommand } from '@domain/commands';
 import { findTrack, timelineDuration } from '@domain/project';
-import { TICKS_PER_SECOND, formatDuration, parseDuration, secondsToTicks, ticksToSeconds } from '@domain/timebase';
+import { formatDuration, parseDuration, secondsToTicks, ticksToSeconds } from '@domain/timebase';
 import { useApp } from '../lib/store';
 import { Badge, Button, Field, Icon, IconButton, InlineNote, Segmented, Slider, TextInput, Toggle } from './ui';
-import { cn } from '../lib/format';
+import { cn, clamp } from '../lib/format';
+import { planClipMove, splittableTick, clipEndTick } from './Timeline';
+import { CANVAS_PRESETS } from '@domain/presets';
 
 type Tab = 'clip' | 'zoom' | 'privacy' | 'cursor' | 'canvas';
 
@@ -50,6 +51,100 @@ const BACKGROUND_SWATCHES = [
 
 function styleLabel(style: PrivacyStyle): string {
   return style === 'solid' ? '实色' : style === 'blur' ? '模糊' : '马赛克';
+}
+
+/** 与 domain commands.ts 的 MIN_CLIP_TICKS 保持一致（1ms）。 */
+const MIN_CLIP_TICKS = 10_000;
+/**
+ * 遮挡/运镜的最短有效区间：0.2 秒。
+ * TICKS_PER_SECOND = 10_000_000，所以是 2_000_000；旧值 200_000 只有 0.02 秒，
+ * 与面板上「最短 0.2 秒」的提示、以及 EditorView 框选创建用的 0.2 秒都不一致。
+ */
+const MIN_EFFECT_SPAN_TICKS = 2_000_000;
+
+function finiteOr(value: number, fallback: number): number {
+  return Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * 归一化遮挡矩形：宽高进 [0.01, 1]，x/y 夹紧到矩形不出画面。
+ *
+ * 属性面板的滑杆各自独立取值，不夹紧就能组合出 x=0.9 / width=0.5 这种
+ * 「框一半在画面外」的几何；预览上看起来只遮住一角，但 confirmed 仍然是 true，
+ * 用户会误以为敏感内容已被完整遮住。
+ */
+export function clampPrivacyRect(rect: { x: number; y: number; width: number; height: number }): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+} {
+  const width = clamp(finiteOr(rect.width, 0.01), 0.01, 1);
+  const height = clamp(finiteOr(rect.height, 0.01), 0.01, 1);
+  const x = clamp(finiteOr(rect.x, 0), 0, 1 - width);
+  const y = clamp(finiteOr(rect.y, 0), 0, 1 - height);
+  return { x, y, width, height };
+}
+
+/**
+ * 夹紧效果时间区间，保证 0 <= start < end 且都落在工程时长内。
+ *
+ * 直接沿用滑杆值会造出 start === end（甚至 start > end）的区间：效果永远不生效，
+ * 但确认状态仍显示「已遮挡」——这正是「已确认」与真实几何不一致的来源。
+ */
+export function clampEffectRange(
+  range: { start: number; end: number },
+  durationTicks: number,
+  minSpanTicks = MIN_EFFECT_SPAN_TICKS,
+): { start: number; end: number } {
+  const duration = Math.max(0, Math.round(finiteOr(durationTicks, 0)));
+  const span = Math.max(1, Math.min(Math.round(minSpanTicks), duration > 0 ? duration : Math.round(minSpanTicks)));
+  if (duration <= 0) return { start: 0, end: span };
+  const start = clamp(Math.round(finiteOr(range.start, 0)), 0, Math.max(0, duration - span));
+  const end = clamp(Math.round(finiteOr(range.end, start + span)), start + span, Math.max(start + span, duration));
+  return { start, end };
+}
+
+/**
+ * 裁剪参数夹紧到素材可用范围：源入点 + 时长不得超过素材总时长。
+ *
+ * 素材时长未知（外部工程/尚未挂载素材）时不做限制，保持原有行为。
+ */
+export function clampTrimSource(
+  clip: { sourceInTicks: number; sourceDurationTicks: number },
+  assetDurationTicks: number | null | undefined,
+  patch: { sourceInTicks?: number; sourceDurationTicks?: number },
+): { sourceInTicks?: number; sourceDurationTicks?: number } {
+  const next: { sourceInTicks?: number; sourceDurationTicks?: number } = { ...patch };
+  const asset = assetDurationTicks && assetDurationTicks > 0 ? Math.round(assetDurationTicks) : null;
+  if (!asset) return next;
+  const minLen = Math.min(MIN_CLIP_TICKS, asset);
+  let sourceIn = Math.round(finiteOr(next.sourceInTicks ?? clip.sourceInTicks, clip.sourceInTicks));
+  sourceIn = clamp(sourceIn, 0, Math.max(0, asset - minLen));
+  let duration = Math.round(finiteOr(next.sourceDurationTicks ?? clip.sourceDurationTicks, clip.sourceDurationTicks));
+  if (next.sourceInTicks !== undefined && next.sourceDurationTicks !== undefined) {
+    // 同时改入点与时长：优先满足时长，再回推入点，避免两个值互相撑爆素材长度
+    duration = clamp(duration, minLen, asset);
+    sourceIn = clamp(sourceIn, 0, Math.max(0, asset - duration));
+  } else {
+    duration = clamp(duration, minLen, Math.max(minLen, asset - sourceIn));
+  }
+  next.sourceInTicks = sourceIn;
+  next.sourceDurationTicks = duration;
+  return next;
+}
+
+/** 摄像头画中画矩形夹紧：整块必须留在输出画布内。 */
+export function clampCameraRect(camera: CanvasStyle['camera']): CanvasStyle['camera'] {
+  const width = clamp(finiteOr(camera.width, 0.24), 0.01, 1);
+  const height = clamp(finiteOr(camera.height, 0.24), 0.01, 1);
+  return {
+    ...camera,
+    width,
+    height,
+    x: clamp(finiteOr(camera.x, 0), 0, 1 - width),
+    y: clamp(finiteOr(camera.y, 0), 0, 1 - height),
+  };
 }
 
 export function InspectorPanel() {
@@ -79,6 +174,12 @@ export function InspectorPanel() {
     return project.effects.find((e) => e.id === selectedEffectId) ?? null;
   }, [project, selectedEffectId]);
 
+  useEffect(() => {
+    const kind = selectedEffect?.kind;
+    if (kind === 'zoom' || kind === 'privacy' || kind === 'cursor') setTab(kind);
+  }, [selectedEffectId, selectedEffect?.kind]);
+  useEffect(() => { if (selectedClipId) setTab('clip'); }, [selectedClipId]);
+
   if (!project) {
     return (
       <aside className="editor-inspector" aria-label="属性面板">
@@ -95,12 +196,23 @@ export function InspectorPanel() {
 
   return (
     <aside className="editor-inspector" aria-label="属性面板">
-      <div className="inspector-tabs" role="tablist" aria-label="属性分类">
+      <div className="inspector-tabs" role="tablist" aria-label="属性分类" onKeyDown={(event) => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const index = TABS.findIndex((item) => item.id === tab);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? TABS.length - 1
+          : (index + (event.key === 'ArrowRight' ? 1 : -1) + TABS.length) % TABS.length;
+        setTab(TABS[next].id);
+        event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
+      }}>
         {TABS.map((item) => (
           <button
             key={item.id}
             type="button"
             role="tab"
+            id={`inspector-tab-${item.id}`}
+            aria-controls="inspector-content"
+            tabIndex={tab === item.id ? 0 : -1}
             aria-selected={tab === item.id}
             className={cn('inspector-tab', tab === item.id && 'is-active')}
             onClick={() => setTab(item.id)}
@@ -111,7 +223,7 @@ export function InspectorPanel() {
         ))}
       </div>
 
-      <div className="inspector-body">
+      <div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${tab}`}>
         {tab === 'clip' && (
           <ClipTab
             project={project}
@@ -130,6 +242,7 @@ export function InspectorPanel() {
             selectedEffectId={selectedEffectId}
             onSelectEffect={selectEffect}
             execute={execute}
+            pushToast={pushToast}
           />
         )}
         {tab === 'privacy' && (
@@ -185,13 +298,55 @@ function ClipTab({
   const mic = findTrack(project, 'mic');
   const system = findTrack(project, 'system');
 
+  const asset = useMemo(() => {
+    if (!selectedClip) return null;
+    return project.assets.find((item) => item.id === selectedClip.clip.assetId) ?? null;
+  }, [project.assets, selectedClip]);
+
+  /** 同组（linkGroupId）片段数量：联动移动需要 domain 原子命令，这里只做提示。 */
+  const linkedElsewhere = useMemo(() => {
+    if (!selectedClip || !selectedClip.clip.linkGroupId) return 0;
+    let count = 0;
+    for (const track of project.tracks) {
+      for (const clip of track.clips) {
+        if (clip.id === selectedClip.clip.id) continue;
+        if (clip.linkGroupId && clip.linkGroupId === selectedClip.clip.linkGroupId) count += 1;
+      }
+    }
+    return count;
+  }, [project.tracks, selectedClip]);
+
   const applyTrim = (patch: Partial<TrimClipCommand>) => {
     if (!selectedClip) return;
+    // 源入点/时长不得超过素材总时长：否则裁剪后的片段会引用不存在的媒体区间，
+    // 导出时尾部黑屏或直接失败。
+    const clamped = clampTrimSource(selectedClip.clip, asset?.durationTicks, patch);
     execute<TrimClipCommand>(
-      { kind: 'TrimClip', clipId: selectedClip.clip.id, ...patch },
+      { kind: 'TrimClip', clipId: selectedClip.clip.id, ...clamped },
       '裁剪片段',
     );
   };
+
+  // 滑杆上限按「素材剩余长度」而不是工程时长：单片段工程里工程时长正好等于
+  // 当前片段长度，用工程时长当上限会让用户永远无法把片段拉长。
+  const currentDurationSeconds = selectedClip ? ticksToSeconds(selectedClip.clip.sourceDurationTicks) : 0;
+  const currentSourceInSeconds = selectedClip ? ticksToSeconds(selectedClip.clip.sourceInTicks) : 0;
+  const maxDurationSeconds = selectedClip
+    ? asset
+      ? Math.max(
+          currentDurationSeconds,
+          ticksToSeconds(Math.max(MIN_CLIP_TICKS, asset.durationTicks - selectedClip.clip.sourceInTicks)),
+        )
+      : Math.max(currentDurationSeconds, ticksToSeconds(duration), 1)
+    : 1;
+  const maxSourceInSeconds = selectedClip
+    ? asset
+      ? Math.max(
+          currentSourceInSeconds,
+          ticksToSeconds(Math.max(0, asset.durationTicks - selectedClip.clip.sourceDurationTicks)),
+        )
+      : Math.max(currentSourceInSeconds, ticksToSeconds(duration), 1)
+    : 1;
 
   return (
     <>
@@ -212,6 +367,16 @@ function ClipTab({
           </div>
         ) : (
           <>
+            {selectedClip.track.kind === 'primaryVideo' && (
+              <Field label="播放速度" htmlFor="clip-speed" hint="画面、关联音频和摄像头同步变速，后续片段自动衔接。音调会随速度变化。">
+                <select id="clip-speed" className="wcs-select" aria-label="播放速度"
+                  value={selectedClip.clip.rate.num / selectedClip.clip.rate.den}
+                  onChange={(event) => execute({ kind: 'SetClipRate', clipId: selectedClip.clip.id,
+                    rate: { num: Math.round(Number(event.target.value) * 100), den: 100 } }, '调整播放速度')}>
+                  {[0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4].map((rate) => <option key={rate} value={rate}>{rate}×{rate === 1 ? ' · 原速' : ''}</option>)}
+                </select>
+              </Field>
+            )}
             <div className="kv-list">
               <div className="kv-row">
                 <span className="kv-key">片段 ID</span>
@@ -252,8 +417,22 @@ function ClipTab({
                       pushToast({ tone: 'warn', title: '时间格式无法识别', message: '请使用 mm:ss.cc 或纯秒数。' });
                       return;
                     }
+                    const clip = selectedClip.clip;
+                    const plan = planClipMove(project, clip.id, Math.min(parsed, Math.max(0, duration)));
+                    if (!plan) return;
+                    if (plan.adjusted) {
+                      pushToast({
+                        tone: 'warn',
+                        title: '目标位置与同轨片段重叠',
+                        message:
+                          plan.tick === plan.originTick
+                            ? '片段未移动：目标位置会和同轨其它片段叠在一起。'
+                            : '已把片段放到最近的不重叠位置。',
+                      });
+                    }
+                    if (plan.tick === clip.timelineInTicks) return;
                     execute<MoveClipCommand>(
-                      { kind: 'MoveClip', clipId: selectedClip.clip.id, timelineInTicks: Math.min(parsed, Math.max(0, duration)) },
+                      { kind: 'MoveClip', clipId: clip.id, timelineInTicks: plan.tick },
                       '移动片段',
                     );
                   }}
@@ -266,18 +445,19 @@ function ClipTab({
               <Slider
                 label="时长"
                 min={0.2}
-                max={Math.max(1, ticksToSeconds(duration))}
+                max={Math.max(0.2, maxDurationSeconds)}
                 step={0.1}
-                value={ticksToSeconds(selectedClip.clip.sourceDurationTicks)}
+                value={currentDurationSeconds}
                 format={(v) => `${v.toFixed(1)} 秒`}
                 onCommit={(next) => applyTrim({ sourceDurationTicks: secondsToTicks(next) })}
+                hint={asset ? '不得超过素材剩余长度；拉长会覆盖同轨后续片段所在位置。' : undefined}
               />
               <Slider
                 label="源入点"
                 min={0}
-                max={Math.max(1, ticksToSeconds(duration))}
+                max={Math.max(0.2, maxSourceInSeconds)}
                 step={0.1}
-                value={ticksToSeconds(selectedClip.clip.sourceInTicks)}
+                value={currentSourceInSeconds}
                 format={(v) => `${v.toFixed(1)} 秒`}
                 onCommit={(next) => applyTrim({ sourceInTicks: secondsToTicks(next) })}
               />
@@ -286,7 +466,17 @@ function ClipTab({
                 <Button
                   size="sm"
                   icon="split"
-                  onClick={() => execute({ kind: 'SplitClip', timelineTick: tick }, '分割片段')}
+                  onClick={() => {
+                    if (!splittableTick(project, tick)) {
+                      pushToast({
+                        tone: 'warn',
+                        title: '这里无法分割',
+                        message: '播放头需要落在某个片段内部（距片段两端至少 1 毫秒）。',
+                      });
+                      return;
+                    }
+                    execute({ kind: 'SplitClip', timelineTick: tick }, '分割片段');
+                  }}
                 >
                   在播放头分割
                 </Button>
@@ -294,6 +484,13 @@ function ClipTab({
                   取消选择
                 </Button>
               </div>
+              {linkedElsewhere > 0 && (
+                <div style={{ marginTop: 8 }}>
+                  <InlineNote tone="info">
+                    移动和裁剪会同步作用于同组的 {linkedElsewhere} 段片段，保持摄像头与声音对齐。可用撤销一起恢复。
+                  </InlineNote>
+                </div>
+              )}
               <div style={{ marginTop: 8 }}>
                 <Button
                   size="sm"
@@ -305,7 +502,7 @@ function ClipTab({
                     execute(
                       {
                         kind: 'DeleteRange',
-                        range: { start: clip.timelineInTicks, end: clip.timelineInTicks + clip.sourceDurationTicks },
+                        range: { start: clip.timelineInTicks, end: clipEndTick(clip) },
                         ripple: true,
                       },
                       '删除时间线片段（波纹）',
@@ -406,12 +603,14 @@ function ZoomTab({
   selectedEffectId,
   onSelectEffect,
   execute,
+  pushToast,
 }: {
   project: Project;
   tick: number;
   selectedEffectId: string | null;
   onSelectEffect: (id: string | null) => void;
   execute: ReturnType<typeof useApp>['execute'];
+  pushToast: ReturnType<typeof useApp>['pushToast'];
 }) {
   const zooms = project.effects.filter((e) => e.kind === 'zoom');
   const current = zooms.find((e) => e.id === selectedEffectId) ?? zooms.find((e) => tick >= e.range.start && tick < e.range.end) ?? null;
@@ -424,11 +623,17 @@ function ZoomTab({
   };
 
   const addZoom = () => {
-    const id = `zoom-manual-${Date.now().toString(36)}`;
+    const duration = timelineDuration(project);
+    if (duration <= 0) {
+      pushToast({ tone: 'warn', title: '工程里还没有画面', message: '先录制或导入素材，再新建运镜。' });
+      return;
+    }
+    const id = `zoom-manual-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+    const range = clampEffectRange({ start: tick, end: tick + secondsToTicks(3) }, duration);
     const effect: Effect = {
       id,
       kind: 'zoom',
-      range: { start: tick, end: Math.min(timelineDuration(project), tick + secondsToTicks(3)) },
+      range,
       parameters: {
         scale: 1.6,
         focusX: 0.5,
@@ -617,26 +822,35 @@ function PrivacyTab({
   const privacy = project.effects.filter((e) => e.kind === 'privacy');
   const current = privacy.find((e) => e.id === selectedEffectId) ?? null;
   const unconfirmed = privacy.filter((e) => !(e.parameters as PrivacyParameters).confirmed);
+  const duration = timelineDuration(project);
 
   const update = (patch: Partial<PrivacyParameters>) => {
     if (!current) return;
     const params = { ...(current.parameters as PrivacyParameters), ...patch };
-    const next: Effect = { ...current, parameters: params };
+    // 几何夹紧：任何一次修改都保证矩形完整落在源画面内，避免出现
+    // 「已确认但框有一半在画面外」这种确认状态与真实遮挡不一致的情况。
+    const rect = clampPrivacyRect(params);
+    const next: Effect = { ...current, parameters: { ...params, ...rect } };
     execute<SetEffectCommand>({ kind: 'SetEffect', effect: next, lock: true }, patch.confirmed !== undefined ? '确认遮挡' : '调整遮挡');
   };
 
   const addPrivacy = () => {
-    const id = `privacy-${Date.now().toString(36)}`;
+    if (duration <= 0) {
+      pushToast({ tone: 'warn', title: '工程里还没有画面', message: '先录制或导入素材，再新建遮挡区域。' });
+      return;
+    }
+    const id = `privacy-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+    const range = clampEffectRange(
+      { start: tick - secondsToTicks(1), end: tick + secondsToTicks(4) },
+      duration,
+    );
     const effect: Effect = {
       id,
       kind: 'privacy',
-      range: { start: Math.max(0, tick - secondsToTicks(1)), end: Math.min(timelineDuration(project), tick + secondsToTicks(4)) },
+      range,
       anchor: 'screen',
       parameters: {
-        x: 0.32,
-        y: 0.32,
-        width: 0.22,
-        height: 0.08,
+        ...clampPrivacyRect({ x: 0.32, y: 0.32, width: 0.22, height: 0.08 }),
         anchor: 'screen',
         style: 'solid',
         confirmed: false,
@@ -787,19 +1001,24 @@ function PrivacyTab({
           <div className="inspector-section">
             <div className="inspector-section-head">
               <h3>时间区间</h3>
+              <Badge tone={current.range.end > current.range.start ? 'muted' : 'danger'}>
+                {formatDuration(current.range.start)} → {formatDuration(current.range.end)}
+              </Badge>
             </div>
             <Slider
               label="开始"
               min={0}
-              max={Math.max(1, ticksToSeconds(timelineDuration(project)))}
+              max={Math.max(0.2, ticksToSeconds(duration))}
               step={0.1}
               value={ticksToSeconds(current.range.start)}
               format={(v) => `${v.toFixed(1)} 秒`}
               onCommit={(next) => {
-                const start = secondsToTicks(next);
-                const end = Math.max(start + secondsToTicks(0.2), current.range.end);
+                const range = clampEffectRange(
+                  { start: secondsToTicks(next), end: current.range.end },
+                  duration,
+                );
                 execute<SetEffectCommand>(
-                  { kind: 'SetEffect', effect: { ...current, range: { start, end } }, lock: true },
+                  { kind: 'SetEffect', effect: { ...current, range }, lock: true },
                   '调整遮挡区间',
                 );
               }}
@@ -807,15 +1026,17 @@ function PrivacyTab({
             <Slider
               label="结束"
               min={0}
-              max={Math.max(1, ticksToSeconds(timelineDuration(project)))}
+              max={Math.max(0.2, ticksToSeconds(duration))}
               step={0.1}
               value={ticksToSeconds(current.range.end)}
               format={(v) => `${v.toFixed(1)} 秒`}
               onCommit={(next) => {
-                const end = secondsToTicks(next);
-                const start = Math.min(current.range.start, Math.max(0, end - secondsToTicks(0.2)));
+                const range = clampEffectRange(
+                  { start: current.range.start, end: secondsToTicks(next) },
+                  duration,
+                );
                 execute<SetEffectCommand>(
-                  { kind: 'SetEffect', effect: { ...current, range: { start, end } }, lock: true },
+                  { kind: 'SetEffect', effect: { ...current, range }, lock: true },
                   '调整遮挡区间',
                 );
               }}
@@ -825,19 +1046,28 @@ function PrivacyTab({
               variant="ghost"
               icon="clock"
               block
-              onClick={() =>
+              onClick={() => {
+                if (tick <= current.range.start) {
+                  pushToast({
+                    tone: 'warn',
+                    title: '播放头不在遮挡区间内',
+                    message: '请把播放头移到遮挡开始时间之后，再设为结束时间。',
+                  });
+                  return;
+                }
+                const range = clampEffectRange(
+                  { start: current.range.start, end: Math.min(duration, tick) },
+                  duration,
+                );
                 execute<SetEffectCommand>(
-                  {
-                    kind: 'SetEffect',
-                    effect: { ...current, range: { start: current.range.start, end: Math.min(timelineDuration(project), tick) } },
-                    lock: true,
-                  },
+                  { kind: 'SetEffect', effect: { ...current, range }, lock: true },
                   '结束时间设为播放头',
-                )
-              }
+                );
+              }}
             >
               结束时间设为播放头
             </Button>
+            <p className="wcs-field-hint">最短 0.2 秒，区间会被夹紧到工程时长内；零长度区间不会生效。</p>
           </div>
 
           <div className="inspector-section">
@@ -846,9 +1076,16 @@ function PrivacyTab({
             </div>
             {(current.parameters as PrivacyParameters).confirmed ? (
               <>
-                <InlineNote tone="ok">
-                  该区域已确认遮挡，导出时会按「{styleLabel((current.parameters as PrivacyParameters).style)}」处理。
-                </InlineNote>
+                {current.range.end <= current.range.start ? (
+                  <InlineNote tone="danger">
+                    该区域<strong>已标记确认</strong>，但时间区间是空的（{formatDuration(current.range.start)} →{' '}
+                    {formatDuration(current.range.end)}），实际<strong>不会遮挡</strong>。请先把结束时间调到开始时间之后。
+                  </InlineNote>
+                ) : (
+                  <InlineNote tone="ok">
+                    该区域已确认遮挡，导出时会按「{styleLabel((current.parameters as PrivacyParameters).style)}」处理。
+                  </InlineNote>
+                )}
                 <Button
                   size="sm"
                   variant="ghost"
@@ -871,6 +1108,14 @@ function PrivacyTab({
                   block
                   style={{ marginTop: 8 }}
                   onClick={() => {
+                    if (current.range.end <= current.range.start) {
+                      pushToast({
+                        tone: 'warn',
+                        title: '时间区间无效，无法确认',
+                        message: '开始时间必须早于结束时间；零长度区间不会真的遮挡。',
+                      });
+                      return;
+                    }
                     update({ confirmed: true });
                     pushToast({ tone: 'ok', title: '遮挡已确认', message: '导出与教程截图都会应用该遮挡。' });
                   }}
@@ -989,6 +1234,20 @@ function CursorTab({
           </InlineNote>
         ) : null}
 
+        <Field label="光标样式">
+          <Segmented ariaLabel="光标样式" value={params.style ?? 'arrow'}
+            options={[{ value: 'arrow', label: '箭头' }, { value: 'dot', label: '圆点' }]}
+            onChange={(style) => { if (!params.burnedIn) update({ style }, '调整光标样式'); }} />
+        </Field>
+        <Toggle checked={(params.hideAfterTicks ?? 0) > 0}
+          onChange={(next) => update({ hideAfterTicks: next ? secondsToTicks(2) : 0 }, '调整光标静止隐藏')}
+          label="静止时隐藏" description="指针停止移动 2 秒后自动隐藏，移动或点击后重新显示。" disabled={params.burnedIn} />
+        <Slider label="光标时间校准" min={-500} max={500} step={10}
+          value={(params.timeOffsetTicks ?? 0) / 10_000} disabled={params.burnedIn}
+          format={(v) => `${v > 0 ? '+' : ''}${v} ms`}
+          onCommit={(next) => update({ timeOffsetTicks: Math.round(next * 10_000) }, '校准光标时间')}
+          hint="正值让指针提前显示，负值让指针延后；预览与导出同步应用。" />
+
         <Slider
           label="光标大小"
           min={12}
@@ -1069,8 +1328,36 @@ function CanvasTab({
   const canvas = project.settings.canvas;
   const variant = project.variants.find((v) => v.id === project.settings.activeVariantId) ?? project.variants[0];
 
+  // 自定义背景色：受控输入不能直接把每次按键写回工程（"#1" 这类中间值非法，
+  // 若在 onChange 里拒绝写入，输入框会被旧值覆盖，用户根本打不出一个颜色）。
+  // 这里用本地草稿：输入期间只改草稿，回车/失焦时校验并提交。
+  const [backgroundDraft, setBackgroundDraft] = useState(canvas.background.startsWith('#') ? canvas.background : '');
+  const [backgroundEditing, setBackgroundEditing] = useState(false);
+  useEffect(() => {
+    if (backgroundEditing) return;
+    setBackgroundDraft(canvas.background.startsWith('#') ? canvas.background : '');
+  }, [backgroundEditing, canvas.background]);
+
+  const commitBackground = () => {
+    setBackgroundEditing(false);
+    const value = backgroundDraft.trim();
+    if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(value)) {
+      if (value !== canvas.background) {
+        execute<SetCanvasStyleCommand>({ kind: 'SetCanvasStyle', canvas: { background: value } }, '调整画布样式');
+      }
+      return;
+    }
+    // 非法输入回退到当前工程值，不留一个「看起来已生效」的假颜色
+    setBackgroundDraft(canvas.background.startsWith('#') ? canvas.background : '');
+  };
+
   const setCanvas = (patch: Partial<CanvasStyle>) => {
     execute<SetCanvasStyleCommand>({ kind: 'SetCanvasStyle', canvas: patch }, '调整画布样式');
+  };
+
+  const setCamera = (patch: Partial<CanvasStyle['camera']>) => {
+    // 摄像头画中画整块必须留在画布内，否则导出后会被裁掉一半
+    setCanvas({ camera: clampCameraRect({ ...canvas.camera, ...patch }) });
   };
 
   const setVariant = (variantId: string) => {
@@ -1079,6 +1366,21 @@ function CanvasTab({
 
   return (
     <>
+      <div className="inspector-section">
+        <div className="inspector-section-head"><h3>场景预设</h3><Badge tone="muted">一键应用</Badge></div>
+        <div className="canvas-presets" role="group" aria-label="场景预设">
+          {CANVAS_PRESETS.map((preset) => {
+            const selected = Object.entries(preset.style).every(([key, value]) => canvas[key as keyof CanvasStyle] === value);
+            return <button key={preset.id} type="button" className={cn('canvas-preset', selected && 'is-selected')}
+              aria-pressed={selected} title={preset.description} onClick={() => setCanvas({ ...preset.style })}>
+              <span className="canvas-preset-preview" style={{ background: preset.style.background }}>
+                <span style={{ inset: `${preset.style.padding * 100 + 8}%`, borderRadius: preset.style.cornerRadius / 4 }} />
+              </span>
+              <span>{preset.name}</span>
+            </button>;
+          })}
+        </div>
+      </div>
       <div className="inspector-section">
         <div className="inspector-section-head">
           <h3>
@@ -1128,15 +1430,24 @@ function CanvasTab({
           ))}
           <TextInput
             aria-label="自定义背景色"
-            value={canvas.background.startsWith('#') ? canvas.background : ''}
+            value={backgroundDraft}
             placeholder="#101418"
             style={{ width: 92, height: 24, fontSize: 'var(--fs-aux)' }}
+            onFocus={() => setBackgroundEditing(true)}
             onChange={(event) => {
-              const value = event.target.value.trim();
-              if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(value)) setCanvas({ background: value });
+              setBackgroundEditing(true);
+              setBackgroundDraft(event.target.value);
             }}
+            onBlur={commitBackground}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') (event.target as HTMLInputElement).blur();
+            }}
+            title="输入 #RGB / #RRGGBB / #RRGGBBAA，回车或失焦生效"
           />
         </div>
+        <p className="wcs-field-hint" style={{ marginTop: 6 }}>
+          自定义背景色支持 #RGB / #RRGGBB / #RRGGBBAA，回车或失焦生效。
+        </p>
       </div>
 
       <div className="inspector-section">
@@ -1187,7 +1498,7 @@ function CanvasTab({
           <button
             type="button"
             className={cn('wcs-btn is-sm is-ghost', !canvas.camera.visible && 'is-danger')}
-            onClick={() => setCanvas({ camera: { ...canvas.camera, visible: !canvas.camera.visible } })}
+            onClick={() => setCamera({ visible: !canvas.camera.visible })}
           >
             <Icon name={canvas.camera.visible ? 'eye' : 'eyeOff'} size={11} />
             {canvas.camera.visible ? '显示' : '隐藏'}
@@ -1200,7 +1511,7 @@ function CanvasTab({
           step={0.005}
           value={canvas.camera.x}
           format={(v) => `${(v * 100).toFixed(0)}%`}
-          onCommit={(next) => setCanvas({ camera: { ...canvas.camera, x: next } })}
+          onCommit={(next) => setCamera({ x: next })}
         />
         <Slider
           label="Y"
@@ -1209,7 +1520,7 @@ function CanvasTab({
           step={0.005}
           value={canvas.camera.y}
           format={(v) => `${(v * 100).toFixed(0)}%`}
-          onCommit={(next) => setCanvas({ camera: { ...canvas.camera, y: next } })}
+          onCommit={(next) => setCamera({ y: next })}
         />
         <Slider
           label="大小"
@@ -1218,7 +1529,7 @@ function CanvasTab({
           step={0.005}
           value={canvas.camera.width}
           format={(v) => `${(v * 100).toFixed(0)}%`}
-          onCommit={(next) => setCanvas({ camera: { ...canvas.camera, width: next, height: next } })}
+          onCommit={(next) => setCamera({ width: next, height: next })}
         />
         <Slider
           label="圆角"
@@ -1227,8 +1538,9 @@ function CanvasTab({
           step={1}
           value={canvas.camera.cornerRadius}
           format={(v) => `${v} px`}
-          onCommit={(next) => setCanvas({ camera: { ...canvas.camera, cornerRadius: next } })}
+          onCommit={(next) => setCamera({ cornerRadius: next })}
         />
+        <p className="wcs-field-hint">X/Y 会自动夹紧，保证摄像头整块留在画布内。</p>
       </div>
 
       {selectedEffect && selectedEffect.kind === 'privacy' && (

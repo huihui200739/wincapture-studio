@@ -137,6 +137,7 @@ export function frameRangeForTicks(range: TickRange, fps: FrameRate): { start: n
 
 /** 第 frameIndex 帧应求值的时间线 tick（预览与导出唯一来源，§11.4）。 */
 export function frameTickAt(plan: ExportPlan, frameIndex: number): Ticks {
+  if (!Number.isFinite(frameIndex)) return 0;
   return frameIndexToTicks(Math.max(0, Math.floor(frameIndex)), plan.fps);
 }
 
@@ -240,6 +241,8 @@ export function buildExportPlan(project: Project, profile: ExportProfileLike = {
       const timeline = clipTimelineRange(clip);
       if (timeline.end <= timeline.start) continue;
       const frames = frameRangeForTicks(timeline, fps);
+      // 片段可能位于输出时长之外（例如摄像头轨比主轨长）：帧区间必须夹到
+      // [0, totalFrames]，否则会给出 frameStart > totalFrames 的「未来帧」区间。
       segments.push({
         track: track.kind,
         clipId: clip.id,
@@ -250,8 +253,8 @@ export function buildExportPlan(project: Project, profile: ExportProfileLike = {
           end: clip.sourceInTicks + clip.sourceDurationTicks,
         },
         rate: { ...clip.rate },
-        frameStart: frames.start,
-        frameEnd: Math.min(frames.end, Math.max(frames.start, totalFrames)),
+        frameStart: Math.min(frames.start, totalFrames),
+        frameEnd: Math.min(frames.end, totalFrames),
       });
     }
   }

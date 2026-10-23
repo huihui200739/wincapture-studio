@@ -7,6 +7,7 @@
  */
 
 import {
+  Component,
   useCallback,
   useEffect,
   useId,
@@ -14,6 +15,7 @@ import {
   useState,
   type ButtonHTMLAttributes,
   type CSSProperties,
+  type ErrorInfo,
   type InputHTMLAttributes,
   type ReactNode,
 } from 'react';
@@ -102,6 +104,8 @@ const ICON_PATHS: Record<string, ReactNode> = {
       <path d="M12 3.5v4M12 16.5v4" />
     </>
   ),
+  copy: <><rect x="8" y="8" width="12" height="13" rx="2" /><path d="M16 8V3H3v13h5" /></>,
+  paste: <><path d="M8 5H5v16h14V5h-3" /><rect x="8" y="3" width="8" height="4" rx="1" /><path d="M8 12h8M8 16h6" /></>,
   trash: (
     <>
       <path d="M4 7h16" />
@@ -468,13 +472,18 @@ export function Toggle({
   disabled?: boolean;
 }) {
   const id = useId();
+  const descId = `${id}-desc`;
   return (
     <div className={cn('wcs-toggle-row', disabled && 'is-disabled')}>
       <div className="wcs-toggle-text">
         <label htmlFor={id} className="wcs-toggle-label">
           {label}
         </label>
-        {description && <p className="wcs-toggle-desc">{description}</p>}
+        {description && (
+          <p className="wcs-toggle-desc" id={descId}>
+            {description}
+          </p>
+        )}
       </div>
       <button
         id={id}
@@ -482,6 +491,7 @@ export function Toggle({
         role="switch"
         aria-checked={checked}
         aria-label={typeof label === 'string' ? label : undefined}
+        aria-describedby={description ? descId : undefined}
         className={cn('wcs-switch', checked && 'is-on')}
         onClick={() => !disabled && onChange(!checked)}
         disabled={disabled}
@@ -707,11 +717,12 @@ export function ProgressBar({
         aria-label={label}
         aria-valuemin={0}
         aria-valuemax={100}
-        aria-valuenow={Math.round(pct)}
+        aria-valuenow={indeterminate ? undefined : Math.round(pct)}
+        aria-valuetext={indeterminate ? '处理中' : `${Math.round(pct)}%`}
       >
         <div className="wcs-progress-fill" style={{ width: `${pct}%` }} />
       </div>
-      <span className="wcs-progress-value">{Math.round(pct)}%</span>
+      <span className="wcs-progress-value">{indeterminate ? '处理中' : `${Math.round(pct)}%`}</span>
     </div>
   );
 }
@@ -761,6 +772,21 @@ export function Kbd({ children }: { children: ReactNode }) {
 // 模态框
 // ---------------------------------------------------------------------------
 
+/**
+ * 打开中的模态框栈：Esc 只关闭最上层，Tab 焦点陷阱只作用于最上层。
+ * （用模块级数组而不是 DOM 查询，嵌套确认框也能正确处理。）
+ */
+const modalStack: symbol[] = [];
+
+function focusableWithin(root: HTMLElement): HTMLElement[] {
+  const nodes = Array.from(
+    root.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+    ),
+  );
+  return nodes.filter((node) => node.getClientRects().length > 0);
+}
+
 export function Modal({
   title,
   children,
@@ -777,38 +803,160 @@ export function Modal({
   tone?: 'default' | 'danger';
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
+  const titleId = useId();
+  // 用 ref 保存最新 onClose：父组件通常传内联箭头函数，若放进 deps，
+  // 每次父组件重渲染都会重建监听器并重新聚焦首元素，输入框会频繁失焦。
+  const onCloseRef = useRef(onClose);
   useEffect(() => {
+    onCloseRef.current = onClose;
+  });
+
+  useEffect(() => {
+    const token = Symbol('wcs-modal');
+    modalStack.push(token);
+    const isTopmost = () => modalStack[modalStack.length - 1] === token;
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
     const onKey = (event: KeyboardEvent) => {
+      if (!isTopmost()) return;
       if (event.key === 'Escape') {
+        event.preventDefault();
         event.stopPropagation();
-        onClose();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const root = ref.current;
+      if (!root) return;
+      const items = focusableWithin(root);
+      if (items.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (!(active instanceof HTMLElement) || !root.contains(active)) {
+        event.preventDefault();
+        first.focus();
+        return;
+      }
+      if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
       }
     };
     document.addEventListener('keydown', onKey, true);
-    const first = ref.current?.querySelector<HTMLElement>('button, input, textarea, select, [tabindex]:not([tabindex="-1"])');
-    first?.focus();
-    return () => document.removeEventListener('keydown', onKey, true);
-  }, [onClose]);
+
+    const root = ref.current;
+    if (root) {
+      // 初始焦点优先落在可输入的正文控件；否则落在页脚第一个按钮（通常是「取消」），
+      // 避免危险确认框默认聚焦「删除」。
+      const preferred =
+        root.querySelector<HTMLElement>(
+          '[autofocus], input:not([disabled]), textarea:not([disabled]), select:not([disabled])',
+        ) ??
+        root.querySelector<HTMLElement>('.wcs-modal-foot button:not([disabled])') ??
+        focusableWithin(root)[0] ??
+        root;
+      preferred.focus();
+    }
+
+    // 背景滚动锁定：模态框打开期间页面不应跟着滚动
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    return () => {
+      document.removeEventListener('keydown', onKey, true);
+      const index = modalStack.indexOf(token);
+      if (index >= 0) modalStack.splice(index, 1);
+      document.body.style.overflow = previousOverflow;
+      // 关闭后焦点回到触发元素，键盘用户可以继续原位置操作
+      if (previouslyFocused && document.contains(previouslyFocused)) previouslyFocused.focus();
+    };
+  }, []);
 
   return (
-    <div className="wcs-modal-backdrop" onPointerDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div
+      className="wcs-modal-backdrop"
+      onPointerDown={(event) => event.target === event.currentTarget && onCloseRef.current()}
+    >
       <div
         ref={ref}
         className={cn('wcs-modal', tone === 'danger' && 'is-danger')}
         role="dialog"
         aria-modal="true"
-        aria-label={typeof title === 'string' ? title : '对话框'}
+        aria-labelledby={titleId}
         style={{ width }}
       >
         <header className="wcs-modal-head">
-          <h2>{title}</h2>
-          <IconButton icon="close" label="关闭对话框" size="sm" onClick={onClose} />
+          <h2 id={titleId}>{title}</h2>
+          <IconButton icon="close" label="关闭对话框" size="sm" onClick={() => onCloseRef.current()} />
         </header>
         <div className="wcs-modal-body">{children}</div>
         {footer && <footer className="wcs-modal-foot">{footer}</footer>}
       </div>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// 错误边界
+// ---------------------------------------------------------------------------
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+  /** 出错区域名，用于展示与日志定位 */
+  scope?: string;
+  onReset?: () => void;
+}
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+/**
+ * 渲染错误兜底：单个视图崩溃不应该让整个窗口白屏（Electron 下白屏等于应用假死）。
+ * 这里保留导航/状态栏，只把出错区域替换成可重试界面。
+ */
+export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  override state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: unknown): ErrorBoundaryState {
+    return { error: error instanceof Error ? error : new Error(String(error)) };
+  }
+
+  override componentDidCatch(error: Error, info: ErrorInfo): void {
+    // 控制台错误会进入 verify-ui / 诊断日志；不把堆栈直接展示给用户
+    console.error(`[renderer] ${this.props.scope ?? '界面'}渲染失败`, error, info.componentStack);
+  }
+
+  private reset = (): void => {
+    this.setState({ error: null });
+    this.props.onReset?.();
+  };
+
+  override render(): ReactNode {
+    const { error } = this.state;
+    if (!error) return this.props.children;
+    return (
+      <div className="view" role="alert">
+        <EmptyState
+          icon="warning"
+          title={`${this.props.scope ?? '这部分界面'}加载失败`}
+          description="渲染时发生错误。可以重试；如果反复失败，请在设置页导出诊断日志。"
+          actions={
+            <Button variant="primary" size="sm" icon="refresh" onClick={this.reset}>
+              重试
+            </Button>
+          }
+        />
+      </div>
+    );
+  }
 }
 
 /** 带固定宽高比的画布容器，内部按输出尺寸绘制并等比缩放。 */

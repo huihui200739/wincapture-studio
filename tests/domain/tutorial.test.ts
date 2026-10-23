@@ -2,6 +2,10 @@ import { describe, it, expect } from 'vitest';
 import {
   buildStepDrafts,
   mapStepsToTimeline,
+  sourceTickToTimeline,
+  stepTimelineTick,
+  stepTimelineRange,
+  timelineTickToStepSource,
   clampStepImageTick,
   stepsToMarkdown,
   stepsToHtml,
@@ -11,6 +15,7 @@ import {
 } from '../../src/domain/tutorial';
 import type { RecordingMarker } from '../../src/domain/types';
 import type { TutorialStep } from '../../src/domain/project';
+import { createEmptyProject } from '../../src/domain/project';
 import { TICKS_PER_SECOND, secondsToTicks } from '../../src/domain/timebase';
 
 const S = TICKS_PER_SECOND;
@@ -230,5 +235,184 @@ describe('stepsToHtml: 教程输出与转义', () => {
 
   it('escapeMarkdown 转义常见符号', () => {
     expect(escapeMarkdown('a*b_c')).toBe('a\\*b\\_c');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 回归测试：步骤生成的时间边界（空区间/越界点击/零时长/负延迟）
+// ---------------------------------------------------------------------------
+
+describe('回归：buildStepDrafts 的时间边界', () => {
+  function expectValidStep(step: TutorialStep, durationTicks: number): void {
+    expect(step.sourceRange.start).toBeGreaterThanOrEqual(0);
+    expect(step.sourceRange.end).toBeGreaterThan(step.sourceRange.start);
+    expect(step.sourceRange.start).toBeLessThan(durationTicks);
+    expect(step.imageTick).toBeGreaterThanOrEqual(step.sourceRange.start);
+    expect(step.imageTick).toBeLessThan(step.sourceRange.end);
+  }
+
+  it('标记恰好在录制终点时不产生空区间（imageTick 仍落在区间内）', () => {
+    const steps = buildStepDrafts({
+      markers: [marker('m-end', 10 * S)],
+      clicks: [],
+      durationTicks: 10 * S,
+    });
+    expect(steps).toHaveLength(1);
+    expectValidStep(steps[0], 10 * S);
+    expect(steps[0].imageTick).toBeLessThan(10 * S);
+  });
+
+  it('录制时长为 0 或负数时不生成步骤（旧实现 imageTick 为 -1）', () => {
+    expect(buildStepDrafts({ markers: [marker('m', 0)], clicks: [], durationTicks: 0 })).toEqual([]);
+    expect(buildStepDrafts({ markers: [marker('m', S)], clicks: [], durationTicks: -S })).toEqual([]);
+  });
+
+  it('越界点击不生成非法区间（负起点/反向/超出时长）', () => {
+    const steps = buildStepDrafts(
+      {
+        markers: [],
+        clicks: [
+          { tick: -S, kind: 'down', x: 0.5, y: 0.5 },
+          { tick: 20 * S, kind: 'down', x: 0.5, y: 0.5 },
+        ],
+        durationTicks: 10 * S,
+      },
+      { includeClicks: true },
+    );
+    expect(steps).toHaveLength(0);
+    // 录制末尾的点击仍可生成合法步骤
+    const atEnd = buildStepDrafts(
+      { markers: [], clicks: [{ tick: 10 * S - 1, kind: 'down', x: 0.5, y: 0.5 }], durationTicks: 10 * S },
+      { includeClicks: true },
+    );
+    expect(atEnd).toHaveLength(1);
+    expectValidStep(atEnd[0], 10 * S);
+  });
+
+  it('负的截图延迟被夹到 0，不产生反向区间', () => {
+    const steps = buildStepDrafts({
+      markers: [marker('m', 5 * S)],
+      clicks: [],
+      durationTicks: 10 * S,
+      screenshotDelayTicks: -2 * S,
+    });
+    expect(steps).toHaveLength(1);
+    expectValidStep(steps[0], 10 * S);
+  });
+
+  it('合并后的步骤区间仍然合法（第二个标记在终点）', () => {
+    const steps = buildStepDrafts({
+      markers: [marker('m1', 10 * S - secondsToTicks(0.5)), marker('m2', 10 * S)],
+      clicks: [],
+      durationTicks: 10 * S,
+    });
+    expect(steps).toHaveLength(1);
+    expectValidStep(steps[0], 10 * S);
+  });
+});
+
+describe('步骤时间映射：源时间 ↔ 成片时间', () => {
+  /** 主轨：源 5s..10s 放在时间线 0..5s（前面剪掉 5 秒）。 */
+  function trimmedProject() {
+    const project = createEmptyProject('p', 'trimmed');
+    project.assets.push({
+      id: 'screen-1',
+      kind: 'screen',
+      path: 'media/screen/seg-000001.mp4',
+      hash: 'h',
+      durationTicks: 20 * S,
+      width: 1920,
+      height: 1080,
+      sampleRate: 0,
+      channels: 0,
+      createdAt: 0,
+    });
+    project.tracks.find((t) => t.kind === 'primaryVideo')!.clips = [
+      {
+        id: 'clip-1',
+        assetId: 'screen-1',
+        sourceInTicks: 5 * S,
+        sourceDurationTicks: 5 * S,
+        timelineInTicks: 0,
+        rate: { num: 1, den: 1 },
+        linkGroupId: 'rec-1',
+      },
+    ];
+    return project;
+  }
+
+  it('源时间减去被剪掉的前段后落到正确时间线位置', () => {
+    const project = trimmedProject();
+    expect(sourceTickToTimeline(project, 7 * S)).toBe(2 * S);
+    expect(sourceTickToTimeline(project, 5 * S)).toBe(0);
+  });
+
+  it('被剪掉的源时刻返回 null（步骤应标为 dangling）', () => {
+    const project = trimmedProject();
+    expect(sourceTickToTimeline(project, 2 * S)).toBeNull();
+    expect(sourceTickToTimeline(project, 12 * S)).toBeNull();
+  });
+
+  it('步骤截图时刻与区间都按同一张表映射', () => {
+    const project = trimmedProject();
+    const s = step('s1', 6 * S, 8 * S, 7 * S);
+    expect(stepTimelineTick(project, s)).toBe(2 * S);
+    expect(stepTimelineRange(project, s)).toEqual({ start: S, end: 3 * S });
+  });
+
+  it('步骤开头被裁掉后，保留的截图区间仍正确显示', () => {
+    const project = trimmedProject();
+    expect(stepTimelineRange(project, step('partial', 4 * S, 7 * S, 6 * S)))
+      .toEqual({ start: 0, end: 2 * S });
+  });
+
+  it('倍速片段的右开终点不因 end-1 取整而多出一个 tick', () => {
+    const project = trimmedProject();
+    project.tracks[0].clips[0].rate = { num: 2, den: 1 };
+    expect(stepTimelineRange(project, step('fast', 6 * S, 8 * S, 7 * S)))
+      .toEqual({ start: S / 2, end: 1.5 * S });
+  });
+
+  it('区间起点被剪掉时不画步骤带（返回 null）', () => {
+    expect(stepTimelineRange(trimmedProject(), step('s2', 0, 2 * S, S))).toBeNull();
+  });
+
+  it('成片时间可反查回步骤内的源时间（编辑截图时间用）', () => {
+    const project = trimmedProject();
+    const s = step('s1', 6 * S, 8 * S, 7 * S);
+    expect(timelineTickToStepSource(project, s, 2 * S)).toBe(7 * S);
+    // 反查结果被夹在步骤区间内
+    expect(timelineTickToStepSource(project, s, 0)).toBe(6 * S);
+    expect(timelineTickToStepSource(project, s, 4 * S)).toBe(8 * S - 1);
+  });
+
+  it('未修剪时映射是恒等（不破坏旧工程行为）', () => {
+    const project = createEmptyProject('p2', 'plain');
+    project.assets.push({
+      id: 'a',
+      kind: 'screen',
+      path: 'media/screen/seg-000001.mp4',
+      hash: 'h',
+      durationTicks: 20 * S,
+      width: 1920,
+      height: 1080,
+      sampleRate: 0,
+      channels: 0,
+      createdAt: 0,
+    });
+    project.tracks.find((t) => t.kind === 'primaryVideo')!.clips = [
+      {
+        id: 'c',
+        assetId: 'a',
+        sourceInTicks: 0,
+        sourceDurationTicks: 10 * S,
+        timelineInTicks: 0,
+        rate: { num: 1, den: 1 },
+        linkGroupId: 'g',
+      },
+    ];
+    const s = step('s', 3 * S, 5 * S, 4 * S);
+    expect(stepTimelineTick(project, s)).toBe(4 * S);
+    expect(stepTimelineRange(project, s)).toEqual({ start: 3 * S, end: 5 * S });
   });
 });

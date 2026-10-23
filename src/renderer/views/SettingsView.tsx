@@ -2,13 +2,13 @@
  * 设置页：设备与能力、快捷键、诊断与数据目录
  */
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useApp } from '../lib/store';
-import { Badge, Button, Field, Icon, InlineNote, Kbd, Panel, Select, Toggle } from '../components/ui';
+import { Badge, Button, Field, InlineNote, Kbd, Panel, Select, Toggle } from '../components/ui';
 import { formatBytes, formatDateTime, unwrap } from '../lib/format';
-import { wcs } from '../lib/wcs';
+import { wcs, withTimeout, IPC_TIMEOUT } from '../lib/wcs';
+import { loadSettings, saveSettings } from '../lib/settings';
 import type { DiagnosticsReport } from '@shared/api';
-import { cn } from '../lib/format';
 
 const SHORTCUTS: { group: string; items: { keys: string[]; label: string }[] }[] = [
   {
@@ -26,6 +26,8 @@ const SHORTCUTS: { group: string; items: { keys: string[]; label: string }[] }[]
       { keys: ['←', '→'], label: '上一帧 / 下一帧' },
       { keys: ['Shift', '←/→'], label: '后退 / 前进 1 秒' },
       { keys: ['Ctrl', 'B'], label: '在播放头分割' },
+      { keys: ['Ctrl', 'C/V'], label: '复制 / 粘贴所选效果' },
+      { keys: ['Ctrl', 'Shift', 'V'], label: '只粘贴效果属性' },
       { keys: ['Delete'], label: '删除所选（时间线片段 / 效果 / 步骤）' },
       { keys: ['Ctrl', 'Z'], label: '撤销' },
       { keys: ['Ctrl', 'Y'], label: '重做' },
@@ -41,16 +43,69 @@ const SHORTCUTS: { group: string; items: { keys: string[]; label: string }[] }[]
 ];
 
 export function SettingsView() {
-  const { systemInfo, apiMode, config, updateConfig, pushToast, pushError, setView, refreshRecents, refreshRecoverables } = useApp();
+  const {
+    systemInfo,
+    refreshSystemInfo,
+    apiMode,
+    config,
+    updateConfig,
+    pushToast,
+    pushError,
+    setView,
+    refreshRecents,
+    refreshRecoverables,
+  } = useApp();
   const [diagnostics, setDiagnostics] = useState<DiagnosticsReport | null>(null);
+  const [diagnosedAt, setDiagnosedAt] = useState<number | null>(null);
   const [diagnosing, setDiagnosing] = useState(false);
-  const [alwaysOnTop, setAlwaysOnTop] = useState(false);
+  // 置顶是窗口状态，但用户期望重启后保留：本地设置在这里只用于显示，
+  // 真正的「启动即恢复」由 store 的启动流程执行（不依赖用户是否打开过设置页）。
+  const [alwaysOnTop, setAlwaysOnTop] = useState(() => loadSettings().alwaysOnTop);
+
+  const changeAlwaysOnTop = useCallback(
+    async (next: boolean) => {
+      setAlwaysOnTop(next); // 乐观更新
+      try {
+        const response = await withTimeout(wcs().setAlwaysOnTop(next), 8000, '设置窗口置顶');
+        if (!response.ok) throw new Error(response.error?.message ?? '主进程拒绝了置顶设置');
+        saveSettings({ alwaysOnTop: next });
+      } catch (error) {
+        // 回滚，避免开关显示的状态与真实窗口状态不一致
+        setAlwaysOnTop(!next);
+        pushError(error, '置顶设置未生效');
+      }
+    },
+    [pushError],
+  );
+
+  const openManagedPath = useCallback(
+    async (path: string, title: string) => {
+      try {
+        unwrap(await wcs().openPath(path));
+      } catch (error) {
+        pushError(error, title);
+      }
+    },
+    [pushError],
+  );
+
+  const revealManagedPath = useCallback(
+    async (path: string) => {
+      try {
+        unwrap(await wcs().showInFolder(path));
+      } catch (error) {
+        pushError(error, '打开所在文件夹失败');
+      }
+    },
+    [pushError],
+  );
 
   const runDiagnostics = useCallback(async () => {
     setDiagnosing(true);
     try {
-      const report = unwrap(await wcs().writeDiagnostics());
+      const report = unwrap(await withTimeout(wcs().writeDiagnostics(), IPC_TIMEOUT.diagnostics, '导出诊断日志'));
       setDiagnostics(report);
+      setDiagnosedAt(Date.now());
       pushToast({ tone: 'ok', title: '诊断日志已导出', message: `${formatBytes(report.bytes)} · ${report.entries.length} 个文件` });
     } catch (error) {
       pushError(error, '导出诊断日志失败');
@@ -69,7 +124,16 @@ export function SettingsView() {
           <p>设备能力、快捷键、诊断与数据目录。修改会立即生效并保存在本机。</p>
         </div>
         <div className="view-actions">
-          <Button size="sm" variant="ghost" icon="refresh" onClick={() => { void refreshRecents(); void refreshRecoverables(); }}>
+          <Button
+            size="sm"
+            variant="ghost"
+            icon="refresh"
+            onClick={() => {
+              void refreshRecents();
+              void refreshRecoverables();
+              void refreshSystemInfo();
+            }}
+          >
             刷新数据
           </Button>
         </div>
@@ -177,8 +241,9 @@ export function SettingsView() {
               ]}
             />
           </Field>
-          <Field label="默认倒计时">
+          <Field label="默认倒计时" htmlFor="default-countdown">
             <Select
+              id="default-countdown"
               ariaLabel="默认倒计时"
               value={String(config.countdownSeconds)}
               onChange={(next) => updateConfig({ countdownSeconds: Number(next) })}
@@ -205,25 +270,28 @@ export function SettingsView() {
         <Panel title="窗口" icon="window">
           <Toggle
             checked={alwaysOnTop}
-            onChange={(next) => {
-              setAlwaysOnTop(next);
-              void wcs().setAlwaysOnTop(next).then((response) => {
-                if (!response.ok) pushToast({ tone: 'warn', title: '置顶设置未生效', message: response.error?.message });
-              });
-            }}
+            onChange={(next) => void changeAlwaysOnTop(next)}
             label="主窗口置顶"
-            description="录制讲解时便于随时暂停或标记"
+            description="录制讲解时便于随时暂停或标记；重启应用后保留"
           />
           <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
             <Button size="sm" icon="minimize" onClick={() => void wcs().minimize()}>
               最小化
             </Button>
-            <Button size="sm" variant="ghost" icon="external" onClick={() => void wcs().pickDirectory()}>
-              选择目录
+            <Button
+              size="sm"
+              variant="ghost"
+              icon="folder"
+              disabled={!systemInfo?.videosPath}
+              onClick={() => {
+                if (systemInfo?.videosPath) void openManagedPath(systemInfo.videosPath, '打开输出目录失败');
+              }}
+            >
+              打开输出目录
             </Button>
           </div>
           <p className="wcs-field-hint" style={{ marginTop: 8 }}>
-            悬浮控制条会在录制开始时出现，显示状态、计时、暂停、标记与停止。
+            导出默认保存到 <code>{systemInfo?.videosPath ?? '（读取中…）'}</code>；悬浮控制条会在录制开始时出现。
           </p>
         </Panel>
 
@@ -231,7 +299,7 @@ export function SettingsView() {
           <div className="kv-list">
             <div className="kv-row">
               <span className="kv-key">最近诊断</span>
-              <span className="kv-value">{diagnostics ? formatDateTime(Date.now()) : '尚未导出'}</span>
+              <span className="kv-value">{diagnostics && diagnosedAt ? formatDateTime(diagnosedAt) : '尚未导出'}</span>
             </div>
             {diagnostics && (
               <>
@@ -256,10 +324,15 @@ export function SettingsView() {
             </Button>
             {diagnostics && (
               <>
-                <Button size="sm" variant="ghost" icon="folder" onClick={() => void wcs().showInFolder(diagnostics.path)}>
+                <Button size="sm" variant="ghost" icon="folder" onClick={() => void revealManagedPath(diagnostics.path)}>
                   打开所在文件夹
                 </Button>
-                <Button size="sm" variant="ghost" icon="external" onClick={() => void wcs().openPath(diagnostics.path)}>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon="external"
+                  onClick={() => void openManagedPath(diagnostics.path, '打开诊断文件失败')}
+                >
                   打开文件
                 </Button>
               </>

@@ -15,7 +15,6 @@ import type {
   MediaInfo,
   ProjectHandle,
   SaveResult,
-  TutorialExportResult,
   WcsApi,
 } from '@shared/api';
 import type {
@@ -25,7 +24,6 @@ import type {
   CaptureStatus,
   DisplayInfo,
   ExportProgress,
-  ExportResult,
   IpcResponse,
   QualityProfile,
   RecentProject,
@@ -34,10 +32,11 @@ import type {
   VideoDeviceInfo,
 } from '@shared/ipc';
 import { QUALITY_PROFILES } from '@shared/ipc';
+import { AppError } from '@shared/errors';
 import type { Project } from '@domain/project';
 import { createEmptyProject } from '@domain/project';
 import type { RecordingMarker } from '@domain/types';
-import { secondsToTicks, TICKS_PER_SECOND } from '@domain/timebase';
+import { TICKS_PER_SECOND } from '@domain/timebase';
 import {
   MOCK_PROJECT_PATH,
   createMockProject,
@@ -53,6 +52,53 @@ import {
 const S = TICKS_PER_SECOND;
 
 export type ApiMode = 'native' | 'mock';
+
+/**
+ * 非交互型 IPC 的超时预算（毫秒）。
+ * 打开工程/选择路径/导出这类「用户会一直看着」的操作不设短超时：
+ * 它们本身就是长任务，超时会把正常的慢操作误报为失败。
+ */
+export const IPC_TIMEOUT = {
+  save: 30_000,
+  list: 15_000,
+  system: 20_000,
+  diagnostics: 60_000,
+  recovery: 60_000,
+} as const;
+
+/**
+ * 给 IPC 调用加超时。主进程无响应（进程卡死/通道未注册）时，
+ * 渲染层原本会永远停在「保存中…」并且按钮一直禁用；加上超时后至少能报错重试。
+ *
+ * 注意：超时只影响本次调用的等待，底层 IPC 请求无法撤销；
+ * 调用方必须用「序号/工程快照比较」丢弃迟到的结果（见 store.openProject / save）。
+ */
+export function withTimeout<T>(promise: Promise<T>, ms: number, action: string): Promise<T> {
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new AppError({
+          code: 'E_UNKNOWN',
+          message: `「${action}」超时（超过 ${Math.round(ms / 1000)} 秒），主进程可能无响应。请重试；若反复超时，可在设置页导出诊断日志。`,
+          retryable: true,
+          preservedData: true,
+          detail: `ipc timeout: ${action} > ${ms}ms`,
+        }),
+      );
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 export function detectApiMode(): ApiMode {
   return typeof window !== 'undefined' && window.wcs ? 'native' : 'mock';
@@ -370,8 +416,10 @@ class MockWcs implements WcsApi {
     return ok(null);
   }
 
-  async deleteProject(_path: string): Promise<IpcResponse<null>> {
+  async deleteProject(path: string): Promise<IpcResponse<null>> {
     await delay(120);
+    // mock 里没有磁盘可删，但「最近工程」必须同步移除，否则界面出现假成功
+    this.recents = this.recents.filter((item) => item.path !== path);
     return ok(null);
   }
 
@@ -431,93 +479,22 @@ class MockWcs implements WcsApi {
     includeTutorial: boolean;
   }): Promise<IpcResponse<ExportBundleResult>> {
     if (this.exportJob) return fail('E_EXPORT_FAILED', '已有导出任务在进行中，请等待完成或取消。');
-    const job = { cancelled: false, progress: 0 };
-    this.exportJob = job;
-    const jobId = `job-${Date.now().toString(36)}`;
-    const totalFrames = 900;
-
-    await new Promise<void>((resolve) => {
-      const tick = () => {
-        if (!this.exportJob || job.cancelled) {
-          resolve();
-          return;
-        }
-        job.progress = Math.min(1, job.progress + 0.018 + Math.random() * 0.01);
-        const phase: ExportProgress['phase'] =
-          job.progress < 0.06 ? 'preparing' : job.progress < 0.9 ? 'rendering' : job.progress < 0.97 ? 'encoding' : 'muxing';
-        this.exportEmitter.emit({
-          jobId,
-          progress: job.progress,
-          phase,
-          framesDone: Math.round(totalFrames * job.progress),
-          framesTotal: totalFrames,
-          message:
-            phase === 'preparing'
-              ? '正在准备工程快照'
-              : phase === 'rendering'
-                ? '正在渲染画面'
-                : phase === 'encoding'
-                  ? '正在编码视频'
-                  : '正在封装 MP4',
-          bytesWritten: Math.round(42 * 1024 * 1024 * job.progress),
-        });
-        if (job.progress >= 1) {
-          resolve();
-          return;
-        }
-        this.exportTimer = window.setTimeout(tick, 90);
-      };
-      tick();
-    });
-
-    this.exportJob = null;
-    if (job.cancelled) {
-      this.exportEmitter.emit({
-        jobId,
-        progress: 0,
-        phase: 'cancelled',
-        framesDone: 0,
-        framesTotal: totalFrames,
-        message: '导出已取消，临时文件已清理',
-        bytesWritten: 0,
-      });
-      return fail('E_EXPORT_CANCELLED', '导出已取消。临时文件已删除，工程与素材保持原样。');
-    }
-
+    // 示例数据模式下没有真实导出管线：绝不返回「成功」的假结果，
+    // 否则用户会以为视频已落盘（实际一个字节都没写）。这里显式失败。
     this.exportEmitter.emit({
-      jobId,
-      progress: 1,
-      phase: 'done',
-      framesDone: totalFrames,
-      framesTotal: totalFrames,
-      message: '导出完成',
-      bytesWritten: 42 * 1024 * 1024,
+      jobId: `mock-${Date.now().toString(36)}`,
+      progress: 0,
+      phase: 'failed',
+      framesDone: 0,
+      framesTotal: 0,
+      message: '示例数据模式无法导出',
+      bytesWritten: 0,
     });
-
-    const video: ExportResult = {
-      jobId,
-      ok: true,
-      outputPath: params.outputPath,
-      encoder: 'H.264 · 硬件编码（Media Foundation）',
-      error: null,
-      durationTicks: 30 * S,
-      frames: totalFrames,
-      bytes: 42 * 1024 * 1024,
-      verified: true,
-    };
-
-    const tutorial: TutorialExportResult | null = params.includeTutorial
-      ? {
-          ok: true,
-          outputDir: params.outputPath.replace(/\.mp4$/i, '-教程'),
-          indexPath: params.outputPath.replace(/\.mp4$/i, '-教程\\index.html'),
-          markdownPath: params.outputPath.replace(/\.mp4$/i, '-教程\\tutorial.md'),
-          stepsJsonPath: params.outputPath.replace(/\.mp4$/i, '-教程\\steps.json'),
-          imageCount: params.project.steps.length,
-        }
-      : null;
-
-    return ok({ video, tutorial, snapshotHash: '9f2c41d8a0b7e653' });
+    return fail(
+      'E_EXPORT_FAILED',
+      '示例数据模式无法导出视频：当前没有连接主进程，不会写出任何文件。请用 npm start 启动完整应用后再导出。',
+      false,
+    );
   }
 
   async cancelExport(): Promise<IpcResponse<null>> {
@@ -724,7 +701,16 @@ class MockWcs implements WcsApi {
 let cached: WcsApi | null = null;
 let cachedMode: ApiMode = 'mock';
 
-/** 取得可用的 API 实现（真实优先，其次 mock）。 */
+/**
+ * 取得可用的 API 实现（真实优先，其次 mock）。
+ *
+ * mock 回退是**演示与自动化探针（scripts/verify-ui.cjs 不注入 preload）**的
+ * 既定能力，不是生产数据源。使用它的代码必须遵守：
+ * - 任何「写」操作都不能假装成功：MockWcs.startExport 直接失败，
+ *   store.save 会明确提示“仅内存、未写入磁盘”；
+ * - mock 工程/最近工程只存在于内存，绝不写真实工程目录；
+ * - 界面必须显示「示例数据模式」标识（见 App / Home / Settings）。
+ */
 export function wcs(): WcsApi {
   if (!cached) {
     if (typeof window !== 'undefined' && window.wcs) {

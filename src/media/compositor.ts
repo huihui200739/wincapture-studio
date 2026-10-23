@@ -10,7 +10,7 @@
  *            → 摄像头与画布标注 → 输出色彩转换 → 编码
  */
 
-import type { FrameScene, NormalizedRect } from '../domain/scene';
+import type { FrameScene, NormalizedRect, PrivacyScene } from '../domain/scene';
 import { screenRectPx } from '../domain/scene';
 
 /** 一帧可用的媒体资源（由调用方按时间点解码后提供）。 */
@@ -52,6 +52,35 @@ function roundRectPath(
   ctx.closePath();
 }
 
+/**
+ * 计算 CSS `linear-gradient(<角度>, …)` 在画布坐标系里的渐变线端点。
+ *
+ * CSS 角度约定：0deg = 向上、90deg = 向右、180deg = 向下、270deg = 向左，
+ * 即方向向量为 (sin θ, −cos θ)（画布 y 轴向下）。渐变线长度按 CSS 规范取
+ * |W·sinθ| + |H·cosθ|，这样四角的投影都被覆盖，不会在角落提前用到端色。
+ *
+ * 之前这里把 y 分量写成 +cosθ，导致所有角度的渐变相对 CSS 预览上下翻转
+ * （背景样块与预览/导出方向相反）。
+ */
+export function cssLinearGradientGeometry(
+  angleDeg: number,
+  width: number,
+  height: number,
+): { x0: number; y0: number; x1: number; y1: number } {
+  const rad = ((Number.isFinite(angleDeg) ? angleDeg : 180) * Math.PI) / 180;
+  const dx = Math.sin(rad);
+  const dy = -Math.cos(rad);
+  const half = (Math.abs(width * dx) + Math.abs(height * dy)) / 2;
+  const cx = width / 2;
+  const cy = height / 2;
+  return {
+    x0: cx - dx * half,
+    y0: cy - dy * half,
+    x1: cx + dx * half,
+    y1: cy + dy * half,
+  };
+}
+
 function parseBackground(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
   background: string,
@@ -64,16 +93,8 @@ function parseBackground(
     const parts = inner.split(',').map((s) => s.trim());
     const angle = parseFloat(parts[0]);
     const stops = parts.slice(1);
-    const rad = ((Number.isFinite(angle) ? angle : 180) * Math.PI) / 180;
-    const cx = width / 2;
-    const cy = height / 2;
-    const len = Math.max(width, height) / 2;
-    const grad = ctx.createLinearGradient(
-      cx - Math.sin(rad) * len,
-      cy - Math.cos(rad) * len,
-      cx + Math.sin(rad) * len,
-      cy + Math.cos(rad) * len,
-    );
+    const g = cssLinearGradientGeometry(Number.isFinite(angle) ? angle : 180, width, height);
+    const grad = ctx.createLinearGradient(g.x0, g.y0, g.x1, g.y1);
     stops.forEach((stop, index) => {
       grad.addColorStop(stops.length === 1 ? 0 : index / (stops.length - 1), stop);
     });
@@ -84,45 +105,65 @@ function parseBackground(
   ctx.fillRect(0, 0, width, height);
 }
 
-/** 在源坐标系内绘制遮挡（随画面一起被裁切/缩放，§11.2）。 */
-function drawSourcePrivacy(
+/** 源坐标遮挡在输出画布上的像素矩形（含运镜取景变换）。 */
+export function mapSourceRectToScreen(
+  rect: NormalizedRect,
+  view: { x: number; y: number; width: number; height: number },
+  target: { x: number; y: number; width: number; height: number },
+): { x: number; y: number; width: number; height: number } {
+  const viewW = view.width > 0 ? view.width : 1;
+  const viewH = view.height > 0 ? view.height : 1;
+  return {
+    x: target.x + ((rect.x - view.x) / viewW) * target.width,
+    y: target.y + ((rect.y - view.y) / viewH) * target.height,
+    width: (rect.width / viewW) * target.width,
+    height: (rect.height / viewH) * target.height,
+  };
+}
+
+/**
+ * 在屏幕裁剪区内绘制源坐标遮挡（§11.2：先于光标、跟随运镜缩放）。
+ *
+ * 这是遮挡唯一的绘制入口：导出、预览与教程截图都经过 drawScene → 本函数，
+ * 不存在「某一产物旁路取原帧」的分支。
+ */
+export function drawScreenPrivacy(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
-  scene: FrameScene,
-  sourceRect: { x: number; y: number; width: number; height: number },
+  items: readonly PrivacyScene[],
+  view: { x: number; y: number; width: number; height: number },
+  target: { x: number; y: number; width: number; height: number },
 ): void {
-  for (const privacy of scene.screenPrivacy) {
-    const x = sourceRect.x + privacy.rect.x * sourceRect.width;
-    const y = sourceRect.y + privacy.rect.y * sourceRect.height;
-    const w = privacy.rect.width * sourceRect.width;
-    const h = privacy.rect.height * sourceRect.height;
-    if (w <= 0 || h <= 0) continue;
+  for (const privacy of items) {
+    const px = mapSourceRectToScreen(privacy.rect, view, target);
+    if (px.width <= 0 || px.height <= 0) continue;
     ctx.save();
     if (privacy.style === 'solid') {
-      // 高敏感信息优先不透明实色覆盖（§12.2）
+      // 高敏感信息优先使用不透明实色覆盖（§12.2）
       ctx.fillStyle = '#000000';
-      ctx.fillRect(x, y, w, h);
+      ctx.fillRect(px.x, px.y, px.width, px.height);
     } else if (privacy.style === 'blur') {
-      ctx.filter = 'blur(14px)';
-      ctx.fillStyle = 'rgba(0,0,0,0.9)';
-      ctx.fillRect(x, y, w, h);
+      // 注意：模糊与马赛克按文档只是视觉样式，不作为不可恢复保证（§12.2）。
+      ctx.filter = 'blur(16px)';
+      ctx.fillStyle = 'rgba(0,0,0,0.88)';
+      ctx.fillRect(px.x, px.y, px.width, px.height);
       ctx.filter = 'none';
     } else {
-      // 马赛克：只作为视觉样式，不作为不可恢复保证
-      ctx.fillStyle = 'rgba(30,30,30,0.92)';
-      ctx.fillRect(x, y, w, h);
+      // 马赛克：深色底 + 网格线，保证既不透明也能看出「已遮挡」
+      ctx.fillStyle = 'rgba(24,24,24,0.94)';
+      ctx.fillRect(px.x, px.y, px.width, px.height);
       ctx.strokeStyle = 'rgba(255,255,255,0.10)';
       ctx.lineWidth = 1;
-      const step = 8;
-      for (let gx = x; gx < x + w; gx += step) {
+      const step = 9;
+      for (let gx = px.x; gx < px.x + px.width; gx += step) {
         ctx.beginPath();
-        ctx.moveTo(gx, y);
-        ctx.lineTo(gx, y + h);
+        ctx.moveTo(gx, px.y);
+        ctx.lineTo(gx, px.y + px.height);
         ctx.stroke();
       }
-      for (let gy = y; gy < y + h; gy += step) {
+      for (let gy = px.y; gy < px.y + px.height; gy += step) {
         ctx.beginPath();
-        ctx.moveTo(x, gy);
-        ctx.lineTo(x + w, gy);
+        ctx.moveTo(px.x, gy);
+        ctx.lineTo(px.x + px.width, gy);
         ctx.stroke();
       }
     }
@@ -151,10 +192,11 @@ function drawCursor(
   const pos = toPx(scene.cursor.x, scene.cursor.y);
 
   // 点击波纹
-  if (scene.cursor.clickProgress > 0) {
+  const rippleScale = Math.max(0, scene.cursor.rippleScale ?? 1);
+  if (scene.cursor.clickProgress > 0 && rippleScale > 0) {
     const clickPos = toPx(scene.cursor.clickX, scene.cursor.clickY);
     const p = scene.cursor.clickProgress;
-    const radius = scene.cursor.size * (1.2 + p * 2.4);
+    const radius = scene.cursor.size * (1.2 + p * 2.4) * rippleScale;
     ctx.save();
     ctx.globalAlpha = Math.max(0, 1 - p) * 0.85;
     ctx.strokeStyle = '#ffd54a';
@@ -163,6 +205,19 @@ function drawCursor(
     ctx.arc(clickPos.x, clickPos.y, radius, 0, Math.PI * 2);
     ctx.stroke();
     ctx.restore();
+  }
+
+  if (scene.cursor.style === 'dot') {
+    ctx.save();
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = 'rgba(0,0,0,0.72)';
+    ctx.lineWidth = Math.max(1, scene.cursor.size * 0.07);
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, scene.cursor.size * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+    return;
   }
 
   if (resources.cursor) {
@@ -213,9 +268,19 @@ function drawCamera(
   ctx.fillStyle = '#0b0f14';
   ctx.fillRect(px, py, pw, ph);
   if (resources.camera) {
-    // 按「覆盖」方式填充，避免变形
-    const sw = 'videoWidth' in resources.camera ? (resources.camera as HTMLVideoElement).videoWidth : (resources.camera as HTMLCanvasElement).width;
-    const sh = 'videoHeight' in resources.camera ? (resources.camera as HTMLVideoElement).videoHeight : (resources.camera as HTMLCanvasElement).height;
+    // 按「覆盖」方式填充，避免变形。
+    // 注意：不能只认 videoWidth/width——VideoFrame 暴露的是 displayWidth，
+    // 旧实现遇到 VideoFrame 会算成 0×0 直接不画，画中画变成纯黑块。
+    const cam = resources.camera as unknown as {
+      displayWidth?: number;
+      displayHeight?: number;
+      videoWidth?: number;
+      videoHeight?: number;
+      width?: number;
+      height?: number;
+    };
+    const sw = cam.displayWidth ?? cam.videoWidth ?? cam.width ?? 0;
+    const sh = cam.displayHeight ?? cam.videoHeight ?? cam.height ?? 0;
     if (sw > 0 && sh > 0) {
       const scale = Math.max(pw / sw, ph / sh);
       const dw = sw * scale;
@@ -302,43 +367,12 @@ export function drawScene(
     ctx.beginPath();
     ctx.rect(rect.x, rect.y, rect.width, rect.height);
     ctx.clip();
-    for (const privacy of scene.screenPrivacy) {
-      const px = rect.x + ((privacy.rect.x - viewX) / viewW) * rect.width;
-      const py = rect.y + ((privacy.rect.y - viewY) / viewH) * rect.height;
-      const pw = (privacy.rect.width / viewW) * rect.width;
-      const ph = (privacy.rect.height / viewH) * rect.height;
-      if (pw <= 0 || ph <= 0) continue;
-      if (privacy.style === 'solid') {
-        ctx.fillStyle = '#000000';
-        ctx.fillRect(px, py, pw, ph);
-      } else if (privacy.style === 'blur') {
-        ctx.save();
-        ctx.filter = 'blur(16px)';
-        ctx.fillStyle = 'rgba(0,0,0,0.88)';
-        ctx.fillRect(px, py, pw, ph);
-        ctx.restore();
-      } else {
-        ctx.fillStyle = 'rgba(24,24,24,0.94)';
-        ctx.fillRect(px, py, pw, ph);
-        ctx.save();
-        ctx.strokeStyle = 'rgba(255,255,255,0.10)';
-        ctx.lineWidth = 1;
-        const step = 9;
-        for (let gx = px; gx < px + pw; gx += step) {
-          ctx.beginPath();
-          ctx.moveTo(gx, py);
-          ctx.lineTo(gx, py + ph);
-          ctx.stroke();
-        }
-        for (let gy = py; gy < py + ph; gy += step) {
-          ctx.beginPath();
-          ctx.moveTo(px, gy);
-          ctx.lineTo(px + pw, gy);
-          ctx.stroke();
-        }
-        ctx.restore();
-      }
-    }
+    drawScreenPrivacy(
+      ctx,
+      scene.screenPrivacy,
+      { x: viewX, y: viewY, width: viewW, height: viewH },
+      rect,
+    );
     ctx.restore();
   } else {
     // 无源帧：填充占位（导出时上层会复用上一帧，这里只是兜底）

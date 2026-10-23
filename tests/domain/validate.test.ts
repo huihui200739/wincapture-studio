@@ -321,6 +321,21 @@ describe('validateProject: 片段引用与时间区间', () => {
     expect(validateProject(project).errors.some((e) => e.code === 'clip-timeline-overlap')).toBe(false);
   });
 
+  it('嵌套重叠（中间夹一个短片段）同样报错', () => {
+    const project = goodProject();
+    project.assets[0].durationTicks = 30 * S;
+    const track = project.tracks.find((t) => t.kind === 'primaryVideo')!;
+    track.clips = [
+      { ...track.clips[0], id: 'long', timelineInTicks: 0, sourceInTicks: 0, sourceDurationTicks: 20 * S },
+      { ...track.clips[0], id: 'short', timelineInTicks: 2 * S, sourceInTicks: 20 * S, sourceDurationTicks: S },
+      { ...track.clips[0], id: 'tail', timelineInTicks: 4 * S, sourceInTicks: 21 * S, sourceDurationTicks: S },
+    ];
+    const overlaps = validateProject(project).errors.filter((e) => e.code === 'clip-timeline-overlap');
+    // 旧实现只和「紧邻的前一个」比：tail 的前一个是 short（结束 3s < 4s），漏检
+    expect(overlaps.some((e) => e.entityId === 'short')).toBe(true);
+    expect(overlaps.some((e) => e.entityId === 'tail')).toBe(true);
+  });
+
   it('checkOverlap=false 时跳过重叠检查', () => {
     const project = goodProject();
     project.assets[0].durationTicks = 30 * S;
@@ -395,6 +410,19 @@ describe('validateProject: 效果与步骤区间', () => {
       kind: 'zoom',
       range: { start: 0, end: S },
       parameters: { scale: 2, focusX: 1.5, focusY: 0.5, easeInTicks: 0, easeOutTicks: 0 },
+      origin: 'manual',
+      locked: true,
+    });
+    expect(validateProject(project).errors.some((e) => e.code === 'effect-parameters-invalid')).toBe(true);
+  });
+
+  it('运镜焦点为 NaN 同样报错（NaN 通过范围比较会被漏掉）', () => {
+    const project = goodProject();
+    project.effects.push({
+      id: 'e-nan',
+      kind: 'zoom',
+      range: { start: 0, end: S },
+      parameters: { scale: 2, focusX: Number.NaN, focusY: 0.5, easeInTicks: 0, easeOutTicks: 0 },
       origin: 'manual',
       locked: true,
     });
@@ -552,5 +580,98 @@ describe('projectDuration / removedLength', () => {
   it('removedLength 汇总区间长度', () => {
     expect(removedLength([{ start: 0, end: S }, { start: 2 * S, end: 3 * S }])).toBe(2 * S);
     expect(removedLength([])).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 回归测试：损坏结构不抛异常、路径归一化绕过、重复 ID、空区间
+// ---------------------------------------------------------------------------
+
+describe('回归：损坏的工程结构返回结构化错误而不是抛 TypeError', () => {
+  it('tracks / assets / effects / markers 缺失或类型错误时不抛异常', () => {
+    const base = goodProject();
+    const malformed = [
+      { ...base, tracks: undefined },
+      { ...base, tracks: {} },
+      { ...base, assets: {} },
+      { ...base, effects: 'broken' },
+      { ...base, steps: 42 },
+      { ...base, variants: null },
+      { ...base, markers: {} },
+    ];
+    for (const project of malformed) {
+      const result = validateProject(project as unknown as Project);
+      expect(result.ok).toBe(false);
+      expect(result.errors.length).toBeGreaterThan(0);
+      expect(result.errors.every((e) => typeof e.message === 'string' && e.message.length > 0)).toBe(true);
+    }
+  });
+
+  it('轨道 clips 不是数组时不抛异常', () => {
+    const project = goodProject();
+    (project.tracks.find((t) => t.kind === 'primaryVideo') as unknown as { clips: unknown }).clips = 'broken';
+    const result = validateProject(project);
+    expect(result.ok).toBe(false);
+    expect(result.errors.some((e) => e.code === 'schema-unsupported')).toBe(true);
+  });
+});
+
+describe('回归：路径校验的 Windows 归一化绕过', () => {
+  it('拒绝尾随点/空格的 .. 与保留名（Windows 会忽略尾随字符）', () => {
+    for (const path of ['a/.. /b', 'media/.. /secret.mp4', 'media/con. /x', 'media/CON.', 'media/nul ', 'media/...']) {
+      const result = checkProjectRelativePath(path);
+      expect(result.ok, path).toBe(false);
+      expect(result.code).toBe('asset-path-traversal');
+    }
+  });
+
+  it('拒绝 NTFS 备用数据流（ADS）冒号', () => {
+    const result = checkProjectRelativePath('media/a.mp4:evil');
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('asset-path-traversal');
+  });
+
+  it('合法路径仍通过（含 . 段与普通点号文件名）', () => {
+    for (const path of ['media/a.b.mp4', './media/a.mp4', 'media/.hidden/a.mp4', 'events/pointer.jsonl']) {
+      expect(checkProjectRelativePath(path).ok, path).toBe(true);
+    }
+  });
+});
+
+describe('回归：重复 ID 检测覆盖效果/步骤/画幅/标记', () => {
+  it('重复效果 ID 报 id-duplicate（SetEffect 只会更新第一条）', () => {
+    const project = goodProject();
+    const effect = {
+      kind: 'zoom' as const,
+      range: { start: 0, end: S },
+      parameters: { scale: 2, focusX: 0.5, focusY: 0.5, easeInTicks: 0, easeOutTicks: 0 },
+      origin: 'manual' as const,
+      locked: true,
+    };
+    project.effects.push({ ...effect, id: 'dup' }, { ...effect, id: 'dup', range: { start: S, end: 2 * S } });
+    const result = validateProject(project);
+    expect(result.errors.some((e) => e.code === 'id-duplicate' && e.entity === 'effect')).toBe(true);
+  });
+
+  it('重复步骤/标记/画幅 ID 报 id-duplicate', () => {
+    const project = goodProject();
+    project.steps.push(
+      { id: 's-dup', sourceRange: { start: 0, end: S }, title: 'a', description: '', imageTick: 0, actionRect: null, source: 'manual', privacyVersion: 0 },
+      { id: 's-dup', sourceRange: { start: S, end: 2 * S }, title: 'b', description: '', imageTick: S, actionRect: null, source: 'manual', privacyVersion: 0 },
+    );
+    project.markers.push({ id: 'm-dup', mediaTick: 0, note: '', createdAt: 0 }, { id: 'm-dup', mediaTick: S, note: '', createdAt: 0 });
+    project.variants.push({ id: 'landscape', aspect: [16, 9], layoutOverrides: {} });
+    const codes = validateProject(project).errors.filter((e) => e.code === 'id-duplicate').map((e) => e.entity);
+    expect(codes).toContain('step');
+    expect(codes).toContain('marker');
+    expect(codes).toContain('variant');
+  });
+});
+
+describe('回归：rangesOverlap 空区间不与任何区间重叠', () => {
+  it('空区间被大区间包含时仍不算重叠', () => {
+    expect(rangesOverlap({ start: 5, end: 5 }, { start: 0, end: 10 })).toBe(false);
+    expect(rangesOverlap({ start: 0, end: 10 }, { start: 3, end: 3 })).toBe(false);
+    expect(rangesOverlap({ start: 3, end: 5 }, { start: 0, end: 10 })).toBe(true);
   });
 });

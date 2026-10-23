@@ -22,6 +22,7 @@ import type { FrameScene, SceneOptions } from '../domain/scene';
 import { buildExportPlan, frameSceneOptions, frameTickAt } from '../domain/exportPlan';
 import type { AudioMixInterval, ExportPlan } from '../domain/exportPlan';
 import { TimeMap } from '../domain/timeMap';
+import { pointerForScene } from '../domain/pointer';
 import type { Project } from '../domain/project';
 import { TICKS_PER_SECOND, fpsToNumber } from '../domain/timebase';
 import type { TickRange, Ticks } from '../domain/timebase';
@@ -58,6 +59,8 @@ export interface FrameProvider {
   getFrameAt(tick: Ticks): Promise<CanvasImageSource | null>;
   /** 取 [range.start, range.end) 的 PCM。 */
   getAudioAt?(range: TickRange, options?: { channels?: number }): Promise<DecodedAudio | null>;
+  /** 已判定损坏并跳过的分段索引（用于导出后如实报告降级）。 */
+  failedSegmentIndexes?(): number[];
   close?(): void;
 }
 
@@ -414,6 +417,36 @@ function intrinsicSize(source: CanvasImageSource): { width: number; height: numb
 // ---------------------------------------------------------------------------
 
 /**
+ * 按播放速率把源 PCM 重采样为 `outCount` 个输出采样（线性插值）。
+ *
+ * rate 是播放速度倍数：rate=2 表示源 10s 压成 5s，输出第 k 个采样对应源 k×2 处。
+ * 越界部分留 0（解码不足时宁可有极短静音，也不读越界内存）。
+ */
+export function resampleAudioChannels(
+  channels: readonly Float32Array[],
+  outCount: number,
+  rate: number,
+): Float32Array[] {
+  const count = Math.max(0, Math.floor(outCount));
+  const step = Number.isFinite(rate) && rate > 0 ? rate : 1;
+  return channels.map((src) => {
+    const dst = new Float32Array(count);
+    const maxIndex = src.length - 1;
+    if (maxIndex < 0) return dst;
+    for (let k = 0; k < count; k++) {
+      const pos = k * step;
+      const i0 = Math.floor(pos);
+      if (i0 > maxIndex) break;
+      const frac = pos - i0;
+      const s0 = src[i0];
+      const s1 = i0 < maxIndex ? src[i0 + 1] : s0;
+      dst[k] = frac === 0 ? s0 : s0 + (s1 - s0) * frac;
+    }
+    return dst;
+  });
+}
+
+/**
  * 按时间线逐块混合 PCM 并推给封装器。
  *
  * 说明：
@@ -435,9 +468,19 @@ class TimelineAudioMixer {
     private readonly abortCheck: () => void,
     /** clipId → 播放速率（AudioMixInterval 不含 rate，从工程片段补齐） */
     private readonly clipRate: Map<string, number> = new Map(),
+    /** 非致命问题收集：音频解码失败必须让用户知道，而不是导出「成功」的静音视频 */
+    private readonly warnings: string[] = [],
   ) {
     this.sampleRate = plan.audioSampleRate;
     this.channels = plan.audioChannels;
+  }
+
+  private readonly warned = new Set<string>();
+
+  private warnOnce(key: string, message: string): void {
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    this.warnings.push(message);
   }
 
   /** 推进到 targetSample（时间线采样数）。force=true 时把余量也写掉（收尾）。 */
@@ -486,7 +529,13 @@ class TimelineAudioMixer {
       if (b <= a) continue;
 
       const provider = this.sources.get(interval.assetId);
-      if (!provider?.getAudioAt) continue;
+      if (!provider?.getAudioAt) {
+        this.warnOnce(
+          `missing-audio-provider:${interval.assetId}`,
+          `音频素材 ${interval.assetId} 缺失或不可解码，对应区间已按静音导出。`,
+        );
+        continue;
+      }
 
       const decoded = await this.decodeInterval(provider, interval, a, b, channels);
       if (!decoded) continue;
@@ -525,8 +574,7 @@ class TimelineAudioMixer {
   }
 
   /** 取某个音频区间在输出采样 [a, b) 对应的源 PCM，并对齐到该区间起点。 */
-  private async decodeInterval(
-    provider: FrameProvider,
+  private async decodeInterval(    provider: FrameProvider,
     interval: AudioMixInterval,
     a: number,
     b: number,
@@ -549,10 +597,28 @@ class TimelineAudioMixer {
     let decoded: DecodedAudio | null = null;
     try {
       decoded = await provider.getAudioAt!(range, { channels });
-    } catch {
+    } catch (error) {
+      // 不能静默吞掉：否则导出结果「成功」但整段音频消失，用户只能事后发现。
+      this.warnOnce(
+        `audio-decode-failed:${interval.clipId}`,
+        `音频片段 ${interval.clipId} 解码失败（${error instanceof Error ? error.message : String(error)}），对应区间已按静音导出。`,
+      );
       return null;
     }
     if (!decoded || decoded.frameCount <= 0) return null;
+
+    // 变速片段：解码得到的是「源时长」的采样（输出时长 × rate），
+    // 必须按 rate 重采样成输出采样数，否则 rate>1 会写到片段结束之后、
+    // rate<1 则每块只填前 rate 比例（听感是周期性断音）。
+    // 当前 UI 尚未暴露变速，但领域模型与导出计划都支持，属「一启用就必须正确」的路径。
+    if (Math.abs(rate - 1) > 1e-6) {
+      const outCount = Math.max(0, b - a);
+      decoded = {
+        ...decoded,
+        channels: resampleAudioChannels(decoded.channels, outCount, rate),
+        frameCount: outCount,
+      };
+    }
 
     // 解码结果按采样网格对齐；把它的源起点换算成相对本区间起点的输出采样偏移
     const offset = Math.round(
@@ -613,8 +679,13 @@ async function verifyMp4(
 
   let input: MediabunnyInputLike | null = null;
   try {
+    // BufferSource 直接引用字节数组，不像 BlobSource 那样在构造 Blob 时再复制一整份；
+    // 长录制（10 分钟 1080p 约 900MB）下这一步能省掉一份整片内存。
+    const source = lib.BufferSource
+      ? new lib.BufferSource(data as unknown as ArrayBufferView)
+      : new lib.BlobSource(new Blob([data as unknown as BlobPart]));
     input = new lib.Input({
-      source: new lib.BlobSource(new Blob([data as unknown as BlobPart])),
+      source,
       formats: lib.ALL_FORMATS,
     }) as unknown as MediabunnyInputLike;
     const opened = input;
@@ -738,15 +809,19 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
   const progress = createProgressReporter(jobId, totalFrames, options.onProgress);
 
   let muxer: ContinuousMuxer | null = null;
+  /** `.partial` 是否已经「尝试写入」（写失败也视为可能留下残片，必须清理） */
+  let partialWriteAttempted = false;
   let partialWritten = false;
   let renamed = false;
+  /** 已渲染帧数：失败/取消时进度必须带上真实值，不能显示成 0 帧 */
+  let framesDone = 0;
 
   const cleanupPartial = async (): Promise<void> => {
-    if (!partialWritten && !renamed) {
-      // 还没写就无需清理
-      return;
-    }
     if (renamed) return;
+    // 关键：写文件是「先落盘、后置标记」——磁盘写满时 writeFile 抛错，但文件可能已经
+    // 留下全部或部分字节。只看 partialWritten 会把这种最常见的失败当成「还没写」，
+    // 把几 GB 的 .partial 永久留在用户磁盘上（还会占满下一次导出所需的空闲空间）。
+    if (!partialWriteAttempted && !partialWritten) return;
     if (!io.removeFile) {
       warnings.push(`无法删除临时文件（未提供 removeFile）：${partialPath}`);
       return;
@@ -754,6 +829,7 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
     try {
       await io.removeFile(partialPath);
       partialWritten = false;
+      partialWriteAttempted = false;
     } catch (error) {
       warnings.push(
         `删除临时文件失败：${partialPath} (${error instanceof Error ? error.message : String(error)})`,
@@ -774,7 +850,9 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
     }
 
     // ---- 1. 磁盘空间预检 ----
-    const estimated = options.estimatedBytes ?? estimateOutputBytes(plan);
+    const estimated =
+      options.estimatedBytes ??
+      estimateOutputBytes(plan, { videoBitrate: profile.videoBitrate, audioBitrate: profile.audioBitrate });
     if (io.freeBytes) {
       let free = 0;
       try {
@@ -856,16 +934,19 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
         clipRate.set(clip.id, clip.rate.den > 0 ? clip.rate.num / clip.rate.den : 1);
       }
     }
-    const audioMixer = new TimelineAudioMixer(plan, sources, muxer, throwIfAborted, clipRate);
+    const audioMixer = new TimelineAudioMixer(plan, sources, muxer, throwIfAborted, clipRate, warnings);
 
     progress.emit(1, 'rendering', '开始逐帧渲染…', 0, 0);
 
     // ---- 4. 逐帧渲染 ----
-    let framesDone = 0;
+    framesDone = 0;
     for (let i = 0; i < totalFrames; i++) {
       throwIfAborted();
       const tick = frameTickAt(plan, i);
-      const pointer = options.pointerAt ? options.pointerAt(tick) : null;
+      // 指针日志是按「素材/会话时间」记录的（captureEngine 写的是 clock.durationTicks），
+      // 而这里的 tick 是时间线时间。修剪、删除前段、重排之后两者不再相等，
+      // 直接拿时间线 tick 查表会让整片光标与点击波纹偏移一个编辑量。
+      const pointer = options.pointerAt ? pointerForScene(snapshot, tick, options.pointerAt, timeMap) : null;
       const scene = evaluateScene(snapshot, tick, {
         ...sceneOptions,
         pointer,
@@ -904,6 +985,18 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
     await audioMixer.pumpTo(plan.audioTotalSamples, true);
     throwIfAborted();
 
+    // 损坏分段是「静默降级」的：画面回退到上一段末帧、音频按静音导出。
+    // 导出本身会成功、完整性校验也会通过，所以必须在这里把降级原因交给界面，
+    // 否则用户只有回放时才发现某一段冻结/失声。
+    for (const [assetId, provider] of sources) {
+      const failed = provider.failedSegmentIndexes?.() ?? [];
+      if (failed.length > 0) {
+        warnings.push(
+          `素材 ${assetId} 有 ${failed.length} 个分段无法解码，对应画面已用上一帧填充、音频按静音处理。`,
+        );
+      }
+    }
+
     // ---- 6. 封装（长尾阶段也推进进度，不允许卡在 99%） ----
     progress.emit(86, 'muxing', '正在完成封装…', framesDone, 0);
     const heartbeat = startHeartbeat(progress, framesDone);
@@ -917,6 +1010,9 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
     progress.emit(92, 'muxing', '封装完成，正在写入临时文件…', framesDone, finalized.data.byteLength);
 
     // ---- 7. 写 .partial ----
+    // 先标记「尝试写入」再 await：写盘失败（磁盘满、IPC 中断、进程被杀前抛错）时
+    // 文件可能已经存在，清理逻辑必须尝试删除。
+    partialWriteAttempted = true;
     try {
       await io.writeFile(partialPath, finalized.data);
       partialWritten = true;
@@ -927,12 +1023,18 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
       throw error;
     }
     throwIfAborted();
-    progress.emit(94, 'finalizing', '正在校验输出文件…', framesDone, finalized.data.byteLength);
+    // 记下真实字节数：回读校验后会主动释放整片编码结果，不能再从它上面读
+    const encodedBytes = finalized.data.byteLength;
+    progress.emit(94, 'finalizing', '正在校验输出文件…', framesDone, encodedBytes);
 
     // ---- 8. 重新打开校验 ----
     let verifyBytes = finalized.data;
     let verifySource: 'file' | 'memory' = 'memory';
     if (io.readFile) {
+      // 回读前先放弃内存里的编码结果：否则「整片编码结果 + 回读副本 + 校验器副本」
+      // 会同时驻留，10 分钟 1080p 场景峰值可达数 GB，隐藏导出窗口直接 OOM。
+      // verifyBytes 仍持有原数组，读回失败时还能退回内存校验。
+      finalized.data = new Uint8Array(0);
       try {
         verifyBytes = await io.readFile(partialPath);
         verifySource = 'file';
@@ -966,7 +1068,7 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
       error: null,
       durationTicks: plan.durationTicks,
       frames: framesDone,
-      bytes: finalized.data.byteLength,
+      bytes: encodedBytes,
       verified: true,
       snapshotHash,
       partialPath: null,
@@ -997,11 +1099,18 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
       progress.lastPercent,
       appError.code === 'E_EXPORT_CANCELLED' ? 'cancelled' : 'failed',
       appError.message,
-      0,
+      framesDone,
       0,
     );
     throw appError;
   } finally {
+    // 释放封装器：硬件 VideoEncoder / AAC 编码器 / 1080p 画布不能等 GC，
+    // 否则同一隐藏窗口里连续导出会持续占用 GPU 编码会话。
+    try {
+      muxer?.dispose();
+    } catch {
+      // 忽略释放异常
+    }
     for (const provider of sources.values()) {
       try {
         provider.close?.();
@@ -1013,11 +1122,29 @@ export async function exportProject(options: ExportProjectOptions): Promise<Expo
   }
 }
 
-/** 按码率估算输出体积（含 15% 封装与索引余量）。 */
-export function estimateOutputBytes(plan: ExportPlan): number {
+/** 估算输出体积时的编码参数；缺省沿用 12Mbps 视频 + 192kbps 音频。 */
+export interface OutputByteEstimateOptions {
+  /** 视频码率（比特/秒）；<=0 或未提供时用 12Mbps */
+  videoBitrate?: number;
+  /** 音频码率（比特/秒）；<=0 或未提供时用 192kbps */
+  audioBitrate?: number;
+}
+
+/**
+ * 按码率估算输出体积（含 15% 封装与索引余量）。
+ *
+ * 之前这里把 12Mbps/192kbps 写死，不看导出 profile：导出 4Mbps 档时估算值约为
+ * 实际体积的 3 倍，会把「磁盘其实够用」的导出在预检阶段误判为磁盘不足；
+ * 反过来 20Mbps 档会低估，写盘阶段才失败。调用方应传 profile 里的真实码率。
+ */
+export function estimateOutputBytes(plan: ExportPlan, options: OutputByteEstimateOptions = {}): number {
   const seconds = plan.durationTicks / TICKS_PER_SECOND;
-  const videoBits = plan.audioOnly ? 0 : 12_000_000;
-  const audioBits = 192_000;
+  const videoBits = plan.audioOnly
+    ? 0
+    : options.videoBitrate && options.videoBitrate > 0
+      ? options.videoBitrate
+      : 12_000_000;
+  const audioBits = options.audioBitrate && options.audioBitrate > 0 ? options.audioBitrate : 192_000;
   return Math.ceil(((videoBits + audioBits) / 8) * Math.max(1, seconds) * 1.15) + 8 * 1024 * 1024;
 }
 

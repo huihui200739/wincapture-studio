@@ -2,9 +2,10 @@
  * 应用外壳：左侧导航 + 顶栏 + 视图切换 + 状态栏 + 提示条
  */
 
-import { useEffect, useMemo, type ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import { useApp, VIEWS, type ViewId } from './lib/store';
-import { Icon, IconButton, Badge } from './components/ui';
+import { useShortcuts } from './lib/hooks';
+import { Icon, IconButton, Badge, ErrorBoundary } from './components/ui';
 import { formatClock, cn } from './lib/format';
 import { HomeView } from './views/HomeView';
 import { RecordView } from './views/RecordView';
@@ -20,9 +21,13 @@ function ToastStack() {
   const { toasts, dismissToast } = useApp();
   if (toasts.length === 0) return null;
   return (
-    <div className="toast-stack" role="region" aria-label="操作提示">
+    <div className="toast-stack" role="region" aria-label="操作提示" aria-live="polite" aria-relevant="additions">
       {toasts.map((toast) => (
-        <div key={toast.id} className={cn('toast', `is-${toast.tone}`)}>
+        <div
+          key={toast.id}
+          className={cn('toast', `is-${toast.tone}`)}
+          role={toast.tone === 'danger' ? 'alert' : 'status'}
+        >
           <span className="toast-icon">
             <Icon
               name={toast.tone === 'ok' ? 'check' : toast.tone === 'danger' ? 'warning' : toast.tone === 'warn' ? 'warning' : 'info'}
@@ -89,6 +94,8 @@ function TopBar() {
     dirty,
     canUndo,
     canRedo,
+    undoLabel,
+    redoLabel,
     undo,
     redo,
     save,
@@ -123,8 +130,20 @@ function TopBar() {
 
       {view === 'editor' && project && (
         <div className="topbar-group">
-          <IconButton icon="undo" label={canUndo ? `撤销（Ctrl+Z）` : '撤销（无可撤销操作）'} size="sm" onClick={undo} disabled={!canUndo} />
-          <IconButton icon="redo" label="重做（Ctrl+Y）" size="sm" onClick={redo} disabled={!canRedo} />
+          <IconButton
+            icon="undo"
+            label={canUndo ? `撤销：${undoLabel ?? '上一步'}（Ctrl+Z）` : '撤销（无可撤销操作）'}
+            size="sm"
+            onClick={undo}
+            disabled={!canUndo}
+          />
+          <IconButton
+            icon="redo"
+            label={canRedo ? `重做：${redoLabel ?? '下一步'}（Ctrl+Y）` : '重做（无可重做操作）'}
+            size="sm"
+            onClick={redo}
+            disabled={!canRedo}
+          />
           <button type="button" className="wcs-btn is-sm" onClick={() => void save()} disabled={saving || !dirty}>
             {saving ? <span className="wcs-spinner" style={{ width: 12, height: 12 }} /> : <Icon name="save" size={13} />}
             {dirty ? '保存' : '已保存'}
@@ -204,29 +223,28 @@ function ViewRouter(): ReactNode {
 }
 
 export function App() {
-  const { setView, capture } = useApp();
+  const { view, setView, capture } = useApp();
 
-  // 快捷键：Ctrl+1..6 切换视图（输入框内不触发）
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
-      if (!event.ctrlKey || event.altKey) return;
-      const index = Number(event.key);
-      if (Number.isInteger(index) && index >= 1 && index <= VIEWS.length) {
-        event.preventDefault();
-        setView(VIEWS[index - 1].id);
-      }
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [setView]);
+  // 快捷键：Ctrl+1..6 切换视图。
+  // 复用统一的 useShortcuts：自动跳过输入框，且模态框打开时不再切换视图
+  //（旧实现会在删除确认框打开时把视图切走，确认框随之消失）。
+  useShortcuts(
+    useMemo(
+      () =>
+        VIEWS.map((item, index) => ({
+          combo: `ctrl+${index + 1}`,
+          handler: () => setView(item.id),
+          allowInModal: false,
+        })),
+      [setView],
+    ),
+  );
 
   // 录制异常状态：顶部提示不遮挡主流程
   const recordingBanner =
     capture && (capture.state === 'RecoverableFailure' || capture.state === 'RecoveryReady') ? (
       <div style={{ padding: '0 18px', marginTop: 10 }}>
-        <div className="wcs-note is-danger">
+        <div className="wcs-note is-danger" role="alert">
           <Icon name="warning" size={14} />
           <div className="wcs-note-body">
             <strong>录制中断，已保留可用片段。</strong> {capture.error?.message ?? '可以恢复已提交的分段后继续编辑，或丢弃本次会话。'}
@@ -239,9 +257,12 @@ export function App() {
     <div className="app-shell">
       <Rail />
       <TopBar />
-      <main className="app-main">
+      <main className="app-main" id="main-content">
         {recordingBanner}
-        <ViewRouter />
+        {/* 单个视图崩溃不应导致整窗白屏：保留导航与状态栏，只降级出错区域 */}
+        <ErrorBoundary key={view} scope={VIEW_TITLES[view].title}>
+          <ViewRouter />
+        </ErrorBoundary>
       </main>
       <StatusBar />
       <ToastStack />

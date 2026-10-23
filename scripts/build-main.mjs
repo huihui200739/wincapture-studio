@@ -1,9 +1,13 @@
 import { build } from 'esbuild';
 import path from 'node:path';
 import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { ROOT, useLocalTempDir } from './lib/local-temp.mjs';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// esbuild 在本机 %TEMP% 上清理临时文件会被拒绝（Access is denied），
+// 先把手上的临时目录指到工作区内再构建（详见 lib/local-temp.mjs）。
+useLocalTempDir('esbuild-main');
+
+const root = ROOT;
 
 // 应用图标随包复制到 dist/assets/：主进程在打包环境下从 dist/assets/app-icon.ico
 // 解析窗口/任务栏图标（见 electron/main.ts 的 appIconPath）。

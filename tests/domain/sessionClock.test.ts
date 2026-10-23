@@ -236,3 +236,69 @@ describe('SessionClock: reset 与常量', () => {
     expect(RECOVERY_LOSS_TARGET_TICKS).toBe(4 * S);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 回归：非法时刻不得污染会话状态；倒序 resume 不得丢失暂停
+// ---------------------------------------------------------------------------
+
+describe('回归：非法 QPC 时刻与倒序恢复', () => {
+  it('setZero(NaN/Infinity) 不写入零点，之后的有效零点仍可用', () => {
+    const clock = new SessionClock();
+    expect(clock.setZero(NaN)).toBe(0);
+    expect(clock.hasZero).toBe(false);
+    expect(clock.setZero(Infinity)).toBe(0);
+    expect(clock.hasZero).toBe(false);
+    expect(clock.setZero(5 * S)).toBe(5 * S);
+    expect(clock.mediaTickAt(6 * S)).toBe(S);
+    expect(clock.durationTicks(6 * S)).toBe(S);
+  });
+
+  it('pause(NaN) 不进入暂停，查询接口不返回 NaN', () => {
+    const clock = new SessionClock();
+    clock.setZero(0);
+    expect(clock.pause(NaN)).toBe(false);
+    expect(clock.paused).toBe(false);
+    expect(clock.mediaTickAt(NaN)).toBe(0);
+    expect(clock.isDuringPause(NaN)).toBe(false);
+    expect(clock.pausedTicksAt(NaN)).toBe(0);
+    expect(clock.durationTicks(NaN)).toBe(0);
+    expect(clock.mediaTickAt(3 * S)).toBe(3 * S);
+  });
+
+  it('stop(NaN) 不改变状态', () => {
+    const clock = new SessionClock();
+    clock.setZero(S);
+    clock.stop(NaN);
+    expect(clock.stopped).toBe(false);
+    expect(clock.durationTicks(3 * S)).toBe(2 * S);
+  });
+
+  it('倒序 resume 被忽略，暂停区间不会静默丢失', () => {
+    const clock = new SessionClock();
+    clock.setZero(0);
+    clock.pause(5 * S);
+    expect(clock.resume(3 * S)).toBe(false); // QPC 回跳
+    expect(clock.paused).toBe(true);
+    expect(clock.resume(6 * S)).toBe(true);
+    expect(clock.pauseTable()).toEqual([{ start: 5 * S, end: 6 * S }]);
+    expect(clock.mediaTickAt(7 * S)).toBe(6 * S); // 7s − 1s 暂停
+  });
+
+  it('setTrackOffset 忽略非有限参数', () => {
+    const clock = new SessionClock();
+    clock.setZero(0);
+    clock.setTrackOffset('mic', NaN);
+    expect(clock.trackOffset('mic')).toBeUndefined();
+    clock.setTrackOffset('mic', 0, Infinity);
+    expect(clock.trackOffset('mic')).toBeUndefined();
+    clock.setTrackOffset('mic', S);
+    expect(clock.trackMediaTickAt('mic', 2 * S)).toBe(3 * S);
+  });
+
+  it('placeSample / trackMediaTickAt 对非法时刻返回 null', () => {
+    const clock = new SessionClock();
+    clock.setZero(0);
+    expect(clock.placeSample('mic', NaN)).toEqual({ mediaTick: null, padTicks: 0, padReason: null, duringPause: false });
+    expect(clock.trackMediaTickAt('mic', Infinity)).toBeNull();
+  });
+});

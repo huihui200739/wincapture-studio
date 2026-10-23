@@ -114,11 +114,14 @@ export class SegmentEncoder {
   private videoSource: CanvasSource | null = null;
   private audioSource: AudioBufferSource | null = null;
   private started = false;
+  /** finalize 是否已经成功（成功后不再对已结束的 Output 调 cancel） */
+  private finalized = false;
   private audioContext: OfflineAudioContext | null = null;
-  private readonly pendingAudio: { data: Float32Array[]; timestampUs: number }[] = [];
   private framesWritten = 0;
   private firstTimestampUs: number | null = null;
   private lastTimestampUs = 0;
+  /** 已追加音频在「段内时间」上的结束位置（微秒），用于按时间戳补静音 */
+  private audioEndUs = 0;
   private encoderLabel = 'unknown';
   private videoCodec: 'avc' | 'vp9' = 'avc';
   private failed: Error | null = null;
@@ -126,6 +129,7 @@ export class SegmentEncoder {
   constructor(private readonly options: SegmentEncodeOptions) {}
 
   async init(): Promise<void> {
+    if (this.started || this.output) throw new Error('SegmentEncoder 已初始化，请新建实例');
     const { width, height, fps, videoBitrate, audioBitrate, hardwarePreferred, includeAudio, audioSampleRate, audioChannels } = this.options;
 
     // 视频编码器：优先硬件，失败降级软件（§11.3）
@@ -136,7 +140,7 @@ export class SegmentEncoder {
     for (const codec of ['avc', 'vp9'] as const) {
       for (const hw of attempts) {
         try {
-          const ok = await canEncodeVideo(codec, { width, height, bitrate: videoBitrate, hardwareAcceleration: hw });
+          const ok = await canEncodeVideo(codec, { width, height, frameRate: fps, bitrate: videoBitrate, hardwareAcceleration: hw });
           if (ok) {
             chosen = { codec, hw };
             break;
@@ -226,51 +230,76 @@ export class SegmentEncoder {
     this.lastTimestampUs = timestampUs;
   }
 
-  /** 追加音频（Float32 平面数据），时间戳为该批首个样本的时间。 */
+  /**
+   * 追加音频（Float32 平面数据），时间戳为该批首个样本的时间。
+   *
+   * `timestampUs` 相对**段起点**（与 commitVideoFrame 的语义一致，同样按
+   * startTimestampUs 归一化）。mediabunny 的 AudioBufferSource 只支持顺序追加，
+   * 因此这里负责把「时间戳上的空洞」显式补成静音：否则调用方传入 0.2s 处的音频会
+   * 被当成段首音频，整段音画错位且没有任何报错。
+   */
   async addAudio(data: Float32Array[], timestampUs: number, sampleRate: number): Promise<void> {
     if (!this.audioSource || !this.audioContext) return;
     const frames = data[0]?.length ?? 0;
     if (frames === 0) return;
+    if (!(sampleRate > 0)) throw new Error(`SegmentEncoder.addAudio: 非法采样率 ${sampleRate}`);
+
+    // 第一批允许从段首之外开始；后续批次按「上一批结束时间」补空洞。
+    const relStartUs = Math.max(0, timestampUs - this.options.startTimestampUs);
+    const gapUs = relStartUs - this.audioEndUs;
+    const gapFrames = gapUs > 0 ? Math.round((gapUs / 1e6) * sampleRate) : 0;
+    if (gapFrames > 0) {
+      const silence = this.audioContext.createBuffer(data.length, gapFrames, sampleRate);
+      await this.audioSource.add(silence);
+      this.audioEndUs += (gapFrames / sampleRate) * 1e6;
+    }
+
     const buffer = this.audioContext.createBuffer(data.length, frames, sampleRate);
     for (let ch = 0; ch < data.length; ch++) {
       buffer.copyToChannel(data[ch] as Float32Array<ArrayBuffer>, ch);
     }
-    // AudioBufferSource.add 只接收 AudioBuffer，位置由构造时的 startTimestamp 决定；
-    // 分段编码时音频总是从段首开始，因此这里直接追加即可（顺序拼接）。
-    void timestampUs;
     await this.audioSource.add(buffer);
+    this.audioEndUs = Math.max(this.audioEndUs, relStartUs) + (frames / sampleRate) * 1e6;
     if (this.firstTimestampUs === null) this.firstTimestampUs = timestampUs;
   }
 
-  /** 完成本段封装，返回可独立解码的 MP4 字节。 */
+  /** 完成本段封装，返回可独立解码的 MP4 字节。无论成功与否都会释放编码资源。 */
   async finalize(): Promise<SegmentResult> {
     if (!this.output || !this.started) throw new Error('SegmentEncoder 未启动');
-    if (this.failed) throw this.failed;
-    // 至少写一帧，避免空轨
-    if (this.framesWritten === 0 && this.canvas) {
-      await this.commitVideoFrame(this.options.startTimestampUs);
+    if (this.failed) {
+      this.dispose();
+      throw this.failed;
     }
-    await this.output.finalize();
-    const target = this.output.target as BufferTarget;
-    const data = new Uint8Array(target.buffer as ArrayBuffer);
-    const durationUs =
-      this.firstTimestampUs !== null && this.lastTimestampUs > this.firstTimestampUs
-        ? this.lastTimestampUs - this.firstTimestampUs + 1e6 / this.options.fps
-        : (this.framesWritten * 1e6) / this.options.fps;
-    return {
-      data,
-      frames: this.framesWritten,
-      durationUs: Math.max(1, Math.round(durationUs)),
-      encoder: this.encoderLabel,
-    };
+    try {
+      // 至少写一帧，避免空轨
+      if (this.framesWritten === 0 && this.canvas) {
+        await this.commitVideoFrame(this.options.startTimestampUs);
+      }
+      await this.output.finalize();
+      this.finalized = true;
+      const target = this.output.target as BufferTarget;
+      const data = new Uint8Array(target.buffer as ArrayBuffer);
+      const durationUs =
+        this.firstTimestampUs !== null && this.lastTimestampUs > this.firstTimestampUs
+          ? this.lastTimestampUs - this.firstTimestampUs + 1e6 / this.options.fps
+          : (this.framesWritten * 1e6) / this.options.fps;
+      return {
+        data,
+        frames: this.framesWritten,
+        durationUs: Math.max(1, Math.round(durationUs)),
+        encoder: this.encoderLabel,
+      };
+    } finally {
+      // 关键：mediabunny 的 Output 持有 VideoEncoder/AudioEncoder（硬件上下文）。
+      // finalize 抛错（GPU 重置、编码器被杀、磁盘/内存不足）时如果不释放，
+      // 下一个分段会拿到被占用的硬件编码器并连续失败，直到进程被 GC。
+      this.dispose();
+    }
   }
 
+  /** 中止本段编码并释放资源（可重复调用）。 */
   abort(): void {
-    try {
-      void this.output?.cancel();
-    } catch {
-      // 忽略取消异常
-    }
+    this.dispose();
   }
 
   /**
@@ -282,22 +311,36 @@ export class SegmentEncoder {
    * 实测长时间录制时进程树内存随分段数线性增长
    * （40 秒涨到 3058MB，超出 §16.2 的 1.2GB）。
    *
-   * canvas 由调用方持有（drawContext），这里只断开本实例的引用，
+   * canvas 由调用方持有（drawContext），这里只断开本实例的引用；
    * 调用方需自行把 canvas 尺寸置零以归还后备存储。
    */
   dispose(): void {
     // 取消未完成的输出（已 finalize 的会静默失败）
-    try {
-      void this.output?.cancel();
-    } catch {
-      // 忽略
+    if (!this.finalized) {
+      try {
+        void this.output?.cancel();
+      } catch {
+        // 忽略
+      }
     }
     this.output = null;
     this.videoSource = null;
     this.audioSource = null;
     // OfflineAudioContext 没有显式 close()，断开引用即可
     this.audioContext = null;
-    this.pendingAudio.length = 0;
+    // 与上方注释一致：断开对画布的引用，并把尺寸置零立即归还后备存储。
+    // 调用方（录制/摄像头运行时的失败路径）不一定记得清画布；不置零时 1080p
+    // 画布（约 8MB）要等 GC 才释放，长时间录制会周期性冲高内存。
+    if (this.canvas) {
+      try {
+        this.canvas.width = 0;
+        this.canvas.height = 0;
+      } catch {
+        // 忽略（部分环境不允许修改尺寸）
+      }
+    }
+    this.canvas = null;
+    this.ctx = null;
     this.started = false;
   }
 }
@@ -330,10 +373,13 @@ export class ContinuousMuxer {
   private audioContext: OfflineAudioContext | null = null;
   private frames = 0;
   private encoderLabel = 'unknown';
+  /** finalize/cancel 是否已经结束（结束后不再调用 Output.cancel） */
+  private settled = false;
 
   constructor(private readonly options: MuxerOptions) {}
 
   async init(hardwarePreferred = true): Promise<string> {
+    if (this.output) throw new Error('ContinuousMuxer 已初始化，请新建实例');
     const { width, height, fps, videoBitrate, audioBitrate, audioSampleRate, audioChannels, includeAudio } = this.options;
     const attempts: HardwareAcceleration[] = hardwarePreferred
       ? ['prefer-hardware', 'no-preference', 'prefer-software']
@@ -342,7 +388,7 @@ export class ContinuousMuxer {
     for (const codec of ['avc', 'vp9'] as const) {
       for (const hw of attempts) {
         try {
-          if (await canEncodeVideo(codec, { width, height, bitrate: videoBitrate, hardwareAcceleration: hw })) {
+          if (await canEncodeVideo(codec, { width, height, frameRate: fps, bitrate: videoBitrate, hardwareAcceleration: hw })) {
             chosen = { codec, hw };
             break;
           }
@@ -423,6 +469,7 @@ export class ContinuousMuxer {
   async finalize(): Promise<{ data: Uint8Array; frames: number; encoder: string }> {
     if (!this.output) throw new Error('未初始化');
     await this.output.finalize();
+    this.settled = true;
     const target = this.output.target as BufferTarget;
     return { data: new Uint8Array(target.buffer as ArrayBuffer), frames: this.frames, encoder: this.encoderLabel };
   }
@@ -430,8 +477,42 @@ export class ContinuousMuxer {
   async cancel(): Promise<void> {
     try {
       await this.output?.cancel();
+      this.settled = true;
     } catch {
       /* 忽略 */
     }
+  }
+
+  /**
+   * 释放封装器持有的编码器与画布。
+   *
+   * 导出窗口常驻时每次导出都会新建 ContinuousMuxer；只 finalize/cancel 不释放引用时，
+   * 硬件 VideoEncoder、AAC 编码器和 1080p 画布要等 GC 才归还，
+   * 连续导出会叠加占用 GPU 编码会话（表现为第二次导出变慢或编码器创建失败）。
+   */
+  dispose(): void {
+    if (this.output && !this.settled) {
+      try {
+        void this.output.cancel();
+      } catch {
+        /* 忽略 */
+      }
+    }
+    if (this.canvas) {
+      try {
+        // 尺寸置零才会立即归还后备存储
+        this.canvas.width = 0;
+        this.canvas.height = 0;
+      } catch {
+        /* 忽略 */
+      }
+    }
+    this.output = null;
+    this.videoSource = null;
+    this.audioSource = null;
+    this.audioContext = null;
+    this.canvas = null;
+    this.ctx = null;
+    this.settled = true;
   }
 }

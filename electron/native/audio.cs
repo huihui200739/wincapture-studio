@@ -53,7 +53,6 @@ internal static class AudioWorker
     private const int AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000;
     private const int STREAM_FLAGS_EVENTCALLBACK = 0x00040000;
     private const int AUDCLNT_E_DEVICE_INVALIDATED = unchecked((int)0x88890004);
-    private const int AUDCLNT_S_BUFFER_EMPTY = 0x08890001;
 
     private const short WAVE_FORMAT_PCM = 1;
     private const short WAVE_FORMAT_IEEE_FLOAT = 3;
@@ -167,6 +166,29 @@ internal static class AudioWorker
     private static readonly Guid KSDATAFORMAT_SUBTYPE_PCM =
         new Guid("00000001-0000-0010-8000-00AA00389B71");
 
+    [StructLayout(LayoutKind.Explicit)]
+    private struct FloatInt32
+    {
+        [FieldOffset(0)] public float Float;
+        [FieldOffset(0)] public int Int;
+    }
+
+    /// <summary>
+    /// 无分配地写 little-endian float32。
+    /// 旧实现每写一个采样就 BitConverter.GetBytes 一次（每 20ms 包约 1920 次小数组分配），
+    /// 50 包/秒就是近 10 万次分配/秒，长期录制持续给 GC 加压。
+    /// </summary>
+    private static void WriteFloatLE(byte[] buffer, int offset, float value)
+    {
+        FloatInt32 v = new FloatInt32();
+        v.Float = value;
+        int bits = v.Int;
+        buffer[offset] = (byte)(bits & 0xFF);
+        buffer[offset + 1] = (byte)((bits >> 8) & 0xFF);
+        buffer[offset + 2] = (byte)((bits >> 16) & 0xFF);
+        buffer[offset + 3] = (byte)((bits >> 24) & 0xFF);
+    }
+
     private static void Log(string message)
     {
         Console.Error.WriteLine(message);
@@ -199,14 +221,12 @@ internal static class AudioWorker
         int offset = 24;
         for (int i = 0; i < frames; i++)
         {
-            byte[] b = BitConverter.GetBytes(left[i]);
-            buffer[offset] = b[0]; buffer[offset + 1] = b[1]; buffer[offset + 2] = b[2]; buffer[offset + 3] = b[3];
+            WriteFloatLE(buffer, offset, left[i]);
             offset += 4;
         }
         for (int i = 0; i < frames; i++)
         {
-            byte[] b = BitConverter.GetBytes(right[i]);
-            buffer[offset] = b[0]; buffer[offset + 1] = b[1]; buffer[offset + 2] = b[2]; buffer[offset + 3] = b[3];
+            WriteFloatLE(buffer, offset, right[i]);
             offset += 4;
         }
         try
@@ -279,9 +299,19 @@ internal static class AudioWorker
                 int hr = store.GetValue(ref key, pv);
                 if (hr != 0) return null;
                 short vt = Marshal.ReadInt16(pv, 0);
-                if (vt != 31) return null; // VT_LPWSTR
+                if (vt != 31) // VT_LPWSTR
+                {
+                    // 非字符串类型也可能持有需要释放的指针（VT_BSTR/VT_UNKNOWN 等），
+                    // 统一交给 PropVariantClear，避免设备枚举路径泄漏 COM 内存。
+                    NativeMethods.PropVariantClear(pv);
+                    return null;
+                }
                 IntPtr str = Marshal.ReadIntPtr(pv, 8);
-                if (str == IntPtr.Zero) return null;
+                if (str == IntPtr.Zero)
+                {
+                    NativeMethods.PropVariantClear(pv);
+                    return null;
+                }
                 string name = Marshal.PtrToStringUni(str);
                 NativeMethods.PropVariantClear(pv);
                 return name;
@@ -318,9 +348,10 @@ internal static class AudioWorker
     private static int ListDevices()
     {
         var items = new List<string>();
+        IMMDeviceEnumerator enumerator = null;
         try
         {
-            var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+            enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
             int[] flows = new int[] { eRender, eCapture };
             string[] kinds = new string[] { "audiooutput", "audioinput" };
             string[] defaultIds = new string[2];
@@ -367,6 +398,11 @@ internal static class AudioWorker
             Log("LIST_ERROR " + ex.GetType().Name + ": " + ex.Message);
             Console.WriteLine("[]");
             return 5;
+        }
+        finally
+        {
+            // 设备枚举器的 RCW 之前从不释放：每次枚举都泄漏一个 COM 对象。
+            try { if (enumerator != null) Marshal.ReleaseComObject(enumerator); } catch { }
         }
         Console.WriteLine("[" + string.Join(",", items.ToArray()) + "]");
         Console.Out.Flush();
@@ -542,10 +578,11 @@ internal static class AudioWorker
         IMMDevice device = null;
         IAudioClient client = null;
         IAudioCaptureClient capture = null;
+        IMMDeviceEnumerator enumerator = null;
         IntPtr mixFormatPtr = IntPtr.Zero;
         try
         {
-            var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+            enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
             int hr;
             if (string.IsNullOrEmpty(config.EndpointId))
             {
@@ -555,7 +592,9 @@ internal static class AudioWorker
             {
                 hr = enumerator.GetDevice(config.EndpointId, out device);
             }
-            if (hr != 0 || device == null)
+            // HRESULT 判断必须用 FAILED(hr)（hr < 0）：COM 成功码可能是非 0 正数
+            // （如 S_FALSE / AUDCLNT_S_BUFFER_EMPTY），旧写法把它们当失败会误报设备错误。
+            if (hr < 0 || device == null)
             {
                 WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 无法打开（hr=0x" + hr.ToString("X8") + "）");
                 return;
@@ -564,7 +603,7 @@ internal static class AudioWorker
             Guid iid = typeof(IAudioClient).GUID;
             object obj;
             hr = device.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out obj);
-            if (hr != 0 || obj == null)
+            if (hr < 0 || obj == null)
             {
                 WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 激活失败（hr=0x" + hr.ToString("X8") + "）");
                 return;
@@ -572,7 +611,7 @@ internal static class AudioWorker
             client = (IAudioClient)obj;
 
             hr = client.GetMixFormat(out mixFormatPtr);
-            if (hr != 0 || mixFormatPtr == IntPtr.Zero)
+            if (hr < 0 || mixFormatPtr == IntPtr.Zero)
             {
                 WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 读取格式失败（hr=0x" + hr.ToString("X8") + "）");
                 return;
@@ -607,7 +646,7 @@ internal static class AudioWorker
 
             int flags = config.Loopback ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
             hr = client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, mixFormatPtr, IntPtr.Zero);
-            if (hr != 0)
+            if (hr < 0)
             {
                 WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 初始化失败（hr=0x" + hr.ToString("X8") + "）");
                 return;
@@ -616,7 +655,7 @@ internal static class AudioWorker
             Guid capIid = typeof(IAudioCaptureClient).GUID;
             object capObj;
             hr = client.GetService(ref capIid, out capObj);
-            if (hr != 0 || capObj == null)
+            if (hr < 0 || capObj == null)
             {
                 WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 获取采集接口失败（hr=0x" + hr.ToString("X8") + "）");
                 return;
@@ -627,7 +666,7 @@ internal static class AudioWorker
             client.GetBufferSize(out bufferFrames);
 
             hr = client.Start();
-            if (hr != 0)
+            if (hr < 0)
             {
                 WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 启动失败（hr=0x" + hr.ToString("X8") + "）");
                 return;
@@ -636,6 +675,9 @@ internal static class AudioWorker
             Log("STARTED " + config.Id + " bufferFrames=" + bufferFrames);
             var pump = new StreamPump(config);
             byte[] scratch = new byte[65536];
+            // 静音包复用同一块零缓冲：旧实现每包 new byte[]（7.5KB），
+            // 回环长时间静音时是纯 GC 垃圾。
+            byte[] silentScratch = new byte[65536];
             int silentRun = 0;
 
             while (!_quit)
@@ -647,7 +689,7 @@ internal static class AudioWorker
                     WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 设备已断开");
                     return;
                 }
-                if (hr != 0)
+                if (hr < 0)
                 {
                     WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 读取失败（hr=0x" + hr.ToString("X8") + "）");
                     return;
@@ -675,7 +717,13 @@ internal static class AudioWorker
                         WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 设备已断开");
                         return;
                     }
-                    if (hr != 0) break;
+                    if (hr < 0)
+                    {
+                        // 旧实现这里 break 后回到外层再取包长，若错误持续存在会变成
+                        // 「读失败→取包长>0→再读失败」的 100% CPU 忙循环。直接上报并退出该流。
+                        WriteError(config.Id, "E_AUDIO_DEVICE_LOST", config.Label + " 采集失败（hr=0x" + hr.ToString("X8") + "）");
+                        return;
+                    }
                     if (frames <= 0)
                     {
                         capture.ReleaseBuffer(frames);
@@ -684,7 +732,10 @@ internal static class AudioWorker
                     bool silent = (packetFlags & 2) != 0; // AUDCLNT_BUFFERFLAGS_SILENT
                     if (silent)
                     {
-                        pump.Process(new byte[frames * config.BlockAlign], frames, qpcPosition);
+                        int bytes = frames * config.BlockAlign;
+                        if (silentScratch.Length < bytes) silentScratch = new byte[bytes];
+                        else Array.Clear(silentScratch, 0, bytes);
+                        pump.Process(silentScratch, frames, qpcPosition);
                     }
                     else if (data != IntPtr.Zero)
                     {
@@ -695,7 +746,7 @@ internal static class AudioWorker
                     }
                     capture.ReleaseBuffer(frames);
                     hr = capture.GetNextPacketSize(out next);
-                    if (hr != 0) next = 0;
+                    if (hr < 0) next = 0;
                 }
             }
             pump.Flush();
@@ -712,6 +763,8 @@ internal static class AudioWorker
             try { if (capture != null) Marshal.ReleaseComObject(capture); } catch { }
             try { if (client != null) Marshal.ReleaseComObject(client); } catch { }
             try { if (device != null) Marshal.ReleaseComObject(device); } catch { }
+            // 设备枚举器 RCW 之前从不释放：每路流启动都泄漏一个 COM 对象
+            try { if (enumerator != null) Marshal.ReleaseComObject(enumerator); } catch { }
         }
     }
 

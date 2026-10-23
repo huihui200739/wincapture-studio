@@ -5,7 +5,7 @@
 import { useMemo, useState } from 'react';
 import { useApp } from '../lib/store';
 import { Badge, Button, EmptyState, Icon, IconButton, InlineNote, Modal, Panel } from '../components/ui';
-import { cn, formatClock, formatDurationLong, formatRelativeTime, unwrap } from '../lib/format';
+import { cn, formatClock, formatDurationLong, formatRelativeTime, isCancelledError, unwrap } from '../lib/format';
 import { TICKS_PER_SECOND } from '@domain/timebase';
 import type { RecoverableSession } from '@shared/ipc';
 import { wcs } from '../lib/wcs';
@@ -22,7 +22,12 @@ export function HomeView() {
     pushToast,
     apiMode,
     project,
+    projectPath,
     duration,
+    dirty,
+    save,
+    saving,
+    closeProject,
     pushError,
   } = useApp();
 
@@ -30,6 +35,9 @@ export function HomeView() {
   const [confirmDelete, setConfirmDelete] = useState<{ path: string; name: string } | null>(null);
   const [recovering, setRecovering] = useState<string | null>(null);
   const [discarding, setDiscarding] = useState<string | null>(null);
+  const [confirmDiscard, setConfirmDiscard] = useState<RecoverableSession | null>(null);
+  /** 有未保存修改时，先确认再切换工程 */
+  const [pendingOpen, setPendingOpen] = useState<string | null>(null);
 
   const stats = useMemo(() => {
     const total = recents.reduce((acc, item) => acc + item.durationTicks, 0);
@@ -41,17 +49,59 @@ export function HomeView() {
     };
   }, [recents, recoverables]);
 
+  const doOpen = async (path?: string) => {
+    const opened = await openProject(path);
+    if (opened) setView('editor');
+  };
+
+  /**
+   * 统一的失败提示：用户主动取消（E_EXPORT_CANCELLED）不能显示成失败，
+   * 更不能显示成成功（例如删除确认框取消后提示「工程已删除」）。
+   */
+  const reportActionError = (error: unknown, title: string, cancelledTitle: string) => {
+    if (isCancelledError(error)) {
+      pushToast({ tone: 'info', title: cancelledTitle });
+      return;
+    }
+    pushError(error, title);
+  };
+
+  /** 打开最近工程：切走前如果当前有未保存修改，先让用户确认。 */
   const handleOpen = async (path: string) => {
-    await openProject(path);
-    setView('editor');
+    if (dirty && project && path !== projectPath) {
+      setPendingOpen(path);
+      return;
+    }
+    await doOpen(path);
+  };
+
+  const handleSaveThenOpen = async () => {
+    const target = pendingOpen;
+    if (!target) return;
+    const saved = await save();
+    if (!saved) {
+      // 保存失败时保留对话框，让用户看到错误提示后自行选择「放弃修改并打开」
+      return;
+    }
+    setPendingOpen(null);
+    await doOpen(target);
+  };
+
+  const handleOpenFolder = async (path: string) => {
+    try {
+      unwrap(await wcs().revealProject(path));
+    } catch (error) {
+      pushError(error, '打开工程所在位置失败');
+    }
   };
 
   const handleRecover = async (session: RecoverableSession) => {
     setRecovering(session.projectPath);
     try {
       const handle = unwrap(await wcs().recoverSession(session.projectPath));
-      await openProject(handle.path);
       await refreshRecoverables();
+      const opened = await openProject(handle.path);
+      if (!opened) return; // 打开失败已由 openProject 提示
       setView('editor');
       pushToast({
         tone: 'ok',
@@ -59,7 +109,7 @@ export function HomeView() {
         message: `恢复了 ${session.committedSegments} 个已提交分段，可能丢失约 ${(session.estimatedLossTicks / TICKS_PER_SECOND).toFixed(1)} 秒尾段。`,
       });
     } catch (error) {
-      pushError(error, '恢复会话失败');
+      reportActionError(error, '恢复会话失败', '已取消恢复会话');
     } finally {
       setRecovering(null);
     }
@@ -72,9 +122,10 @@ export function HomeView() {
       await refreshRecoverables();
       pushToast({ tone: 'info', title: '已丢弃恢复会话', message: '该会话的临时分段会在后台清理。' });
     } catch (error) {
-      pushError(error, '丢弃恢复会话失败');
+      reportActionError(error, '丢弃恢复会话失败', '已取消丢弃会话');
     } finally {
       setDiscarding(null);
+      setConfirmDiscard(null);
     }
   };
 
@@ -85,7 +136,7 @@ export function HomeView() {
       await refreshRecents();
       pushToast({ tone: 'info', title: '已从最近列表移除', message: '工程文件仍保留在磁盘上。' });
     } catch (error) {
-      pushError(error, '移除最近工程失败');
+      reportActionError(error, '移除最近工程失败', '已取消移除');
     } finally {
       setRemoving(null);
     }
@@ -95,11 +146,15 @@ export function HomeView() {
     if (!confirmDelete) return;
     setRemoving(confirmDelete.path);
     try {
+      // 主进程可能还有一次系统级确认；返回 ok(null) 表示删除完成，
+      // 用户取消则走 E_EXPORT_CANCELLED 错误码 —— 绝不能提示「已删除」。
       unwrap(await wcs().deleteProject(confirmDelete.path));
+      // 删除的是当前打开的工程：必须关闭，否则后续保存会写回已删除路径
+      if (confirmDelete.path === projectPath) closeProject();
       await refreshRecents();
       pushToast({ tone: 'warn', title: '工程已删除', message: `${confirmDelete.name} 的工程目录已删除。` });
     } catch (error) {
-      pushError(error, '删除工程失败');
+      reportActionError(error, '删除工程失败', '已取消删除工程');
     } finally {
       setRemoving(null);
       setConfirmDelete(null);
@@ -118,7 +173,7 @@ export function HomeView() {
           <Button variant="primary" size="lg" icon="record" onClick={() => setView('record')}>
             新建录制
           </Button>
-          <Button size="lg" icon="folder" onClick={() => void openProject()} disabled={projectLoading}>
+          <Button size="lg" icon="folder" onClick={() => void doOpen()} disabled={projectLoading}>
             打开工程
           </Button>
           {project && (
@@ -135,7 +190,7 @@ export function HomeView() {
           </div>
           <div>
             <div className="home-stat-label">累计时长</div>
-            <div className="home-stat-value">{formatDurationLong(stats.duration)}</div>
+            <div className="home-stat-value">{stats.duration > 0 ? formatDurationLong(stats.duration) : '0 分钟'}</div>
           </div>
           <div>
             <div className="home-stat-label">待恢复</div>
@@ -185,7 +240,7 @@ export function HomeView() {
                         size="sm"
                         variant="ghost"
                         loading={discarding === session.projectPath}
-                        onClick={() => void handleDiscard(session)}
+                        onClick={() => setConfirmDiscard(session)}
                       >
                         丢弃会话
                       </Button>
@@ -205,7 +260,7 @@ export function HomeView() {
                 <Button size="sm" variant="ghost" icon="refresh" onClick={() => void refreshRecents()}>
                   刷新
                 </Button>
-                <Button size="sm" variant="ghost" icon="folder" onClick={() => void openProject()}>
+                <Button size="sm" variant="ghost" icon="folder" onClick={() => void doOpen()}>
                   打开工程…
                 </Button>
               </>
@@ -215,53 +270,66 @@ export function HomeView() {
               <EmptyState
                 icon="editor"
                 title="还没有工程"
-                description="新建一次录制，或打开一个已有工程。"
-                actions={
-                  <Button variant="primary" size="sm" icon="record" onClick={() => setView('record')}>
-                    新建录制
-                  </Button>
-                }
+                description="使用上方「新建录制」开始，或打开一个已有工程。"
               />
             ) : (
               <div className="recent-list">
                 {recents.map((item) => (
-                  <div
-                    key={item.path}
-                    className="recent-item"
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => void handleOpen(item.path)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        void handleOpen(item.path);
-                      }
-                    }}
-                  >
-                    <div className="recent-thumb">
-                      {item.thumbnail ? (
-                        <img src={item.thumbnail} alt={`${item.name} 缩略图`} />
-                      ) : (
-                        <div className="recent-thumb-fallback">
-                          <Icon name="image" size={18} />
+                  // 外层是普通容器（不再 role="button"）：里面还有三个图标按钮，
+                  // 把按钮嵌在 role=button 里既不符合 ARIA，键盘语义也会打架。
+                  // 打开动作由内部真实 <button> 承担，占满缩略图 + 标题两列。
+                  <div key={item.path} className="recent-item">
+                    <button
+                      type="button"
+                      className="recent-open"
+                      aria-label={`打开工程 ${item.name}`}
+                      onClick={() => void handleOpen(item.path)}
+                      style={{
+                        gridColumn: '1 / 3',
+                        display: 'grid',
+                        gridTemplateColumns: '128px minmax(0, 1fr)',
+                        gap: 12,
+                        alignItems: 'center',
+                        padding: 0,
+                        border: 0,
+                        background: 'transparent',
+                        color: 'inherit',
+                        font: 'inherit',
+                        textAlign: 'left',
+                        cursor: 'pointer',
+                        minWidth: 0,
+                      }}
+                    >
+                      <div className="recent-thumb">
+                        {item.thumbnail ? (
+                          <img src={item.thumbnail} alt="" />
+                        ) : (
+                          <div className="recent-thumb-fallback">
+                            <Icon name="image" size={18} />
+                          </div>
+                        )}
+                      </div>
+                      <div className="recent-main">
+                        <div className="recent-name">{item.name}</div>
+                        <div className="recent-meta">
+                          <span>{formatClock(item.durationTicks)}</span>
+                          <span>·</span>
+                          <span>{formatRelativeTime(item.updatedAt)}</span>
+                          {item.missingMedia && <Badge tone="warn" icon="warning">素材缺失</Badge>}
+                          {item.recoverable && <Badge tone="warn" icon="refresh">可恢复</Badge>}
                         </div>
-                      )}
-                    </div>
-                    <div className="recent-main">
-                      <div className="recent-name">{item.name}</div>
-                      <div className="recent-meta">
-                        <span>{formatClock(item.durationTicks)}</span>
-                        <span>·</span>
-                        <span>{formatRelativeTime(item.updatedAt)}</span>
-                        {item.missingMedia && <Badge tone="warn" icon="warning">素材缺失</Badge>}
-                        {item.recoverable && <Badge tone="warn" icon="refresh">可恢复</Badge>}
+                        <div className="recent-path" title={item.path}>
+                          {item.path}
+                        </div>
                       </div>
-                      <div className="recent-path" title={item.path}>
-                        {item.path}
-                      </div>
-                    </div>
-                    <div className="recent-actions" onClick={(event) => event.stopPropagation()}>
-                      <IconButton icon="external" label="在资源管理器中显示" size="sm" onClick={() => void wcs().revealProject(item.path)} />
+                    </button>
+                    <div className="recent-actions">
+                      <IconButton
+                        icon="external"
+                        label="在资源管理器中显示"
+                        size="sm"
+                        onClick={() => void handleOpenFolder(item.path)}
+                      />
                       <IconButton
                         icon="close"
                         label="从最近列表移除（不删除文件）"
@@ -316,6 +384,67 @@ export function HomeView() {
           )}
         </div>
       </div>
+
+      {pendingOpen && (
+        <Modal
+          title="当前工程有未保存修改"
+          onClose={() => setPendingOpen(null)}
+          footer={
+            <>
+              <Button onClick={() => setPendingOpen(null)} disabled={saving}>
+                取消
+              </Button>
+              <Button
+                variant="ghost"
+                disabled={saving}
+                onClick={() => {
+                  const target = pendingOpen;
+                  setPendingOpen(null);
+                  void doOpen(target);
+                }}
+              >
+                放弃修改并打开
+              </Button>
+              <Button variant="primary" icon="save" loading={saving} onClick={() => void handleSaveThenOpen()}>
+                保存并打开
+              </Button>
+            </>
+          }
+        >
+          <p>继续打开另一个工程会丢弃当前工程里尚未保存的修改。</p>
+          <p style={{ marginTop: 8, color: 'var(--text-muted)' }}>
+            自动保存大约在停止编辑 2 秒后触发；如果刚改完就打开别的工程，仍可能丢失最后一次修改。
+          </p>
+        </Modal>
+      )}
+
+      {confirmDiscard && (
+        <Modal
+          title="丢弃未完成的录制会话？"
+          tone="danger"
+          onClose={() => setConfirmDiscard(null)}
+          footer={
+            <>
+              <Button onClick={() => setConfirmDiscard(null)} disabled={discarding !== null}>
+                取消
+              </Button>
+              <Button
+                variant="danger"
+                icon="trash"
+                loading={discarding === confirmDiscard.projectPath}
+                onClick={() => void handleDiscard(confirmDiscard)}
+              >
+                丢弃会话
+              </Button>
+            </>
+          }
+        >
+          <p>
+            将丢弃「<strong>{confirmDiscard.name}</strong>」的 {confirmDiscard.committedSegments} 个已提交分段，
+            临时素材会在后台清理。该操作不可撤销。
+          </p>
+        </Modal>
+      )}
 
       {confirmDelete && (
         <Modal

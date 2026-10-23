@@ -106,7 +106,7 @@ export function rebuildFromJournal(
   const sessionId = ordered.find((e) => e.type === 'session-start')?.sessionId ?? ordered[0]?.sessionId ?? null;
   const completed = ordered.some((e) => e.type === 'complete');
   const stopEntry = [...ordered].reverse().find((e) => e.type === 'stop');
-  const endedDuringPause = lastEventType(ordered) === 'pause' || lastEventType(ordered) === 'segment-begin';
+  const endedDuringPause = crashOccurredDuringPause(ordered);
 
   // 2. 收集 begin / commit / corrupt，按段路径索引
   const begins = new Map<string, RecoveryJournalEntry>();
@@ -134,12 +134,20 @@ export function rebuildFromJournal(
   // 3. 判定每段是否有效
   const committed: RebuiltSegment[] = [];
   const discarded: { record: SegmentRecord; reason: string }[] = [];
+  const seenPaths = new Set<string>();
 
   for (const record of records) {
     if (!record || !record.path) {
       discarded.push({ record, reason: '段记录缺少路径' });
       continue;
     }
+    // 同一路径只应有一条段记录；清单合并/日志重放可能产生重复项，
+    // 重复计入已提交清单会让 toMediaRefs 生成两份相同素材引用。
+    if (seenPaths.has(record.path)) {
+      discarded.push({ record, reason: '同一路径的段记录重复出现' });
+      continue;
+    }
+    seenPaths.add(record.path);
     if (corrupts.has(record.path)) {
       discarded.push({ record, reason: 'journal 标记该段损坏（segment-corrupt）' });
       continue;
@@ -235,9 +243,20 @@ export function rebuildFromJournal(
   };
 }
 
-function lastEventType(entries: readonly RecoveryJournalEntry[]): RecoveryJournalEntry['type'] | null {
-  for (let i = entries.length - 1; i >= 0; i--) return entries[i].type;
-  return null;
+/**
+ * 崩溃是否发生在暂停期间：取最后一条 pause/resume 事件判断，
+ * 忽略 segment-begin / heartbeat 等与暂停无关的日志。
+ *
+ * 旧实现把「最后事件是 segment-begin」也当成暂停中崩溃，导致摘要错误地提示
+ * 「恢复后不补计时」——段写入中断与用户暂停是两回事。
+ */
+function crashOccurredDuringPause(entries: readonly RecoveryJournalEntry[]): boolean {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const type = entries[i].type;
+    if (type === 'pause') return true;
+    if (type === 'resume') return false;
+  }
+  return false;
 }
 
 /** 从 journal 的 stop/complete 条目中取会话媒体时长。 */

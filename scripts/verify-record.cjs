@@ -33,12 +33,13 @@ async function inspect(file) {
 
 (async () => {
   const resultPath = path.join(ROOT, 'dist', 'verify', 'record-result.json');
+  if (!fs.existsSync(resultPath)) throw new Error('缺少录制结果；请用 npm run verify:record 先运行真实录制探针');
   const result = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
   const projectPath = result.projectPath;
   const screenDir = path.join(projectPath, 'media', 'screen');
   const files = fs.readdirSync(screenDir).filter((f) => f.endsWith('.mp4')).sort();
 
-  const report = { projectPath, segments: [], ok: true };
+  const report = { projectPath, segments: [], ok: files.length > 0 };
   let totalDuration = 0;
   let totalPackets = 0;
   for (const name of files) {
@@ -78,4 +79,4 @@ async function inspect(file) {
   fs.writeFileSync(path.join(ROOT, 'dist', 'verify', 'record-verify.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
   process.exit(report.ok ? 0 : 1);
-})();
+})().catch((error) => { console.error('[record-verify]', error.message); process.exitCode = 1; });

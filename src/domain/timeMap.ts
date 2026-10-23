@@ -58,7 +58,10 @@ export class TimeMap {
     for (const seg of this.segments(kind)) {
       if (timelineTick >= seg.timeline.start && timelineTick < seg.timeline.end) {
         const offset = timelineTick - seg.timeline.start;
-        return { sourceTick: seg.source.start + Math.round(offset * (seg.clip.rate.num / seg.clip.rate.den)), clip: seg.clip };
+        const raw = seg.source.start + Math.round(offset * (seg.clip.rate.num / seg.clip.rate.den));
+        // 变速片段在整数 tick 上取整后可能正好落在 source.end（右开区间之外），
+        // 夹到 end-1 保证「命中片段」时一定返回片段内部的源时间。
+        return { sourceTick: Math.min(seg.source.end - 1, Math.max(seg.source.start, raw)), clip: seg.clip };
       }
     }
     return null;
@@ -71,8 +74,9 @@ export class TimeMap {
       if (seg.clip.assetId !== assetId) continue;
       if (sourceTick >= seg.source.start && sourceTick < seg.source.end) {
         const offset = sourceTick - seg.source.start;
+        const raw = seg.timeline.start + divideByRate(offset, seg.clip.rate);
         hits.push({
-          timelineTick: seg.timeline.start + divideByRate(offset, seg.clip.rate),
+          timelineTick: Math.min(seg.timeline.end - 1, Math.max(seg.timeline.start, raw)),
           clip: seg.clip,
         });
       }
@@ -91,10 +95,11 @@ export class TimeMap {
       const start = Math.max(sourceRange.start, seg.source.start);
       const end = Math.min(sourceRange.end, seg.source.end);
       if (end <= start) continue;
-      out.push({
-        start: seg.timeline.start + divideByRate(start - seg.source.start, seg.clip.rate),
-        end: seg.timeline.start + divideByRate(end - seg.source.start, seg.clip.rate),
-      });
+      const mappedStart = seg.timeline.start + divideByRate(start - seg.source.start, seg.clip.rate);
+      const mappedEnd = seg.timeline.start + divideByRate(end - seg.source.start, seg.clip.rate);
+      // 变速取整可能把极短源区间压成零长度；空区间不应出现在映射结果里。
+      if (mappedEnd <= mappedStart) continue;
+      out.push({ start: mappedStart, end: mappedEnd });
     }
     return out;
   }
@@ -106,10 +111,10 @@ export class TimeMap {
       const start = Math.max(timelineRange.start, seg.timeline.start);
       const end = Math.min(timelineRange.end, seg.timeline.end);
       if (end <= start) continue;
-      out.push({
-        start: seg.source.start + Math.round((start - seg.timeline.start) * (seg.clip.rate.num / seg.clip.rate.den)),
-        end: seg.source.start + Math.round((end - seg.timeline.start) * (seg.clip.rate.num / seg.clip.rate.den)),
-      });
+      const mappedStart = seg.source.start + Math.round((start - seg.timeline.start) * (seg.clip.rate.num / seg.clip.rate.den));
+      const mappedEnd = seg.source.start + Math.round((end - seg.timeline.start) * (seg.clip.rate.num / seg.clip.rate.den));
+      if (mappedEnd <= mappedStart) continue;
+      out.push({ start: mappedStart, end: mappedEnd });
     }
     return out;
   }

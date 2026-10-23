@@ -18,36 +18,16 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 
-export interface VideoFramePacket {
-  /** QPC 原始计数 */
-  qpc: bigint;
-  /** JPEG 字节 */
-  jpeg: Buffer;
-  /** 该帧到达的墙钟时刻（Date.now），仅用于诊断 */
-  receivedAt: number;
-}
+import {
+  AudioStreamDecoder,
+  FrameStreamDecoder,
+  type AudioErrorPacket,
+  type AudioPacket,
+  type VideoFramePacket,
+} from './wireProtocol';
 
-export interface AudioPacket {
-  /** 0 = 系统回环，1 = 麦克风 */
-  streamId: 0 | 1;
-  /** 48 kHz 时间轴上的帧序号（该流自身的序号，仅供调试） */
-  startFrame: number;
-  /** 均方根电平 0..1 */
-  rms: number;
-  /** 该块首采样的 QPC 原始计数 */
-  qpc: bigint;
-  /** 左声道 */
-  left: Float32Array;
-  /** 右声道 */
-  right: Float32Array;
-  receivedAt: number;
-}
-
-export interface AudioErrorPacket {
-  streamId: number;
-  code: string;
-  message: string;
-}
+export type { AudioErrorPacket, AudioPacket, VideoFramePacket } from './wireProtocol';
+export { MAX_AUDIO_PACKET_BYTES, MAX_VIDEO_FRAME_BYTES } from './wireProtocol';
 
 export interface GrabberOptions {
   width: number;
@@ -69,16 +49,88 @@ export interface WorkerPaths {
   audioExe: string;
 }
 
+/** 便于单测注入假的 ChildProcess（生产代码直接用 node:child_process 的 spawn）。 */
+export type SpawnFn = typeof spawn;
+
 type FrameListener = (frame: VideoFramePacket) => void;
 type AudioListener = (packet: AudioPacket) => void;
 type AudioErrorListener = (error: AudioErrorPacket) => void;
 type ExitListener = (reason: { code: number | null; signal: string | null; stderr: string }) => void;
 
+/**
+ * 给子进程的三条管道挂上空 error 监听。
+ *
+ * 为什么必须挂：父进程写 stdin 时如果子进程已经退出，管道会异步发 'error'（EPIPE）；
+ * Node 对没有 error 监听的流会直接抛未捕获异常 —— 整个主进程崩溃。
+ * 这在实际场景里很常见：grabber 启动失败/被杀死后引擎仍会尝试发退出命令。
+ */
+function guardStreamErrors(child: ChildProcess): void {
+  for (const stream of [child.stdin, child.stdout, child.stderr]) {
+    stream?.on('error', () => {
+      // 管道另一端已消失，由 exit/close 路径负责收尾
+    });
+  }
+}
+
+/** 把 stderr 文本解析成启动状态。必须基于「累计文本」，否则一行被管道分块截断时永远匹配不到。 */
+class StderrParser {
+  private text = '';
+  private ready = false;
+  private frequencySeen = false;
+  private fatalSeen = false;
+  private frequency: bigint | null = null;
+
+  constructor(
+    private readonly onReady: () => void,
+    private readonly onFatal: (reason: string) => void,
+    private readonly fatalPattern: RegExp = /ARGS_ERROR|NO_JPEG_ENCODER|BITMAP_ERROR/,
+  ) {}
+
+  push(chunk: Buffer): void {
+    this.text += chunk.toString('utf8');
+    // 保留最后 8KB，避免长时录制无限增长
+    if (this.text.length > 8192) this.text = this.text.slice(-8192);
+
+    if (!this.frequencySeen) {
+      const match = /QPCFREQ (\d+)/.exec(this.text);
+      if (match) {
+        this.frequency = BigInt(match[1]);
+        this.frequencySeen = true;
+      }
+    }
+    if (!this.ready && /(?:^|[\r\n])READY(?:\s|$)/.test(this.text)) {
+      this.ready = true;
+      this.onReady();
+    }
+    if (!this.fatalSeen && this.fatalPattern.test(this.text)) {
+      this.fatalSeen = true;
+      this.onFatal(this.text.trim());
+    }
+  }
+
+  get sawReady(): boolean {
+    return this.ready;
+  }
+
+  get qpcFrequency(): bigint | null {
+    return this.frequency;
+  }
+
+  get raw(): string {
+    return this.text;
+  }
+
+  /** 追加内部诊断错误（协议失步等），并计入 stderrText 供失败原因展示。 */
+  appendError(message: string): void {
+    this.text = `${this.text}\n${message}`.slice(-8192);
+  }
+}
+
 /** GDI 采集进程封装。 */
 export class GrabberWorker {
   private child: ChildProcess | null = null;
-  private acc = Buffer.alloc(0);
-  private stderrText = '';
+  private decoder = new FrameStreamDecoder();
+  private parser: StderrParser;
   private frameListeners = new Set<FrameListener>();
   private exitListeners = new Set<ExitListener>();
   private qpcFrequency = 10_000_000n;
@@ -86,12 +138,20 @@ export class GrabberWorker {
   private readyPromise: Promise<void> | null = null;
   private resolveReady: (() => void) | null = null;
   private rejectReady: ((error: Error) => void) | null = null;
+  private readySettled = false;
   private framesEmitted = 0;
+  private stdoutEnded: Promise<void> | null = null;
 
   constructor(
     private readonly exePath: string,
     private readonly options: GrabberOptions,
-  ) {}
+    private readonly spawnImpl: SpawnFn = spawn,
+  ) {
+    this.parser = new StderrParser(
+      () => this.markReady(),
+      (reason) => this.failStart(new Error(`采集进程启动失败：${reason}`)),
+    );
+  }
 
   get frequency(): bigint {
     return this.qpcFrequency;
@@ -102,7 +162,7 @@ export class GrabberWorker {
   }
 
   get stderr(): string {
-    return this.stderrText;
+    return this.parser.raw;
   }
 
   start(): Promise<void> {
@@ -113,56 +173,34 @@ export class GrabberWorker {
     });
 
     const { width, height, offsetX, offsetY, quality, fps } = this.options;
-    const child = spawn(
+    const child = this.spawnImpl(
       this.exePath,
       [String(width), String(height), String(offsetX), String(offsetY), String(quality), String(fps)],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true },
     );
     this.child = child;
+    guardStreamErrors(child);
+
+    // stdout 排空信号必须在创建时就挂好：进程可能在 stop() 之前就退出，
+    // 若等到 stop() 才去听 'end'，已结束的流不会再触发，尾部帧就丢了。
+    this.stdoutEnded = new Promise<void>((resolve) => {
+      const out = child.stdout;
+      if (!out || out.readableEnded) {
+        resolve();
+        return;
+      }
+      out.once('end', resolve);
+      out.once('close', resolve);
+    });
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
-      this.stderrText += text;
-      // 保留最后 8KB，避免长时录制无限增长
-      if (this.stderrText.length > 8192) this.stderrText = this.stderrText.slice(-8192);
-      const freqMatch = /QPCFREQ (\d+)/.exec(text);
-      if (freqMatch) this.qpcFrequency = BigInt(freqMatch[1]);
-      if (text.includes('READY')) this.resolveReady?.();
-      if (text.includes('ARGS_ERROR') || text.includes('NO_JPEG_ENCODER') || text.includes('BITMAP_ERROR')) {
-        this.rejectReady?.(new Error('采集进程启动失败：' + text.trim()));
-      }
+      this.parser.push(chunk);
+      this.qpcFrequency = this.parser.qpcFrequency ?? this.qpcFrequency;
     });
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      // 缓冲拼接：避免 Buffer.concat + subarray 造成的内存滞留。
-      //
-      // 旧实现有两个问题：
-      //  1. 每个 chunk 都 Buffer.concat 重新分配整个累积缓冲，
-      //     1080p 每帧约 200KB、30fps，一秒就是 6MB 的反复拷贝；
-      //  2. 用 subarray 切走已消费部分后，剩余视图仍引用原来那个大 Buffer，
-      //     V8 无法回收，录制越久滞留越多 ——
-      //     实测主进程内存随录制时长线性增长（0s:426MB → 30s:1853MB）。
-      //
-      // 现在改为：一次只处理 chunk 内的完整帧，剩余不完整部分
-      // 拷贝成新的小缓冲（不引用原 chunk），消费完即释放。
-      let buf = this.acc.length === 0 ? chunk : Buffer.concat([this.acc, chunk]);
-
-      while (buf.length >= 12) {
-        const length = buf.readUInt32LE(0);
-        if (length === 0 || length > 64 * 1024 * 1024) {
-          // 长度异常：重置缓冲，避免死循环
-          buf = Buffer.alloc(0);
-          break;
-        }
-        if (buf.length < 12 + length) break;
-        const qpc = buf.readBigInt64LE(4);
-        const frame: VideoFramePacket = {
-          qpc,
-          // 必须拷贝一份独立的 Buffer，不能直接引用 buf 的视图
-          jpeg: Buffer.from(buf.subarray(12, 12 + length)),
-          receivedAt: Date.now(),
-        };
-        buf = buf.subarray(12 + length);
+      const { frames, error } = this.decoder.push(chunk);
+      for (const frame of frames) {
         this.framesEmitted += 1;
         for (const listener of this.frameListeners) {
           try {
@@ -172,16 +210,19 @@ export class GrabberWorker {
           }
         }
       }
-
-      // 剩下的不完整数据拷贝出来，断开与原 chunk 的引用关系
-      this.acc = buf.length > 0 ? Buffer.from(buf) : Buffer.alloc(0);
+      if (error) {
+        // 协议失步：长度前缀没有同步标记，继续读只会产出错位帧。
+        // 标记原因并杀掉子进程，由 exit 事件把「源故障」上报给引擎（状态迁移到 RecoverableFailure）。
+        this.parser.appendError(`PROTOCOL_ERROR ${error}`);
+        this.killChild();
+      }
     });
 
     child.on('exit', (code, signal) => {
       this.child = null;
-      const reason = { code, signal, stderr: this.stderrText };
-      this.rejectReady?.(new Error(`采集进程退出（code=${code}）`));
+      this.failStart(new Error(`采集进程退出（code=${code}）`));
       if (!this.stopping) {
+        const reason = { code, signal, stderr: this.parser.raw };
         for (const listener of this.exitListeners) {
           try {
             listener(reason);
@@ -193,12 +234,13 @@ export class GrabberWorker {
     });
 
     child.on('error', (error) => {
-      this.rejectReady?.(error instanceof Error ? error : new Error(String(error)));
+      this.failStart(error instanceof Error ? error : new Error(String(error)));
     });
 
-    // 兜底：3 秒内没收到 READY 视为启动失败
+    // 兜底：3 秒内没收到 READY 视为启动失败（并杀掉可能已经半启动的进程，
+    // 否则它会一直抓屏/占用 GDI 资源，成为孤儿进程）
     const timer = setTimeout(() => {
-      this.rejectReady?.(new Error('采集进程启动超时（3 秒内未就绪）'));
+      this.failStart(new Error('采集进程启动超时（3 秒内未就绪）'));
     }, 3000);
     void this.readyPromise.then(
       () => clearTimeout(timer),
@@ -206,6 +248,35 @@ export class GrabberWorker {
     );
 
     return this.readyPromise;
+  }
+
+  private markReady(): void {
+    if (this.readySettled) return;
+    this.readySettled = true;
+    this.resolveReady?.();
+  }
+
+  private failStart(error: Error): void {
+    if (this.readySettled) return;
+    this.readySettled = true;
+    this.rejectReady?.(error);
+    this.killChild();
+  }
+
+  private killChild(): void {
+    const child = this.child;
+    if (!child) return;
+    try {
+      if (child.exitCode === null) child.kill();
+    } catch {
+      // 忽略
+    }
+  }
+
+  /** 等 stdout 真正排空（写端关闭且数据读完），或短暂超时。 */
+  private async waitStdoutDrained(timeoutMs: number): Promise<void> {
+    if (!this.stdoutEnded) return;
+    await Promise.race([this.stdoutEnded, new Promise<void>((resolve) => setTimeout(resolve, timeoutMs))]);
   }
 
   onFrame(listener: FrameListener): () => void {
@@ -218,66 +289,50 @@ export class GrabberWorker {
     return () => this.exitListeners.delete(listener);
   }
 
-  /** 优雅停止；超时后强杀。 */
+  /** 优雅停止；超时后强杀。返回时 stdout 已排空（剩余帧已回调）。 */
   async stop(timeoutMs = 1500): Promise<void> {
+    if (this.stopping) {
+      // 重复 stop：等同一个排空信号即可
+      await this.waitStdoutDrained(800);
+      return;
+    }
     this.stopping = true;
     const child = this.child;
-    if (!child) return;
-    try {
-      child.stdin?.write('q\n');
-    } catch {
-      // 管道可能已关闭
-    }
-    const exited = await new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => resolve(false), timeoutMs);
-      child.once('exit', () => {
-        clearTimeout(timer);
-        resolve(true);
-      });
-    });
-    if (!exited) {
+    if (child) {
       try {
-        child.kill();
+        child.stdin?.write('q\n');
       } catch {
-        // 忽略
+        // 管道可能已关闭
       }
+      const exited = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), timeoutMs);
+        child.once('exit', () => {
+          clearTimeout(timer);
+          resolve(true);
+        });
+        if (child.exitCode !== null) {
+          clearTimeout(timer);
+          resolve(true);
+        }
+      });
+      if (!exited) this.killChild();
     }
 
-    // 等 stdout 真正排空。
-    //
     // 进程 exit 事件只代表采集端停止运行，此时管道里可能还有已写入、
     // 尚未被本进程读取的帧数据（管道缓冲通常能存 2~4 秒的量）。
-    // 如果这时就开始切最后一段，这些帧会被整段丢掉 ——
-    // 实测 20 秒录制只成片 18 秒，正好少一个分段窗口。
-    //
     // 这里等 stdout 的 'end'/'close'（写端关闭且数据读完）或短暂超时，
-    // 确保 this.frames 里是完整的全部帧。
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 800);
-      if (!child.stdout || child.stdout.readableEnded) {
-        clearTimeout(timer);
-        resolve();
-        return;
-      }
-      child.stdout.once('end', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      child.stdout.once('close', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
-
+    // 确保引擎 this.frames 里是完整的全部帧。
+    await this.waitStdoutDrained(800);
     this.child = null;
+    this.decoder.reset();
   }
 }
 
 /** WASAPI 双路音频采集进程封装。 */
 export class AudioWorker {
   private child: ChildProcess | null = null;
-  private acc = Buffer.alloc(0);
-  private stderrText = '';
+  private decoder = new AudioStreamDecoder();
+  private parser: StderrParser;
   private audioListeners = new Set<AudioListener>();
   private errorListeners = new Set<AudioErrorListener>();
   private exitListeners = new Set<ExitListener>();
@@ -286,18 +341,30 @@ export class AudioWorker {
   private readyPromise: Promise<void> | null = null;
   private resolveReady: (() => void) | null = null;
   private rejectReady: ((error: Error) => void) | null = null;
+  private readySettled = false;
+  /** stdout 排空信号：与 GrabberWorker 同理，尾部音频包必须读完再收尾。 */
+  private stdoutEnded: Promise<void> | null = null;
 
   constructor(
     private readonly exePath: string,
     private readonly options: AudioOptions,
-  ) {}
+    private readonly spawnImpl: SpawnFn = spawn,
+  ) {
+    // 音频进程的设备错误以数据包形式上报，stderr 只用来等 READY。
+    // 这里仍复用同一个解析器（fatalPattern 换成永不匹配，避免把日志里的设备名误判为启动失败）。
+    this.parser = new StderrParser(
+      () => this.markReady(),
+      () => {},
+      /$^/,
+    );
+  }
 
   get frequency(): bigint {
     return this.qpcFrequency;
   }
 
   get stderr(): string {
-    return this.stderrText;
+    return this.parser.raw;
   }
 
   start(): Promise<void> {
@@ -312,86 +379,58 @@ export class AudioWorker {
     if (!this.options.enableMic) args.push('--no-mic');
     if (this.options.enableMic && this.options.micDeviceId) args.push('--mic', this.options.micDeviceId);
 
-    const child = spawn(this.exePath, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const child = this.spawnImpl(this.exePath, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     this.child = child;
+    guardStreamErrors(child);
+
+    // 必须现在挂好排空信号：进程可能在 stop() 之前退出，
+    // 那时再去听 'end' 不会触发，尾部音频包就永远读不到了。
+    this.stdoutEnded = new Promise<void>((resolve) => {
+      const out = child.stdout;
+      if (!out || out.readableEnded) {
+        resolve();
+        return;
+      }
+      out.once('end', resolve);
+      out.once('close', resolve);
+    });
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
-      this.stderrText += text;
-      if (this.stderrText.length > 8192) this.stderrText = this.stderrText.slice(-8192);
-      const freqMatch = /QPCFREQ (\d+)/.exec(text);
-      if (freqMatch) this.qpcFrequency = BigInt(freqMatch[1]);
-      if (text.includes('READY')) this.resolveReady?.();
+      this.parser.push(chunk);
+      this.qpcFrequency = this.parser.qpcFrequency ?? this.qpcFrequency;
     });
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      this.acc = this.acc.length === 0 ? Buffer.from(chunk) : Buffer.concat([this.acc, chunk]);
-      while (this.acc.length >= 4) {
-        const total = this.acc.readUInt32LE(0);
-        if (total < 24 || total > 8 * 1024 * 1024) {
-          this.acc = Buffer.alloc(0);
-          break;
-        }
-        if (this.acc.length < total) break;
-        const packet = this.acc.subarray(0, total);
-        this.acc = this.acc.subarray(total);
-
-        const streamId = packet.readUInt32LE(4);
-        if (streamId === 0xffffffff) {
-          const codeLen = packet.readUInt32LE(12);
-          const msgLen = packet.readUInt32LE(16);
-          const error: AudioErrorPacket = {
-            streamId: packet.readUInt32LE(8),
-            code: packet.subarray(20, 20 + codeLen).toString('utf8'),
-            message: packet.subarray(20 + codeLen, 20 + codeLen + msgLen).toString('utf8'),
-          };
-          for (const listener of this.errorListeners) {
-            try {
-              listener(error);
-            } catch {
-              // 忽略
-            }
-          }
-          continue;
-        }
-
-        if (streamId !== 0 && streamId !== 1) continue;
-        const startFrame = packet.readInt32LE(8);
-        const rms = packet.readFloatLE(12);
-        const qpc = packet.readBigInt64LE(16);
-        const frames = (total - 24) / 8;
-        if (!Number.isInteger(frames) || frames <= 0) continue;
-        const left = new Float32Array(frames);
-        const right = new Float32Array(frames);
-        const dataStart = 24;
-        for (let i = 0; i < frames; i++) left[i] = packet.readFloatLE(dataStart + i * 4);
-        const rightStart = dataStart + frames * 4;
-        for (let i = 0; i < frames; i++) right[i] = packet.readFloatLE(rightStart + i * 4);
-
-        const audio: AudioPacket = {
-          streamId: streamId as 0 | 1,
-          startFrame,
-          rms,
-          qpc,
-          left,
-          right,
-          receivedAt: Date.now(),
-        };
+      const { packets, errors, error } = this.decoder.push(chunk);
+      for (const packet of packets) {
         for (const listener of this.audioListeners) {
           try {
-            listener(audio);
+            listener(packet);
           } catch {
             // 忽略
           }
         }
       }
+      for (const packet of errors) {
+        for (const listener of this.errorListeners) {
+          try {
+            listener(packet);
+          } catch {
+            // 忽略
+          }
+        }
+      }
+      if (error) {
+        this.parser.appendError(`PROTOCOL_ERROR ${error}`);
+        this.killChild();
+      }
     });
 
     child.on('exit', (code, signal) => {
       this.child = null;
-      const reason = { code, signal, stderr: this.stderrText };
-      this.rejectReady?.(new Error(`音频进程退出（code=${code}）`));
+      this.failStart(new Error(`音频进程退出（code=${code}）`));
       if (!this.stopping) {
+        const reason = { code, signal, stderr: this.parser.raw };
         for (const listener of this.exitListeners) {
           try {
             listener(reason);
@@ -403,11 +442,11 @@ export class AudioWorker {
     });
 
     child.on('error', (error) => {
-      this.rejectReady?.(error instanceof Error ? error : new Error(String(error)));
+      this.failStart(error instanceof Error ? error : new Error(String(error)));
     });
 
     const timer = setTimeout(() => {
-      this.rejectReady?.(new Error('音频进程启动超时（3 秒内未就绪）'));
+      this.failStart(new Error('音频进程启动超时（3 秒内未就绪）'));
     }, 3000);
     void this.readyPromise.then(
       () => clearTimeout(timer),
@@ -415,6 +454,29 @@ export class AudioWorker {
     );
 
     return this.readyPromise;
+  }
+
+  private markReady(): void {
+    if (this.readySettled) return;
+    this.readySettled = true;
+    this.resolveReady?.();
+  }
+
+  private failStart(error: Error): void {
+    if (this.readySettled) return;
+    this.readySettled = true;
+    this.rejectReady?.(error);
+    this.killChild();
+  }
+
+  private killChild(): void {
+    const child = this.child;
+    if (!child) return;
+    try {
+      if (child.exitCode === null) child.kill();
+    } catch {
+      // 忽略
+    }
   }
 
   onAudio(listener: AudioListener): () => void {
@@ -432,10 +494,19 @@ export class AudioWorker {
     return () => this.exitListeners.delete(listener);
   }
 
+  /** 等 stdout 真正排空（写端关闭且数据读完），或短暂超时。 */
+  private async waitStdoutDrained(timeoutMs: number): Promise<void> {
+    if (!this.stdoutEnded) return;
+    await Promise.race([this.stdoutEnded, new Promise<void>((resolve) => setTimeout(resolve, timeoutMs))]);
+  }
+
   async stop(timeoutMs = 1500): Promise<void> {
     this.stopping = true;
     const child = this.child;
-    if (!child) return;
+    if (!child) {
+      this.decoder.reset();
+      return;
+    }
     try {
       child.stdin?.write('q\n');
     } catch {
@@ -447,15 +518,18 @@ export class AudioWorker {
         clearTimeout(timer);
         resolve(true);
       });
-    });
-    if (!exited) {
-      try {
-        child.kill();
-      } catch {
-        // 忽略
+      if (child.exitCode !== null) {
+        clearTimeout(timer);
+        resolve(true);
       }
-    }
+    });
+    if (!exited) this.killChild();
+    // 与 GrabberWorker 一致：exit 只代表进程停止运行，管道里可能还有已写入
+    // 未读走的音频包。不等排空就 reset 解码器，最后一段音频会被丢弃，
+    // writeWav 只能按声明时长补 0，成片尾部出现「掉音」。
+    await this.waitStdoutDrained(800);
     this.child = null;
+    this.decoder.reset();
   }
 }
 
@@ -464,7 +538,13 @@ export function listAudioDevices(exePath: string): Promise<
   { deviceId: string; label: string; kind: 'audioinput' | 'audiooutput'; isDefault: boolean }[]
 > {
   return new Promise((resolve) => {
-    const child = spawn(exePath, ['--list-devices'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let child: ChildProcess;
+    try {
+      child = spawn(exePath, ['--list-devices'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    } catch {
+      resolve([]);
+      return;
+    }
     let out = '';
     let err = '';
     child.stdout?.on('data', (c: Buffer) => (out += c.toString('utf8')));

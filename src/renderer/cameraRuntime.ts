@@ -87,10 +87,34 @@ async function listDevices(): Promise<CameraDeviceInfo[]> {
 }
 
 /**
+ * 等第一帧真正到达，否则第一段会编码出黑帧。
+ * 超时/失败都要清掉事件处理器，避免下一次 open 时旧 handler 还在。
+ */
+async function waitForFirstFrame(videoEl: HTMLVideoElement, timeoutMs = 3000): Promise<void> {
+  if (videoEl.readyState >= 2) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      videoEl.onloadeddata = null;
+      resolve();
+    };
+    const timer = window.setTimeout(finish, timeoutMs);
+    videoEl.onloadeddata = finish;
+  });
+}
+
+/**
  * 打开摄像头。
  *
  * 优先用调用方指定的 deviceId；指定失败时退回默认设备（用户可能拔了设备）。
  * 失败一律返回 reason，不抛异常——调用方要能继续录制。
+ *
+ * 每个失败分支都必须先把已拿到的 MediaStream 停掉：
+ * 旧实现里 getUserMedia 成功但 video.play() 失败时直接进入下一轮重试，
+ * 上一个流既没 stop 也没断开，摄像头指示灯一直亮着、设备被永久占用。
  */
 async function open(deviceId?: string): Promise<{ ok: boolean; deviceId?: string; label?: string; error?: string }> {
   await close();
@@ -116,24 +140,15 @@ async function open(deviceId?: string): Promise<{ ok: boolean; deviceId?: string
       stream = media;
       videoEl.srcObject = media;
       await videoEl.play();
-      // 等第一帧真正到达，否则第一段会编码出黑帧
-      await new Promise<void>((resolve) => {
-        if (videoEl.readyState >= 2) {
-          resolve();
-          return;
-        }
-        const timer = setTimeout(resolve, 3000);
-        videoEl.onloadeddata = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-      });
+      await waitForFirstFrame(videoEl);
       const track = media.getVideoTracks()[0];
       activeDeviceId = track?.getSettings().deviceId ?? deviceId ?? null;
       const label = track?.label ?? '';
       return { ok: true, deviceId: activeDeviceId ?? undefined, label };
     } catch (error) {
       lastError = String(error instanceof Error ? error.message : error);
+      // 释放本轮可能已经拿到的流（play() 失败时 getUserMedia 已成功）
+      await close();
       // NotAllowedError 说明是权限问题，换约束重试也没用
       if (lastError.includes('NotAllowed') || lastError.includes('Permission')) break;
     }
@@ -206,13 +221,23 @@ function drawFrame(width: number, height: number): boolean {
   return true;
 }
 
+/** 摄像头分段是否正在编码（协调器本来串行 await，这里再防一次重入）。 */
+let encoding = false;
+
 /**
  * 编码一个摄像头分段。
  *
- * 时间语义与 recorderRuntime 完全一致：第 i 帧的时间戳 = i/fps 秒，
+ * 时间语义与 recorderRuntime 完全一致：第 i 帧的时间戳 = i × (1/fps)，
  * 段内从 0 开始，保证各段可独立解码、可顺序拼接。
+ * 时间戳用整数微秒累加（不是每帧重算 i/fps 再取整），
+ * 否则每段会多出约 5.3ms，30 段累计 160ms，超出「音画偏差 ≤80ms」。
  */
 async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegmentResult> {
+  if (encoding) {
+    return { ok: false, error: '上一段摄像头编码尚未完成，跳过该段' };
+  }
+  encoding = true;
+  let encoder: SegmentEncoder | null = null;
   try {
     if (!isReady()) {
       return { ok: false, error: '摄像头未就绪，跳过该段' };
@@ -221,7 +246,7 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
     const width = request.width > 0 ? request.width : 1280;
     const height = request.height > 0 ? request.height : 720;
 
-    const encoder = new SegmentEncoder({
+    encoder = new SegmentEncoder({
       width,
       height,
       fps,
@@ -240,19 +265,21 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
     const drawContext = encoder.drawContext;
 
     const targetFrames = Math.max(1, Math.round((request.durationTicks / 10_000_000) * fps));
+    const frameStepUs = Math.round(1_000_000 / fps);
     let written = 0;
     for (let i = 0; i < targetFrames; i++) {
       if (!drawFrame(width, height)) break;
       drawContext.drawImage(canvas as unknown as CanvasImageSource, 0, 0, width, height);
-      await encoder.commitVideoFrame(Math.round((i / fps) * 1_000_000));
+      await encoder.commitVideoFrame(i * frameStepUs);
       written++;
       // 摄像头是实时源，帧间留一点时间让 video 元素刷新到下一帧，
-      // 否则一段里会编码出同一帧的多个副本（看起来像卡住）
+      // 否则一段里会编码出同一帧的多个副本（看起来像卡住）。
+      // 注意：这使摄像头段的采集耗时≈段时长，必须由协调器与屏幕编码并行，
+      // 不能串行 await（见 cameraCapture.ts / captureEngine.ts 的跨范围说明）。
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.floor(1000 / fps) - 2)));
     }
 
     if (written === 0) {
-      await encoder.abort();
       return { ok: false, error: '该段没有取到任何摄像头帧' };
     }
 
@@ -275,6 +302,15 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
     };
   } catch (error) {
     return { ok: false, error: String(error instanceof Error ? (error.stack ?? error.message) : error) };
+  } finally {
+    encoding = false;
+    // 每段都新建编码器（硬件 VideoEncoder + OffscreenCanvas 后备存储），
+    // 成功与失败都必须释放；旧实现只在 finalize 成功后靠 GC，连续失败会线性涨内存。
+    try {
+      encoder?.dispose();
+    } catch {
+      // 忽略
+    }
   }
 }
 

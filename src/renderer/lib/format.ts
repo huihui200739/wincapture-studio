@@ -116,6 +116,45 @@ export function describeError(input: unknown): PresentedError {
   };
 }
 
+/**
+ * 从 IPC 响应取值；`ok:true` 但 data 为空时返回 null。
+ *
+ * 用于「用户取消对话框」这类**合法的空结果**（主进程返回 ok(null)，
+ * 例如打开工程/选择保存路径的取消分支）。用 unwrap 会得到 null 再解引用报错，
+ * 用 unwrapOptional 调用方可以明确区分「取消」与「失败」。
+ */
+export function unwrapOptional<T>(response: IpcResponse<T> | undefined | null): T | null {
+  if (!response) {
+    throw new AppError({
+      code: 'E_UNKNOWN',
+      message: '主进程没有返回结果，请重试。',
+      retryable: true,
+      preservedData: true,
+    });
+  }
+  if (!response.ok) {
+    const shape = response.error;
+    throw new AppError({
+      code: shape && isAppErrorShape(shape) ? shape.code : 'E_UNKNOWN',
+      message: shape?.message?.trim() || '操作没有完成，请重试。',
+      retryable: shape?.retryable ?? true,
+      preservedData: shape?.preservedData ?? true,
+      detail: (shape as { detail?: string } | undefined)?.detail,
+    });
+  }
+  return response.data ?? null;
+}
+
+/**
+ * 是否是「用户主动取消」。
+ *
+ * 主进程对取消的统一约定是 `E_EXPORT_CANCELLED`（打开/删除/选择路径等对话框都复用），
+ * 这类结果不应该显示成「失败」，也不应该显示成「成功」。界面应据此静默或提示「已取消」。
+ */
+export function isCancelledError(error: unknown): boolean {
+  return describeError(error).code === 'E_EXPORT_CANCELLED';
+}
+
 /** 从 IPC 响应取值；失败时抛出带中文信息的 AppError。 */
 export function unwrap<T>(response: IpcResponse<T> | undefined | null): T {
   if (!response) {

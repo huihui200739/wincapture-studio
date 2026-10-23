@@ -490,3 +490,43 @@ describe('outputSizeForAspect 与 exportPlan 一致', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 回归：非法时长/帧区间边界
+// ---------------------------------------------------------------------------
+
+describe('回归：非法片段速率不污染导出计划', () => {
+  it('主轨片段速率为 0 时时长与总帧数仍为有限值', () => {
+    const project = baseProject();
+    project.tracks.find((t) => t.kind === 'primaryVideo')!.clips[0].rate = { num: 0, den: 1 };
+    const plan = buildExportPlan(project, { fps: { num: 30, den: 1 } });
+    expect(Number.isFinite(plan.durationTicks)).toBe(true);
+    expect(plan.durationTicks).toBe(0);
+    expect(plan.totalFrames).toBe(0);
+    for (const segment of plan.segments) {
+      expect(Number.isFinite(segment.frameStart)).toBe(true);
+      expect(segment.frameStart).toBeLessThanOrEqual(plan.totalFrames);
+      expect(segment.frameEnd).toBeLessThanOrEqual(plan.totalFrames);
+    }
+  });
+});
+
+describe('回归：输出时长之外的片段帧区间被夹紧', () => {
+  it('frameStart 不会超过 totalFrames', () => {
+    const project = baseProject();
+    const camera = project.tracks.find((t) => t.kind === 'camera')!;
+    camera.clips[0].timelineInTicks = 20 * S; // 摄像头轨比主轨（10s）长
+    camera.clips[0].sourceDurationTicks = 10 * S;
+    const plan = buildExportPlan(project, { fps: { num: 30, den: 1 } });
+    expect(plan.totalFrames).toBe(300);
+    const cameraSegment = plan.segments.find((s) => s.track === 'camera')!;
+    expect(cameraSegment.frameStart).toBe(plan.totalFrames);
+    expect(cameraSegment.frameEnd).toBe(plan.totalFrames);
+  });
+
+  it('frameTickAt 对 NaN/Infinity 帧序号返回 0', () => {
+    const plan = buildExportPlan(baseProject());
+    expect(frameTickAt(plan, NaN)).toBe(0);
+    expect(frameTickAt(plan, Infinity)).toBe(0);
+  });
+});

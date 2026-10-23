@@ -133,9 +133,14 @@ export function makeRational(num: number, den: number): Rational {
   if (!Number.isFinite(num) || !Number.isFinite(den) || den === 0) {
     throw new Error(`非法有理数 ${num}/${den}`);
   }
-  const sign = den < 0 ? -1 : 1;
-  const g = gcd(num, den);
-  return { num: (sign * Math.round(num)) / g, den: Math.round(Math.abs(den)) / g };
+  // 先对分子分母取整，再用同一组整数约分：旧实现用四舍五入后的值算 gcd、
+  // 却用原始值算分子，导致 0.5/0.25 这类输入在舍入后产出 den=0 的非法有理数。
+  const n = Math.round(num);
+  const d = Math.round(den);
+  if (d === 0) throw new Error(`非法有理数 ${num}/${den}（分母舍入后为 0）`);
+  const sign = d < 0 ? -1 : 1;
+  const g = gcd(n, d);
+  return { num: (sign * n) / g, den: Math.abs(d) / g };
 }
 
 export const ONE = Object.freeze({ num: 1, den: 1 }) as Rational;
@@ -183,7 +188,10 @@ export function frameIndexToTicks(index: number, fps: FrameRate): Ticks {
 
 /** 覆盖时长所需的输出总帧数，向上取整（§11.4 总帧数统一取整）。 */
 export function ticksToFrameCount(duration: Ticks, fps: FrameRate): number {
-  if (duration <= 0) return 0;
+  // 非法输入（NaN/Infinity/非法帧率）必须归零：导出计划的总帧数一旦是 NaN，
+  // 帧循环与进度计算都会失效，且 JSON 序列化后变成 null。
+  if (!Number.isFinite(duration) || duration <= 0) return 0;
+  if (!Number.isFinite(fps?.num) || !Number.isFinite(fps?.den) || fps.num <= 0 || fps.den <= 0) return 0;
   return Math.ceil((duration * fps.num) / (fps.den * TICKS_PER_SECOND));
 }
 

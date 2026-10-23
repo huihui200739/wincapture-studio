@@ -208,6 +208,9 @@ export function planAutoZoom(
       const prev = effects.at(-1);
       if (prev) {
         prev.range.end = Math.max(prev.range.end, end);
+        // 延长后必须同步推进 lastEnd，否则后续镜头仍按旧结束时间判断间隔，
+        // 会生成相互重叠的自动镜头（minGapTicks 失效）。
+        lastEnd = prev.range.end;
         return;
       }
     }
@@ -233,19 +236,22 @@ export function planAutoZoom(
 
   for (const cluster of clusters) pushEffect(cluster);
 
-  // 3. 长停留且无点击的区域补一个轻量镜头
+  // 3. 长停留且无点击的区域补一个轻量镜头。
+  // 焦点必须用停留位置本身：旧实现固定 0.5/0.5，用户在左上角长时间操作，
+  // 成片却把画面正中心放大，等于镜头对准了没内容的地方。
   for (const region of dwell) {
     const overlaps = effects.some((e) => e.range.start < region.end && region.start < e.range.end);
     if (overlaps) continue;
     if (effects.some((e) => Math.abs(e.range.start - region.start) < opt.minGapTicks)) continue;
+    const focus = clampFocus(region.x, region.y, opt.minScale);
     effects.push({
       id: `zoom-auto-d${effects.length + 1}`,
       kind: 'zoom',
-      range: region,
+      range: { start: region.start, end: region.end },
       parameters: {
         scale: opt.minScale,
-        focusX: 0.5,
-        focusY: 0.5,
+        focusX: focus.x,
+        focusY: focus.y,
         easeInTicks: opt.easeInTicks,
         easeOutTicks: opt.easeOutTicks,
         focusSource: 'pointer',
@@ -258,22 +264,41 @@ export function planAutoZoom(
   return effects.sort((a, b) => a.range.start - b.range.start);
 }
 
-/** 指针停留区域：约 2 秒内位移很小。 */
-function findDwellRegions(pointers: readonly PointerSample[], opt: ZoomPlannerOptions): TickRange[] {
+/** 指针停留区域：约 2 秒内位移很小。附带停留点的平均坐标，供镜头对焦。 */
+interface DwellRegion extends TickRange {
+  x: number;
+  y: number;
+}
+
+function findDwellRegions(pointers: readonly PointerSample[], opt: ZoomPlannerOptions): DwellRegion[] {
   const dwellMin = Math.max(secondsToTicks(2), opt.minHoldTicks * 2);
-  const out: TickRange[] = [];
+  const out: DwellRegion[] = [];
   if (pointers.length < 2) return out;
   const sorted = pointers.slice().sort((a, b) => a.tick - b.tick);
   let anchor = sorted[0];
+  let startIndex = 0;
+  const pushRegion = (start: number, endTick: number, from: number, to: number): void => {
+    let sumX = 0;
+    let sumY = 0;
+    let count = 0;
+    for (let k = from; k <= to; k++) {
+      sumX += sorted[k].x;
+      sumY += sorted[k].y;
+      count += 1;
+    }
+    if (count === 0) return;
+    out.push({ start, end: endTick, x: sumX / count, y: sumY / count });
+  };
   for (let i = 1; i < sorted.length; i++) {
     const p = sorted[i];
     if (dist(p.x, p.y, anchor.x, anchor.y) > 0.04) {
-      if (p.tick - anchor.tick >= dwellMin) out.push({ start: anchor.tick, end: p.tick });
+      if (p.tick - anchor.tick >= dwellMin) pushRegion(anchor.tick, p.tick, startIndex, i - 1);
       anchor = p;
+      startIndex = i;
     }
   }
   const last = sorted[sorted.length - 1];
-  if (last.tick - anchor.tick >= dwellMin) out.push({ start: anchor.tick, end: last.tick });
+  if (last.tick - anchor.tick >= dwellMin) pushRegion(anchor.tick, last.tick, startIndex, sorted.length - 1);
   return out;
 }
 
@@ -284,6 +309,12 @@ function findDwellRegions(pointers: readonly PointerSample[], opt: ZoomPlannerOp
 export function regenerateAutoZoom(existing: readonly Effect[], planned: readonly Effect[]): Effect[] {
   const manual = existing.filter((e) => e.kind === 'zoom' && (e.locked || e.origin === 'manual'));
   const others = existing.filter((e) => e.kind !== 'zoom');
+
+  // 新生成的自动片段必须避开所有已存在的 ID（包括被保留的手工/锁定片段）。
+  // 旧实现直接用 `${effect.id}-${kept.length}`，而 planAutoZoom 的 id 是确定性的，
+  // 「重生成 → 手改锁定 → 再重生成」会产生同 ID 的两条效果：校验报 id-duplicate，
+  // 按 ID 编辑/删除时改到或删掉被保护的手工镜头。
+  const usedIds = new Set<string>([...others.map((e) => e.id), ...manual.map((e) => e.id)]);
 
   const kept: Effect[] = [];
   for (const effect of planned) {
@@ -304,7 +335,11 @@ export function regenerateAutoZoom(existing: readonly Effect[], planned: readonl
     }
     for (const piece of pieces) {
       if (rangeLength(piece) < secondsToTicks(0.25)) continue;
-      kept.push({ ...effect, id: `${effect.id}-${kept.length}`, range: piece });
+      let id = `${effect.id}-${kept.length}`;
+      let suffix = 1;
+      while (usedIds.has(id)) id = `${effect.id}-${kept.length}-${suffix++}`;
+      usedIds.add(id);
+      kept.push({ ...effect, id, range: piece });
     }
   }
 
@@ -316,25 +351,32 @@ export function evaluateZoom(
   effects: readonly Effect[],
   tick: Ticks,
 ): { scale: number; focusX: number; focusY: number } {
-  let scale = 1;
-  let fx = 0.5;
-  let fy = 0.5;
+  let best: { scale: number; focusX: number; focusY: number } = { scale: 1, focusX: 0.5, focusY: 0.5 };
+  let bestId: string | null = null;
+  const ease = (k: number) => k * k * (3 - 2 * k); // smoothstep
   for (const effect of effects) {
     if (effect.kind !== 'zoom') continue;
     if (tick < effect.range.start || tick >= effect.range.end) continue;
     const p = effect.parameters as ZoomParameters;
+    const targetScale = Number.isFinite(p.scale) ? Math.max(1, p.scale) : 1;
     const inT = clampTicks(tick - effect.range.start, 0, Math.max(1, p.easeInTicks));
     const outT = clampTicks(effect.range.end - tick, 0, Math.max(1, p.easeOutTicks));
     const inK = p.easeInTicks > 0 ? inT / p.easeInTicks : 1;
     const outK = p.easeOutTicks > 0 ? outT / p.easeOutTicks : 1;
-    const ease = (k: number) => k * k * (3 - 2 * k); // smoothstep
     const k = Math.min(ease(inK), ease(outK));
-    // 多个镜头重叠时取最强，避免叠加导致过度放大
-    if (p.scale > scale || scale === 1) {
-      scale = 1 + (p.scale - 1) * k;
-      fx = 0.5 + (p.focusX - 0.5) * k;
-      fy = 0.5 + (p.focusY - 0.5) * k;
+    const scale = 1 + (targetScale - 1) * k;
+    // 多个镜头重叠时取「当前有效放大值」最大的一个，绝不叠加：
+    // - 不能比较原始 targetScale，否则强镜头正在进入（k≈0）时会被弱镜头错误覆盖；
+    // - 不能依赖 effects 数组顺序（SetEffect 追加/删除会改变顺序），否则预览与导出、
+    //   不同编辑顺序会得到不同结果。数值相同时按 id 稳定抉择。
+    if (scale > best.scale + 1e-9 || (Math.abs(scale - best.scale) <= 1e-9 && (bestId === null || effect.id < bestId))) {
+      best = {
+        scale,
+        focusX: 0.5 + (p.focusX - 0.5) * k,
+        focusY: 0.5 + (p.focusY - 0.5) * k,
+      };
+      bestId = effect.id;
     }
   }
-  return { scale, focusX: fx, focusY: fy };
+  return best;
 }

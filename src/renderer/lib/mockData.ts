@@ -19,18 +19,13 @@ import type {
 import { QUALITY_PROFILES } from '@shared/ipc';
 import type { Project } from '@domain/project';
 import { createEmptyProject, DEFAULT_VARIANTS, PROJECT_SCHEMA_VERSION } from '@domain/project';
-import type { RecordingMarker } from '@domain/types';
 import { makeFrameRate, secondsToTicks, TICKS_PER_SECOND } from '@domain/timebase';
-import type { Effect, TutorialStep } from '@domain/project';
+import type { Effect } from '@domain/project';
 import { syntheticThumbnail } from './syntheticMedia';
 
 const S = TICKS_PER_SECOND;
 
 export const MOCK_PROJECT_PATH = 'C:\\Users\\huihui\\Documents\\WinCapture\\演示工程.wcaproj';
-
-function id(prefix: string, n: number): string {
-  return `${prefix}-${String(n).padStart(3, '0')}`;
-}
 
 /** 构造示例工程：30 秒屏幕 + 摄像头 + 双音轨，带运镜、遮挡与教程步骤。 */
 export function createMockProject(now = Date.now()): Project {
@@ -460,10 +455,4 @@ export function mockDevices(): { audio: AudioDeviceInfo[]; video: VideoDeviceInf
       { deviceId: 'cam-usb', label: 'Logitech StreamCam' },
     ],
   };
-}
-
-export function mockMarkers(): RecordingMarker[] {
-  return [
-    { id: `marker-${Date.now()}`, mediaTick: 0, note: '', createdAt: Date.now() },
-  ];
 }

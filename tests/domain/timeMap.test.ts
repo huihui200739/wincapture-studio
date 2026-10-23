@@ -410,3 +410,62 @@ describe('TimeMap: 变速与除零保护', () => {
     expect(divideByRate(10 * S, { num: 2, den: 1 })).toBe(5 * S);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 回归：变速取整不得越出片段区间 / 产生零长度区间
+// ---------------------------------------------------------------------------
+
+describe('回归：变速映射的取整边界', () => {
+  it('慢放片段的 toSource 不会返回 source.end（右开边界之外）', () => {
+    // 0.5 倍速：源时长 3tick → 时间线时长 6tick；tick 5 的精确源时间 2.5 会被舍入到 3
+    const project = projectWith([
+      clip({ id: 'c1', assetId: 'a1', sourceInTicks: 0, sourceDurationTicks: 3, timelineInTicks: 0, rate: { num: 1, den: 2 } }),
+    ]);
+    const map = new TimeMap(project);
+    const hit = map.toSource('primaryVideo', 5);
+    expect(hit).not.toBeNull();
+    expect(hit!.sourceTick).toBeGreaterThanOrEqual(0);
+    expect(hit!.sourceTick).toBeLessThan(3);
+    expect(hit!.sourceTick).toBe(2);
+  });
+
+  it('快放片段的 toTimeline 不会返回 timeline.end（右开边界之外）', () => {
+    // 3 倍速：源时长 4tick → 时间线时长 1tick；源 tick 3 映射到 round(1) = 1 = timeline.end
+    const project = projectWith([
+      clip({ id: 'c1', assetId: 'a1', sourceInTicks: 0, sourceDurationTicks: 4, timelineInTicks: 0, rate: { num: 3, den: 1 } }),
+    ]);
+    const map = new TimeMap(project);
+    const hits = map.toTimeline('primaryVideo', 'a1', 3);
+    expect(hits).toHaveLength(1);
+    expect(hits[0].timelineTick).toBe(0);
+  });
+
+  it('变速压缩后的零长度映射结果被丢弃', () => {
+    const fast = projectWith([
+      clip({ id: 'c1', assetId: 'a1', sourceInTicks: 0, sourceDurationTicks: 5, timelineInTicks: 0, rate: { num: 2, den: 1 } }),
+    ]);
+    expect(new TimeMap(fast).mapSourceRange('primaryVideo', 'a1', { start: 1, end: 2 })).toEqual([]);
+
+    const slow = projectWith([
+      clip({ id: 'c1', assetId: 'a1', sourceInTicks: 0, sourceDurationTicks: 5, timelineInTicks: 0, rate: { num: 1, den: 2 } }),
+    ]);
+    expect(new TimeMap(slow).mapTimelineRange('primaryVideo', { start: 1, end: 2 })).toEqual([]);
+  });
+
+  it('映射结果的所有区间都非空', () => {
+    const project = projectWith([
+      clip({ id: 'c1', assetId: 'a1', sourceInTicks: 0, sourceDurationTicks: 20, timelineInTicks: 0, rate: { num: 2, den: 1 } }),
+    ]);
+    const map = new TimeMap(project);
+    for (let start = 0; start < 20; start++) {
+      for (const range of map.mapSourceRange('primaryVideo', 'a1', { start, end: start + 1 })) {
+        expect(range.end).toBeGreaterThan(range.start);
+      }
+    }
+    for (let start = 0; start < 10; start++) {
+      for (const range of map.mapTimelineRange('primaryVideo', { start, end: start + 1 })) {
+        expect(range.end).toBeGreaterThan(range.start);
+      }
+    }
+  });
+});

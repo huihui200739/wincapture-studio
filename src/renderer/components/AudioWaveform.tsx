@@ -30,6 +30,22 @@ export interface AudioWaveformProps {
   className?: string;
 }
 
+/**
+ * 波形 canvas 的物理像素宽度上限。
+ *
+ * 时间线放大到 5× 后，一小时的音频片段会有 60 多万 CSS 像素宽；
+ * 直接按 CSS 宽度建 canvas 会超过浏览器的最大画布尺寸（约 32767），
+ * 拿不到 2D 上下文，波形永远空白，还会占用巨量内存。
+ * 这里上限内绘制、再用 CSS 拉伸回真实宽度。
+ */
+export const MAX_WAVEFORM_PAINT_WIDTH = 4096;
+
+/** 按 CSS 宽度算出实际要绘制的像素宽度（跨缩放比稳定、可单测）。 */
+export function waveformPaintWidth(cssWidth: number): number {
+  const finite = Number.isFinite(cssWidth) ? cssWidth : 0;
+  return Math.max(1, Math.min(Math.round(finite), MAX_WAVEFORM_PAINT_WIDTH));
+}
+
 export function AudioWaveform({
   assetId,
   relativePath,
@@ -45,47 +61,58 @@ export function AudioWaveform({
 
   useEffect(() => {
     let cancelled = false;
+    // 失败状态只属于「这一次 props」：素材/时长/缩放变化后重新尝试，
+    // 否则一次瞬时读取失败会让这条轨道永远没有波形。
+    setFailed(false);
 
     const paint = (peaks: { min: number; max: number }[]) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
       const dpr = Math.min(2, window.devicePixelRatio || 1);
-      const w = Math.max(1, Math.round(width));
-      const h = Math.max(1, Math.round(height));
-      canvas.width = Math.round(w * dpr);
-      canvas.height = Math.round(h * dpr);
+      const cssW = Math.max(1, Math.round(width));
+      const cssH = Math.max(1, Math.round(height));
+      const paintW = waveformPaintWidth(cssW);
+      canvas.width = Math.max(1, Math.round(paintW * dpr));
+      canvas.height = Math.max(1, Math.round(cssH * dpr));
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, w, h);
+      ctx.clearRect(0, 0, paintW, cssH);
 
-      const mid = h / 2;
+      const mid = cssH / 2;
       // 上下一半留给正负峰，留 1px 边距避免贴边
       const amp = Math.max(1, mid - 1);
       ctx.fillStyle = 'rgba(255,255,255,0.72)';
+      if (peaks.length === 0) return;
+      // 峰值桶可能比物理像素宽/窄：按比例铺满整块画布，保证波形横跨整个片段
+      const barWidth = Math.max(1 / dpr, paintW / peaks.length);
       for (let i = 0; i < peaks.length; i++) {
         const p = peaks[i];
         const top = mid - Math.min(1, Math.abs(p.max)) * amp;
         const bottom = mid + Math.min(1, Math.abs(p.min)) * amp;
         const barHeight = Math.max(1, bottom - top);
-        ctx.fillRect(i, top, 1, barHeight);
+        ctx.fillRect((i * paintW) / peaks.length, top, barWidth, barHeight);
       }
     };
 
     const run = async () => {
+      // 缓存的是「整个文件的峰值」，与片段时长/入点无关。
+      // 旧实现把 durationSeconds 塞进指纹，于是每次裁剪（滑杆每松一次手）
+      // 都必然 miss：把整个 WAV 重新读进渲染进程并在主线程全量解析
+      // （10 分钟 48kHz 立体声约 230MB），界面卡死，还最多堆 64 份峰值。
+      // 片段区间只需要在 slicePeaks 里切，不必重读文件。
       const key = waveformCacheKey({
         assetId,
-        // 这里没法先知道字节数，用相对路径长度 + 时长做廉价指纹，
-        // 真正的字节数在首次读取后由 buildWaveformFromWav 内部缓存兜住。
-        byteLength: relativePath.length + Math.round(durationSeconds * 1000),
+        byteLength: -1,
         sampleRate: 48_000,
         channels: 2,
       });
+      const buckets = waveformPaintWidth(width);
 
       const cached = getCachedWaveform(key);
       if (cached) {
         if (cancelled) return;
-        paint(slicePeaks(cached, sourceFromSeconds, sourceFromSeconds + durationSeconds, width));
+        paint(slicePeaks(cached, sourceFromSeconds, sourceFromSeconds + durationSeconds, buckets));
         return;
       }
 
@@ -102,7 +129,7 @@ export function AudioWaveform({
           setFailed(true);
           return;
         }
-        paint(slicePeaks(data, sourceFromSeconds, sourceFromSeconds + durationSeconds, width));
+        paint(slicePeaks(data, sourceFromSeconds, sourceFromSeconds + durationSeconds, buckets));
       } catch {
         if (!cancelled) setFailed(true);
       }
@@ -114,15 +141,15 @@ export function AudioWaveform({
     };
   }, [assetId, relativePath, sourceFromSeconds, durationSeconds, width, height, readFile]);
 
-  // 读不到波形就什么都不画，底下露出轨道的纯色块——不留错误占位
-  if (failed) return null;
-
+  // 读不到波形就不显示任何东西，底下露出轨道的纯色块——不留错误占位。
+  // 注意 canvas 仍然挂载：若因为瞬时读取失败把 canvas 卸载，后续 props 变化时
+  // paint() 拿不到 ref，波形将永远无法恢复。
   return (
     <canvas
       ref={canvasRef}
       className={className}
       aria-hidden="true"
-      style={{ width, height, display: 'block', pointerEvents: 'none' }}
+      style={{ width, height, display: failed ? 'none' : 'block', pointerEvents: 'none' }}
     />
   );
 }

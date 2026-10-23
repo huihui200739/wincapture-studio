@@ -8,10 +8,12 @@
  */
 
 import { useCallback, useMemo, useRef, useState } from 'react';
-import type { Clip, Effect, Project, Track, TrackKind } from '@domain/project';
+import type { Clip, PrivacyParameters, Project, TrackKind, ZoomParameters } from '@domain/project';
 import { findTrack, timelineDuration } from '@domain/project';
+import { stepTimelineRange } from '@domain/tutorial';
+import { planGroupMove } from '@domain/clipEditing';
 import { TICKS_PER_SECOND, formatDuration, ticksToSeconds } from '@domain/timebase';
-import type { PrivacyParameters, ZoomParameters } from '@domain/project';
+import type { Ticks } from '@domain/timebase';
 import { cn } from '../lib/format';
 import { Badge, Icon, IconButton } from './ui';
 import { AudioWaveform } from './AudioWaveform';
@@ -49,6 +51,16 @@ export interface TimelineProps {
   onToggleTrackMute: (kind: TrackKind) => void;
   /** 拖动片段到新位置（R08 重排）；调用方负责提交 MoveClip 命令 */
   onMoveClip: (clipId: string, timelineInTicks: number) => void;
+  /**
+   * 拖动片段左右手柄裁剪（可选）。不传时手柄只做视觉提示，不响应拖拽。
+   * 调用方负责提交 TrimClip 命令。
+   */
+  onTrimClip?: (
+    clipId: string,
+    patch: { sourceInTicks: number; sourceDurationTicks: number; timelineInTicks: number },
+  ) => void;
+  /** 落点因重叠/越界被夹紧时的提示（可选）；不传则静默夹紧 */
+  onMoveBlocked?: (message: string) => void;
   zoom: number;
   onZoomChange: (zoom: number) => void;
   collapsed: boolean;
@@ -79,8 +91,141 @@ const ROWS: RowDef[] = [
   { key: 'step', label: '步骤标记', kind: 'step', advanced: true },
 ];
 
-const GUTTER_WIDTH = 132;
 const BASE_PX_PER_SECOND = 34;
+
+/** 领域层分割命令要求两侧都不短于 1ms（commands.ts MIN_CLIP_TICKS），界面提前做同样校验。 */
+const MIN_CLIP_TICKS = 10_000;
+
+/** 片段在时间线上的结束 tick（与 domain clipEnd 同一公式，包含播放速率）。 */
+export function clipEndTick(clip: Clip): Ticks {
+  return clip.timelineInTicks + Math.round((clip.sourceDurationTicks * clip.rate.den) / clip.rate.num);
+}
+
+/**
+ * 播放头是否位于某个片段内部且两侧都够长。
+ *
+ * domain 的 splitOne 只分割 `tick > start && tick < end` 且两侧 >= 1ms 的片段；
+ * 若不提前判断，Ctrl+B 在片段边界/太靠近端点时不会产生任何变化，却仍然压入一条
+ * 空的撤销记录（用户按 Ctrl+Z 会「撤销了个寂寞」）。
+ */
+export function splittableTick(project: Project, tick: Ticks): boolean {
+  for (const track of project.tracks) {
+    for (const clip of track.clips) {
+      const start = clip.timelineInTicks;
+      const end = clipEndTick(clip);
+      if (tick <= start || tick >= end) continue;
+      const left = Math.round((tick - start) * (clip.rate.num / clip.rate.den));
+      if (left < MIN_CLIP_TICKS) continue;
+      if (clip.sourceDurationTicks - left < MIN_CLIP_TICKS) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+export interface ClipMovePlan {
+  clipId: string;
+  /** 原始时间线位置 */
+  originTick: Ticks;
+  /** 调用方期望的位置（已夹紧到 >= 0） */
+  desiredTick: Ticks;
+  /** 实际可用位置 */
+  tick: Ticks;
+  /** 是否因重叠/越界被调整 */
+  adjusted: boolean;
+}
+
+export interface ClipTrimPlan {
+  clipId: string;
+  /** 裁剪后的时间线起点 */
+  timelineInTicks: Ticks;
+  /** 裁剪后的源入点 */
+  sourceInTicks: Ticks;
+  /** 裁剪后的源时长 */
+  sourceDurationTicks: Ticks;
+  /** 裁剪后在时间线上占据的长度（按速率换算） */
+  spanTicks: Ticks;
+}
+
+/** 片段播放速率（> 0）。 */
+function rateOf(clip: Clip): number {
+  const num = clip.rate.num > 0 ? clip.rate.num : 1;
+  const den = clip.rate.den > 0 ? clip.rate.den : 1;
+  return num / den;
+}
+
+/**
+ * 计算拖拽裁剪手柄后的片段参数。
+ *
+ * 手抖/约束都在这里收敛：
+ * - 源入点不得小于 0，时长不得小于 MIN_CLIP_TICKS；
+ * - 时间线位置不得越过同轨相邻片段（宁可停住，也不制造重叠）；
+ * - 向右扩展不超过素材剩余长度（读不到素材信息时只保证不短于最短时长）。
+ */
+export function planClipTrim(
+  project: Project,
+  clipId: string,
+  edge: 'left' | 'right',
+  deltaTimelineTicks: Ticks,
+): ClipTrimPlan | null {
+  for (const track of project.tracks) {
+    const clip = track.clips.find((candidate) => candidate.id === clipId);
+    if (!clip) continue;
+    const rate = rateOf(clip);
+    // 时间线长度 = 源时长 ÷ 播放速率（与 clipEndTick / TimeMap 一致）
+    const span = Math.round(clip.sourceDurationTicks / rate);
+    const minSpan = Math.max(1, Math.round(MIN_CLIP_TICKS / (rate || 1)));
+    const asset = project.assets.find((item) => item.id === clip.assetId);
+
+    let timelineIn = clip.timelineInTicks;
+    let sourceIn = clip.sourceInTicks;
+    let sourceDuration = clip.sourceDurationTicks;
+
+    if (edge === 'left') {
+      const prevEnd = track.clips
+        .filter((other) => other.id !== clip.id && other.timelineInTicks < clip.timelineInTicks)
+        .reduce((acc, other) => Math.max(acc, clipEndTick(other)), 0);
+      const desiredIn = Math.max(0, clip.timelineInTicks + Math.round(deltaTimelineTicks));
+      // 能往左最多扩展到源起点 0
+      const earliestBySource = clip.timelineInTicks - Math.round(clip.sourceInTicks / (rate || 1));
+      const latest = clip.timelineInTicks + span - minSpan;
+      const nextIn = Math.min(latest, Math.max(prevEnd, Math.max(0, Math.max(earliestBySource, desiredIn))));
+      const deltaTimeline = nextIn - clip.timelineInTicks;
+      const deltaSource = Math.round(deltaTimeline * rate);
+      sourceIn = clip.sourceInTicks + deltaSource;
+      sourceDuration = Math.max(MIN_CLIP_TICKS, clip.sourceDurationTicks - deltaSource);
+      timelineIn = nextIn;
+    } else {
+      const nextStart = track.clips
+        .filter((other) => other.id !== clip.id && other.timelineInTicks >= clip.timelineInTicks)
+        .reduce((acc, other) => Math.min(acc, other.timelineInTicks), Number.POSITIVE_INFINITY);
+      let desiredSpan = span + Math.round(deltaTimelineTicks);
+      desiredSpan = Math.max(minSpan, desiredSpan);
+      if (Number.isFinite(nextStart)) desiredSpan = Math.min(desiredSpan, Math.max(minSpan, nextStart - clip.timelineInTicks));
+      let desiredSourceDuration = Math.round(desiredSpan * rate);
+      const availableSource = asset ? Math.max(MIN_CLIP_TICKS, asset.durationTicks - clip.sourceInTicks) : Number.POSITIVE_INFINITY;
+      desiredSourceDuration = Math.min(availableSource, Math.max(MIN_CLIP_TICKS, desiredSourceDuration));
+      sourceDuration = desiredSourceDuration;
+    }
+
+    const spanTicks = Math.round(sourceDuration / rate);
+    return { clipId, timelineInTicks: timelineIn, sourceInTicks: sourceIn, sourceDurationTicks: sourceDuration, spanTicks };
+  }
+  return null;
+}
+
+/**
+ * 计算片段拖拽/键盘移动的落点。
+ *
+ * domain 的 MoveClip 不检查同轨重叠，而 validate 又把重叠视为 error：
+ * 直接落下会产生「时间线上两个片段叠在一起、预览按 TimeMap 取先出现的片段」的
+ * 不可解释状态，所以界面先把落点夹紧到最近的不重叠位置。
+ *
+ * 使用领域层的整组落点规划，同时检查画面、摄像头和音频轨道。
+ */
+export function planClipMove(project: Project, clipId: string, desiredTick: Ticks): ClipMovePlan | null {
+  return planGroupMove(project, clipId, desiredTick);
+}
 
 export function Timeline({
   project,
@@ -96,6 +241,8 @@ export function Timeline({
   onDeleteSelected,
   onToggleTrackMute,
   onMoveClip,
+  onMoveBlocked,
+  onTrimClip,
   zoom,
   onZoomChange,
   collapsed,
@@ -103,9 +250,14 @@ export function Timeline({
   projectPath,
 }: TimelineProps) {
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [mutedTracks, setMutedTracks] = useState<Record<string, boolean>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const scrubbing = useRef(false);
+
+  /** 轨道静音状态一律从工程派生：撤销/重做、其它面板切换静音后无需手动同步。 */
+  const muteOf = useCallback(
+    (kind: TrackKind): boolean => findTrack(project, kind)?.muted ?? false,
+    [project],
+  );
 
   const duration = useMemo(() => Math.max(timelineDuration(project), TICKS_PER_SECOND), [project]);
   const pxPerTick = (BASE_PX_PER_SECOND * zoom) / TICKS_PER_SECOND;
@@ -152,48 +304,124 @@ export function Timeline({
   // 用 pointer 事件而不是 HTML5 拖放：拖放对「按像素连续移动」的支持很差，
   // 而且拿不到精确的落点时间。这里自己算，拖动时只更新预览位置，松手才提交命令，
   // 保证一次拖拽只进一次撤销栈。
-  const dragRef = useRef<{ clipId: string; startX: number; originTick: number; currentTick: number } | null>(null);
+  // desiredTick 记录「鼠标真正想放的位置」，currentTick 是「夹紧后实际预览位置」：
+  // 松手时用 desiredTick 重新规划，才能判断是否发生过重叠回退并给用户提示。
+  const dragRef = useRef<{
+    clipId: string;
+    startX: number;
+    originTick: number;
+    currentTick: number;
+    desiredTick: number;
+  } | null>(null);
   const [dragPreview, setDragPreview] = useState<{ clipId: string; tick: number } | null>(null);
+
+  // ---- 片段裁剪（拖左右手柄）----
+  // 旧实现的两个手柄只是 aria-hidden 的空 span，光标是 ew-resize 却没有任何处理：
+  // 拖动边缘走的是「整段移动」逻辑，用户以为在裁剪、实际改了位置。
+  const trimRef = useRef<{ clipId: string; edge: 'left' | 'right'; startX: number } | null>(null);
+  const [trimPreview, setTrimPreview] = useState<ClipTrimPlan | null>(null);
 
   const onClipPointerDown = useCallback(
     (event: React.PointerEvent, clip: Clip) => {
       if (event.button !== 0) return;
       event.stopPropagation();
       onSelectClip(clip.id);
+      const handle = (event.target as HTMLElement).closest('.tl-clip-handle');
+      if (handle && onTrimClip) {
+        const edge = handle.classList.contains('is-left') ? 'left' : 'right';
+        trimRef.current = { clipId: clip.id, edge, startX: event.clientX };
+        (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+        return;
+      }
       dragRef.current = {
         clipId: clip.id,
         startX: event.clientX,
         originTick: clip.timelineInTicks,
         currentTick: clip.timelineInTicks,
+        desiredTick: clip.timelineInTicks,
       };
       (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
     },
-    [onSelectClip],
+    [onSelectClip, onTrimClip],
   );
 
   const onClipPointerMove = useCallback(
     (event: React.PointerEvent) => {
+      const trim = trimRef.current;
+      if (trim) {
+        const deltaTicks = Math.round((event.clientX - trim.startX) / pxPerTick);
+        // 吸附到 10ms 网格，与移动保持同一手感
+        const snapped = Math.round(deltaTicks / 100_000) * 100_000;
+        const plan = planClipTrim(project, trim.clipId, trim.edge, snapped);
+        if (plan) setTrimPreview(plan);
+        return;
+      }
       const drag = dragRef.current;
       if (!drag) return;
       const deltaTicks = Math.round((event.clientX - drag.startX) / pxPerTick);
       // 吸附到 10ms 网格，避免拖出无法复现的零头
       const snapped = Math.round((drag.originTick + deltaTicks) / 100_000) * 100_000;
-      const next = Math.max(0, snapped);
+      const desired = Math.max(0, snapped);
+      const plan = planClipMove(project, drag.clipId, desired);
+      const next = plan ? plan.tick : desired;
+      drag.desiredTick = desired;
       if (next === drag.currentTick) return;
       drag.currentTick = next;
       setDragPreview({ clipId: drag.clipId, tick: next });
     },
-    [pxPerTick],
+    [project, pxPerTick],
+  );
+
+  /** 正在拖动的片段（用于关联组预览：同组片段一起偏移） */
+  const draggedClipForPreview = useMemo(
+    () =>
+      dragPreview
+        ? project.tracks.flatMap((track) => track.clips).find((item) => item.id === dragPreview.clipId) ?? null
+        : null,
+    [dragPreview, project],
   );
 
   const onClipPointerUp = useCallback(() => {
+    // 裁剪优先：手柄拖拽松手时提交一次 TrimClip（只进一次撤销栈）
+    const trim = trimRef.current;
+    trimRef.current = null;
+    if (trim) {
+      const plan = trimPreview;
+      setTrimPreview(null);
+      if (!plan || !onTrimClip) return;
+      const clip = project.tracks.flatMap((track) => track.clips).find((item) => item.id === trim.clipId);
+      if (!clip) return;
+      if (
+        plan.timelineInTicks === clip.timelineInTicks &&
+        plan.sourceInTicks === clip.sourceInTicks &&
+        plan.sourceDurationTicks === clip.sourceDurationTicks
+      ) {
+        return; // 没变化：不产生空撤销记录
+      }
+      onTrimClip(trim.clipId, {
+        sourceInTicks: plan.sourceInTicks,
+        sourceDurationTicks: plan.sourceDurationTicks,
+        timelineInTicks: plan.timelineInTicks,
+      });
+      return;
+    }
     const drag = dragRef.current;
     dragRef.current = null;
     setDragPreview(null);
     if (!drag) return;
-    if (drag.currentTick === drag.originTick) return;
-    onMoveClip(drag.clipId, drag.currentTick);
-  }, [onMoveClip]);
+    const plan = planClipMove(project, drag.clipId, drag.desiredTick);
+    if (!plan) return;
+    // 松手位置因重叠被夹紧：明确告诉用户，而不是悄悄落回原处
+    if (plan.adjusted) {
+      onMoveBlocked?.(
+        plan.tick === plan.originTick
+          ? '目标位置与同轨其它片段重叠，片段未移动。'
+          : '目标位置与同轨其它片段重叠，已放到最近的不重叠位置。',
+      );
+    }
+    if (plan.tick === plan.originTick) return;
+    onMoveClip(drag.clipId, plan.tick);
+  }, [onMoveBlocked, onMoveClip, onTrimClip, project, trimPreview]);
 
   // ---- 刻度 ----
   const ticks = useMemo(() => {
@@ -293,47 +521,71 @@ export function Timeline({
           <div className="timeline-gutter">
             <div className="timeline-gutter-head">轨道</div>
             <div className="timeline-gutter-rows">
-              {rows.map((row) => (
-                <button
-                  key={row.key}
-                  type="button"
-                  className={cn('timeline-row-label', (row.kind === 'mic' || row.kind === 'system') && 'is-audio')}
-                  onClick={() => {
-                    if (row.kind === 'mic' || row.kind === 'system') {
-                      onToggleTrackMute(row.kind);
-                      setMutedTracks((prev) => ({ ...prev, [row.kind]: !prev[row.kind] }));
-                    }
-                  }}
-                  title={
-                    row.kind === 'mic' || row.kind === 'system'
-                      ? '点击切换该轨道静音'
-                      : row.advanced
-                        ? '高级轨道'
-                        : '点击选中该轨道片段'
-                  }
-                >
-                  <span
-                    className="row-kind-dot"
-                    style={{
-                      background:
-                        row.kind === 'zoom'
-                          ? '#77a9ff'
-                          : row.kind === 'privacy'
-                            ? '#ff5c69'
-                            : row.kind === 'step'
-                              ? '#4fc08d'
-                              : row.kind === 'marker'
-                                ? '#4fc08d'
-                                : TRACK_STYLE[row.kind as TrackKind].accent,
+              {rows.map((row) => {
+                const isAudioRow = row.kind === 'mic' || row.kind === 'system';
+                const muted = isAudioRow ? muteOf(row.kind as TrackKind) : false;
+                return (
+                  <button
+                    key={row.key}
+                    type="button"
+                    className={cn('timeline-row-label', isAudioRow && 'is-audio')}
+                    onClick={() => {
+                      if (isAudioRow) {
+                        onToggleTrackMute(row.kind as TrackKind);
+                        return;
+                      }
+                      if (row.kind === 'zoom' || row.kind === 'privacy') {
+                        // 高级效果轨：选中播放头命中的效果，没有就选第一条
+                        const effects = row.kind === 'zoom' ? zoomEffects : privacyEffects;
+                        const hit =
+                          effects.find((effect) => tick >= effect.range.start && tick < effect.range.end) ?? effects[0];
+                        if (hit) onSelectEffect(hit.id);
+                        return;
+                      }
+                      if (row.kind === 'step') {
+                        // 步骤存源时间，播放头是成片时间：必须走映射才能判断「当前步骤」
+                        const hit =
+                          project.steps.find((step) => {
+                            const range = stepTimelineRange(project, step);
+                            return range !== null && tick >= range.start && tick < range.end;
+                          }) ?? project.steps[0];
+                        if (hit) onSelectStep(hit.id);
+                        return;
+                      }
+                      // 视频轨：选中播放头所在片段，没有则选轨道第一段（与 title 承诺一致）
+                      const clips = findTrack(project, row.kind as TrackKind)?.clips ?? [];
+                      const hit = clips.find((clip) => tick >= clip.timelineInTicks && tick < clipEndTick(clip)) ?? clips[0];
+                      if (hit) onSelectClip(hit.id);
                     }}
-                  />
-                  <span>{row.label}</span>
-                  {(row.kind === 'mic' || row.kind === 'system') && (
-                    <Icon name={mutedTracks[row.kind] ? 'eyeOff' : 'volume'} size={10} className="" />
-                  )}
-                  {row.advanced && <Badge tone="muted">高级</Badge>}
-                </button>
-              ))}
+                    title={
+                      isAudioRow
+                        ? '点击切换该轨道静音'
+                        : row.advanced
+                          ? '点击选中该轨道上播放头处的条目'
+                          : '点击选中该轨道片段'
+                    }
+                  >
+                    <span
+                      className="row-kind-dot"
+                      style={{
+                        background:
+                          row.kind === 'zoom'
+                            ? '#77a9ff'
+                            : row.kind === 'privacy'
+                              ? '#ff5c69'
+                              : row.kind === 'step'
+                                ? '#4fc08d'
+                                : row.kind === 'marker'
+                                  ? '#4fc08d'
+                                  : TRACK_STYLE[row.kind as TrackKind].accent,
+                      }}
+                    />
+                    <span>{row.label}</span>
+                    {isAudioRow && <Icon name={muted ? 'eyeOff' : 'volume'} size={10} />}
+                    {row.advanced && <Badge tone="muted">高级</Badge>}
+                  </button>
+                );
+              })}
             </div>
           </div>
 
@@ -360,9 +612,9 @@ export function Timeline({
               </div>
 
               {rows.map((row) => {
-                const isAudio = row.kind === 'mic' || row.kind === 'system';
+                const isAudioRow = row.kind === 'mic' || row.kind === 'system';
                 return (
-                  <div key={row.key} className={cn('timeline-row', isAudio && 'is-audio')}>
+                  <div key={row.key} className={cn('timeline-row', isAudioRow && 'is-audio')}>
                     {row.kind === 'zoom' &&
                       zoomEffects.map((effect) => {
                         const params = effect.parameters as ZoomParameters;
@@ -417,13 +669,17 @@ export function Timeline({
                       })}
 
                     {row.kind === 'step' &&
-                      project.steps.map((step, index) => (
+                      project.steps.map((step, index) => {
+                        // 已被剪掉的步骤不画带（否则会出现在错误的位置上）
+                        const band = stepTimelineRange(project, step);
+                        if (!band) return null;
+                        return (
                         <div
                           key={step.id}
                           className="tl-step-band"
                           style={{
-                            left: tickToX(step.sourceRange.start),
-                            width: Math.max(10, tickToX(step.sourceRange.end - step.sourceRange.start)),
+                            left: tickToX(band.start),
+                            width: Math.max(10, tickToX(band.end - band.start)),
                             ...(selectedStepId === step.id
                               ? { boxShadow: '0 0 0 1px #4c8dff', background: 'rgba(69,192,138,0.28)' }
                               : null),
@@ -437,14 +693,35 @@ export function Timeline({
                         >
                           {index + 1}. {step.title}
                         </div>
-                      ))}
+                        );
+                      })}
 
                     {(row.kind === 'primaryVideo' || row.kind === 'camera' || row.kind === 'mic' || row.kind === 'system') &&
                       clipsOf(row.kind).map((clip) => {
-                        const width = Math.max(6, tickToX(clip.sourceDurationTicks));
-                        const isAudio = row.kind === 'mic' || row.kind === 'system';
+                        const trimming = trimPreview?.clipId === clip.id ? trimPreview : null;
+                        const width = Math.max(
+                          6,
+                          tickToX(trimming ? trimming.spanTicks : clipEndTick(clip) - clip.timelineInTicks),
+                        );
                         const dragging = dragPreview?.clipId === clip.id;
-                        const leftTick = dragging ? dragPreview!.tick : clip.timelineInTicks;
+                        // 关联组预览：拖动主轨时，同组的摄像头/音频片段跟着一起偏移，
+                        // 而不是松手后才「瞬移」到新位置（用户会以为它们没联动）。
+                        const draggedClip = draggedClipForPreview;
+                        const followsDrag =
+                          !trimming &&
+                          !dragging &&
+                          !!dragPreview &&
+                          !!clip.linkGroupId &&
+                          clip.linkGroupId === draggedClip?.linkGroupId;
+                        const groupOffset =
+                          followsDrag && dragPreview && draggedClip
+                            ? dragPreview.tick - draggedClip.timelineInTicks
+                            : 0;
+                        const leftTick = trimming
+                          ? trimming.timelineInTicks
+                          : dragging && dragPreview
+                            ? dragPreview.tick
+                            : Math.max(0, clip.timelineInTicks + groupOffset);
                         return (
                           <div
                             key={clip.id}
@@ -457,7 +734,9 @@ export function Timeline({
                             }}
                             role="button"
                             tabIndex={0}
-                            aria-label={`${TRACK_LABEL[row.kind as TrackKind]} 片段，${formatDuration(leftTick)} 到 ${formatDuration(leftTick + clip.sourceDurationTicks)}${dragging ? '，正在拖动' : ''}`}
+                            // 声明本元素自己处理方向键：全局快捷键先查这个属性并让路
+                            data-keys="arrowleft arrowright enter"
+                            aria-label={`${TRACK_LABEL[row.kind as TrackKind]} 片段，${formatDuration(leftTick)} 到 ${formatDuration(leftTick + (clipEndTick(clip) - clip.timelineInTicks))}${dragging ? '，正在拖动' : ''}`}
                             onClick={(event) => {
                               event.stopPropagation();
                               onSelectClip(clip.id);
@@ -475,7 +754,9 @@ export function Timeline({
                               if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
                                 event.preventDefault();
                                 event.stopPropagation();
-                                const stepTicks = event.shiftKey ? TICKS_PER_SECOND / 30 : TICKS_PER_SECOND / 2;
+                                const fps = project.settings.fps;
+                                const frameTicks = Math.max(1, Math.round((TICKS_PER_SECOND * fps.den) / fps.num));
+                                const stepTicks = event.shiftKey ? frameTicks : TICKS_PER_SECOND / 2;
                                 const delta = event.key === 'ArrowLeft' ? -stepTicks : stepTicks;
                                 const nextTick = Math.max(0, Math.round(clip.timelineInTicks + delta));
                                 onMoveClip(clip.id, nextTick);
@@ -485,7 +766,7 @@ export function Timeline({
                             onDoubleClick={() => onSeek(clip.timelineInTicks)}
                           >
                             {/* 音频轨叠加真实波形（§10.4）；读不到就退回纯色块 */}
-                            {isAudio && clip.assetId && (
+                            {isAudioRow && clip.assetId && (
                               <AudioWaveform
                                 assetId={clip.assetId}
                                 relativePath={assetPathOf(clip.assetId) ?? ''}
@@ -524,15 +805,8 @@ export function Timeline({
                 );
               })}
 
-              {/* 播放头 */}
-              <div className="tl-playhead" style={{ left: tickToX(tick) }} aria-hidden="true" />
-
-              {/* 覆盖整层的拖拽 seek 层（在播放头之下、片段之上不可行，改为事件冒泡处理） */}
-              <div
-                className="tl-scrub-layer"
-                style={{ pointerEvents: 'none' }}
-                aria-hidden="true"
-              />
+              {/* 播放头：tick 可能因删除/撤销而暂时超出新时长，显示时夹到内容范围内 */}
+              <div className="tl-playhead" style={{ left: tickToX(Math.max(0, Math.min(tick, duration))) }} aria-hidden="true" />
             </div>
           </div>
         </div>

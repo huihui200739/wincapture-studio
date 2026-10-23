@@ -617,6 +617,42 @@ describe('TrimClip / MoveClip', () => {
     ).toThrowError(AppError);
   });
 
+  it('TrimClip + ripple 让同轨后续片段跟着前移（不留空隙）', () => {
+    const project = linkedProject();
+    const track = project.tracks.find((t) => t.kind === 'primaryVideo')!;
+    track.clips = [
+      { ...track.clips[0], id: 'a', timelineInTicks: 0, sourceInTicks: 0, sourceDurationTicks: 5 * S },
+      { ...track.clips[0], id: 'b', timelineInTicks: 5 * S, sourceInTicks: 5 * S, sourceDurationTicks: 5 * S },
+    ];
+    const result = applyCommand(
+      project,
+      cmd(project, {
+        kind: 'TrimClip',
+        clipId: 'a',
+        sourceDurationTicks: 3 * S,
+        ripple: true,
+      }),
+    );
+    const clips = result.project.tracks.find((t) => t.kind === 'primaryVideo')!.clips;
+    const b = clips.find((c) => c.id === 'b')!;
+    expect(b.timelineInTicks).toBe(3 * S);
+  });
+
+  it('TrimClip 不带 ripple 时后续片段位置不变', () => {
+    const project = linkedProject();
+    const track = project.tracks.find((t) => t.kind === 'primaryVideo')!;
+    track.clips = [
+      { ...track.clips[0], id: 'a', timelineInTicks: 0, sourceInTicks: 0, sourceDurationTicks: 5 * S },
+      { ...track.clips[0], id: 'b', timelineInTicks: 5 * S, sourceInTicks: 5 * S, sourceDurationTicks: 5 * S },
+    ];
+    const result = applyCommand(
+      project,
+      cmd(project, { kind: 'TrimClip', clipId: 'a', sourceDurationTicks: 3 * S }),
+    );
+    const clips = result.project.tracks.find((t) => t.kind === 'primaryVideo')!.clips;
+    expect(clips.find((c) => c.id === 'b')!.timelineInTicks).toBe(5 * S);
+  });
+
   it('MoveClip 移动并重新排序', () => {
     const project = linkedProject();
     const result = applyCommand(
@@ -626,6 +662,61 @@ describe('TrimClip / MoveClip', () => {
     const main = result.project.tracks.find((t) => t.kind === 'primaryVideo')!;
     expect(main.clips[0].timelineInTicks).toBe(3 * S);
     expect(timelineDuration(result.project)).toBe(13 * S);
+  });
+
+  it('同 linkGroupId 的画面/摄像头/音频一起移动（音画不错位）', () => {
+    const project = linkedProject();
+    const result = applyCommand(
+      project,
+      cmd(project, { kind: 'MoveClip', clipId: 'main-clip', timelineInTicks: 2 * S }),
+    );
+    for (const kind of ['primaryVideo', 'camera', 'mic'] as const) {
+      const clip = result.project.tracks.find((t) => t.kind === kind)!.clips[0];
+      expect(clip.timelineInTicks).toBe(2 * S);
+    }
+    expect(result.diff.tracks).toEqual(expect.arrayContaining(['primaryVideo', 'camera', 'mic']));
+  });
+
+  it('整组移动不会被推到 0 之前', () => {
+    const project = linkedProject();
+    // 先整组右移到 4 秒，再尝试拖回负值：应停在 0
+    const moved = applyCommand(project, cmd(project, { kind: 'MoveClip', clipId: 'main-clip', timelineInTicks: 4 * S }));
+    const back = applyCommand(
+      moved.project,
+      cmd(moved.project, { kind: 'MoveClip', clipId: 'main-clip', timelineInTicks: -2 * S }),
+    );
+    for (const kind of ['primaryVideo', 'camera', 'mic'] as const) {
+      expect(back.project.tracks.find((t) => t.kind === kind)!.clips[0].timelineInTicks).toBe(0);
+    }
+  });
+
+  it('裁剪画面片段时关联音频一起裁剪（右边缘）', () => {
+    const project = linkedProject();
+    const result = applyCommand(
+      project,
+      cmd(project, { kind: 'TrimClip', clipId: 'main-clip', sourceDurationTicks: 6 * S }),
+    );
+    const mic = result.project.tracks.find((t) => t.kind === 'mic')!.clips[0];
+    expect(mic.sourceDurationTicks).toBe(6 * S);
+    expect(timelineDuration(result.project)).toBe(6 * S);
+  });
+
+  it('裁剪左边缘时关联音轨同步平移起点与源入点', () => {
+    const project = linkedProject();
+    const result = applyCommand(
+      project,
+      cmd(project, {
+        kind: 'TrimClip',
+        clipId: 'main-clip',
+        sourceInTicks: S,
+        sourceDurationTicks: 9 * S,
+        timelineInTicks: S,
+      }),
+    );
+    const mic = result.project.tracks.find((t) => t.kind === 'mic')!.clips[0];
+    expect(mic.timelineInTicks).toBe(S);
+    expect(mic.sourceInTicks).toBe(S);
+    expect(mic.sourceDurationTicks).toBe(9 * S);
   });
 });
 
@@ -652,6 +743,15 @@ describe('SetEffect / DeleteEffect', () => {
       cmd(project, { kind: 'SetEffect', effect: { ...zoomEffect('z1', 0, S), locked: false } }),
     );
     expect(result.project.effects[0].locked).toBe(true);
+  });
+
+  it('SetEffect 不与调用方共享 parameters 对象（改命令不能追溯性改工程）', () => {
+    const project = linkedProject();
+    const effect: Effect = privacyEffect('pv-1', 0, S);
+    const result = applyCommand(project, cmd(project, { kind: 'SetEffect', effect }));
+    // 调用方之后复用自己的命令对象
+    (effect.parameters as { x: number }).x = 0.99;
+    expect((result.project.effects[0].parameters as { x: number }).x).not.toBe(0.99);
   });
 
   it('DeleteEffect 不存在时抛错', () => {
@@ -716,6 +816,45 @@ describe('SetTrackAudio / SetCanvasStyle / SetVariantOverride / SetActiveVariant
 });
 
 describe('步骤命令', () => {
+  it('只滑动源入点也同步修改关联音频和摄像头入点', () => {
+    const p = linkedProject();
+    const changed = applyCommand(p, cmd(p, { kind: 'TrimClip', clipId: 'main-clip', sourceInTicks: 2 * S })).project;
+    for (const t of changed.tracks.filter((t) => t.clips.length)) {
+      expect(t.clips[0].sourceInTicks).toBe(2 * S);
+      expect(t.clips[0].timelineInTicks).toBe(0);
+    }
+  });
+  it('波纹裁剪会在所有关联轨上移动后续片段', () => {
+    const p = linkedProject();
+    const split = applyCommand(p, cmd(p, { kind: 'SplitClip', timelineTick: 5 * S })).project;
+    const changed = applyCommand(split, cmd(split, { kind: 'TrimClip', clipId: 'main-clip', sourceDurationTicks: 3 * S, ripple: true })).project;
+    for (const t of changed.tracks.filter((t) => t.clips.length)) {
+      expect(t.clips[1].timelineInTicks).toBe(3 * S);
+    }
+  });
+  it('分割后只移动右侧关联组，左侧画面与音频保持原位', () => {
+    const p = linkedProject();
+    const split = applyCommand(p, cmd(p, { kind: 'SplitClip', timelineTick: 5 * S })).project;
+    const right = split.tracks[0].clips[1];
+    expect(right.linkGroupId).not.toBe(split.tracks[0].clips[0].linkGroupId);
+    const moved = applyCommand(split, cmd(split, { kind: 'MoveClip', clipId: right.id, timelineInTicks: 8 * S })).project;
+    for (const t of moved.tracks.filter((t) => t.clips.length)) {
+      expect(t.clips.map((c) => c.timelineInTicks)).toEqual([0, 8 * S]);
+    }
+  });
+  it('关联音轨有冲突时拒绝移动，不留下部分更新的工程', () => {
+    const p = linkedProject();
+    const mic = p.tracks.find((t) => t.kind === 'mic')!;
+    mic.clips.push({ ...mic.clips[0], id: 'mic-other', linkGroupId: 'other', timelineInTicks: 12 * S, sourceDurationTicks: 2 * S });
+    expect(() => applyCommand(p, cmd(p, { kind: 'MoveClip', clipId: 'main-clip', timelineInTicks: 5 * S }))).toThrow(AppError);
+    expect(p.tracks[0].clips[0].timelineInTicks).toBe(0);
+  });
+  it('裁剪拒绝重叠和越过关联素材末尾', () => {
+    const p = linkedProject();
+    p.tracks[0].clips.push({ ...p.tracks[0].clips[0], id: 'later', linkGroupId: '', timelineInTicks: 12 * S, sourceDurationTicks: S });
+    expect(() => applyCommand(p, cmd(p, { kind: 'TrimClip', clipId: 'main-clip', sourceDurationTicks: 14 * S }))).toThrow(AppError);
+    expect(() => applyCommand(p, cmd(p, { kind: 'TrimClip', clipId: 'main-clip', sourceDurationTicks: 30 * S }))).toThrow(AppError);
+  });
   it('SetStep 新增并按时间排序', () => {
     const project = linkedProject();
     let current = applyCommand(project, cmd(project, { kind: 'SetStep', step: step('s2', 5 * S, 6 * S, 5.5 * S) })).project;
@@ -1090,5 +1229,105 @@ describe('DeleteRange 属性测试：随机区间序列 200 组（固定种子�
       expect(undone.markers).toEqual(project.markers);
       expect(undone.revision).toBeGreaterThan(executed.project.revision);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 回归测试：非 ripple 删除头部、非法命令参数、步骤重排去重
+// ---------------------------------------------------------------------------
+
+describe('回归：非 ripple 删除片段头部时保持时间线位置', () => {
+  it('片段起点落在删除区间内时，保留内容必须停在 range.end（不提前）', () => {
+    const project = linkedProject();
+    // 主轨片段 [5s,15s)，删掉 [2s,7s)：只应切掉头部 [5s,7s)，剩余内容停在 7s
+    project.tracks.find((t) => t.kind === 'primaryVideo')!.clips = [
+      {
+        id: 'main-clip',
+        assetId: 'screen-1',
+        sourceInTicks: 0,
+        sourceDurationTicks: 10 * S,
+        timelineInTicks: 5 * S,
+        rate: { num: 1, den: 1 },
+        linkGroupId: 'rec-1',
+      },
+    ];
+    const result = applyCommand(
+      project,
+      cmd(project, { kind: 'DeleteRange', range: { start: 2 * S, end: 7 * S }, ripple: false }),
+    );
+    const clip = result.project.tracks.find((t) => t.kind === 'primaryVideo')!.clips[0];
+    expect(clip.timelineInTicks).toBe(7 * S);
+    expect(clip.sourceInTicks).toBe(2 * S);
+    expect(clip.sourceDurationTicks).toBe(8 * S);
+  });
+});
+
+describe('回归：非法命令参数必须被拒绝（E_INVALID_COMMAND）', () => {
+  function codeOf(fn: () => unknown): string | null {
+    try {
+      fn();
+      return null;
+    } catch (error) {
+      return (error as AppError).code;
+    }
+  }
+
+  it('MoveClip / TrimClip 的 NaN/Infinity 时间不得写入工程', () => {
+    const project = linkedProject();
+    expect(
+      codeOf(() => applyCommand(project, cmd(project, { kind: 'MoveClip', clipId: 'main-clip', timelineInTicks: NaN }))),
+    ).toBe('E_INVALID_COMMAND');
+    expect(
+      codeOf(() =>
+        applyCommand(project, cmd(project, { kind: 'TrimClip', clipId: 'main-clip', sourceInTicks: Infinity })),
+      ),
+    ).toBe('E_INVALID_COMMAND');
+    // 旧实现会把 NaN 经 Math.max(0, NaN) 写进时间线；这里确认工程未被改动
+    expect(project.tracks.find((t) => t.kind === 'primaryVideo')!.clips[0].timelineInTicks).toBe(0);
+  });
+
+  it('DeleteRange 拒绝负起点与反向区间（否则 ripple 会生成负时间线位置）', () => {
+    const project = linkedProject();
+    expect(
+      codeOf(() => applyCommand(project, cmd(project, { kind: 'DeleteRange', range: { start: -2 * S, end: S }, ripple: true }))),
+    ).toBe('E_INVALID_COMMAND');
+    expect(
+      codeOf(() => applyCommand(project, cmd(project, { kind: 'DeleteRange', range: { start: 5 * S, end: 2 * S }, ripple: true }))),
+    ).toBe('E_INVALID_COMMAND');
+    // 空区间仍是合法的 no-op
+    const empty = applyCommand(
+      project,
+      cmd(project, { kind: 'DeleteRange', range: { start: 5 * S, end: 5 * S }, ripple: true }),
+    );
+    expect(timelineDuration(empty.project)).toBe(10 * S);
+  });
+
+  it('SetFrameRate / SetTrackAudio / SetEffect / SetStep 拒绝非法数值', () => {
+    const project = linkedProject();
+    expect(
+      codeOf(() => applyCommand(project, cmd(project, { kind: 'SetFrameRate', fps: { num: 0, den: 0 } }))),
+    ).toBe('E_INVALID_COMMAND');
+    expect(
+      codeOf(() => applyCommand(project, cmd(project, { kind: 'SetFrameRate', fps: { num: 30, den: 0 } }))),
+    ).toBe('E_INVALID_COMMAND');
+    expect(
+      codeOf(() => applyCommand(project, cmd(project, { kind: 'SetTrackAudio', track: 'mic', gain: NaN }))),
+    ).toBe('E_INVALID_COMMAND');
+    expect(
+      codeOf(() => applyCommand(project, cmd(project, { kind: 'SetEffect', effect: zoomEffect('z', 5 * S, 5 * S) }))),
+    ).toBe('E_INVALID_COMMAND');
+    expect(
+      codeOf(() => applyCommand(project, cmd(project, { kind: 'SetStep', step: step('s', 2 * S, S, S) }))),
+    ).toBe('E_INVALID_COMMAND');
+  });
+});
+
+describe('回归：ReorderSteps 去重', () => {
+  it('orderedIds 含重复 ID 时不会把同一步骤复制多份', () => {
+    const project = linkedProject();
+    project.steps.push(step('s1', 0, S, S / 2), step('s2', 2 * S, 3 * S, 2.5 * S));
+    const result = applyCommand(project, cmd(project, { kind: 'ReorderSteps', orderedIds: ['s2', 's2', 's1'] }));
+    expect(result.project.steps.map((s) => s.id)).toEqual(['s2', 's1']);
+    expect(new Set(result.project.steps.map((s) => s.id)).size).toBe(2);
   });
 });

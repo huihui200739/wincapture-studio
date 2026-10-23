@@ -13,10 +13,10 @@
  * fs.realpath 实现），默认实现为纯字符串归一化，可在单元测试中完全复现。
  */
 
-import type { Project, MediaAsset, Track } from './project';
+import type { Project, MediaAsset, Track, Effect, TutorialStep, CanvasVariant } from './project';
 import { PROJECT_SCHEMA_VERSION, timelineDuration } from './project';
 import type { TickRange, Ticks } from './timebase';
-import { TICKS_PER_SECOND, rangeLength } from './timebase';
+import { TICKS_PER_SECOND, rangeIsEmpty, rangeLength } from './timebase';
 
 export type ValidationSeverity = 'error' | 'warning';
 
@@ -137,9 +137,21 @@ export function checkProjectRelativePath(path: string): PathCheck {
   if (trimmed.startsWith('~')) return { ok: false, code: 'asset-path-absolute', reason: '不允许用户目录展开路径' };
 
   const segments = trimmed.split(/[\\/]+/);
-  for (const segment of segments) {
+  for (const rawSegment of segments) {
+    if (rawSegment === '') continue;
+    // ':' 只可能出现在盘符/ADS（备用数据流）中；盘符前面已拒绝，其余一律拒绝，
+    // 否则 `media/a.mp4:evil` 会写到同名文件的数据流上。
+    if (rawSegment.includes(':')) {
+      return { ok: false, code: 'asset-path-traversal', reason: '路径段包含冒号（拒绝备用数据流 ADS）' };
+    }
+    // Windows 会忽略段尾的点与空格（`.. ` 等价于 `..`，`con.` 等价于 `con`），
+    // 必须先按系统行为归一化再判断越界与保留名，否则是路径穿越校验的经典绕过。
+    const segment = rawSegment.replace(/[. ]+$/, '');
     if (segment === '..') return { ok: false, code: 'asset-path-traversal', reason: '路径包含 .. 越界' };
-    if (segment === '.') continue;
+    if (segment === '') {
+      if (rawSegment === '.') continue; // 当前目录
+      return { ok: false, code: 'asset-path-traversal', reason: '路径段仅由点/空格组成' };
+    }
     const base = segment.split('.')[0]?.toLowerCase() ?? '';
     if (RESERVED_NAMES.has(base)) {
       return { ok: false, code: 'asset-path-traversal', reason: `路径包含 Windows 保留名 ${segment}` };
@@ -191,8 +203,9 @@ export function checkRange(range: TickRange | null | undefined, allowEmpty = fal
   return range.start < range.end;
 }
 
-/** 两个左闭右开区间是否重叠（相邻不算重叠）。 */
+/** 两个左闭右开区间是否重叠（相邻不算重叠，空区间不与任何区间重叠）。 */
 export function rangesOverlap(a: TickRange, b: TickRange): boolean {
+  if (rangeIsEmpty(a) || rangeIsEmpty(b)) return false;
   return a.start < b.end && b.start < a.end;
 }
 
@@ -225,6 +238,45 @@ export function validateProject(project: Project, options: ValidationOptions = {
     };
     return { ok: false, issues: [issue], errors: [issue], warnings: [] };
   }
+
+  const projectId = typeof project.id === 'string' ? project.id : '';
+
+  /**
+   * 集合字段必须真的是数组。
+   *
+   * 校验器的契约是「返回结构化错误、不抛异常」：损坏的 project.json 可能把
+   * assets/tracks 写成对象或缺失，旧实现直接 `for...of`/`timelineDuration` 会抛
+   * TypeError，导入流程因此拿不到可展示的错误列表。
+   */
+  const requireCollection = <T>(value: unknown, field: string): T[] => {
+    if (Array.isArray(value)) return value as T[];
+    push({
+      code: 'schema-unsupported',
+      severity: 'error',
+      message: `工程结构损坏：${field} 必须是数组（实际为 ${value === null ? 'null' : typeof value}）。`,
+      entity: 'project',
+      entityId: projectId,
+      field,
+    });
+    return [];
+  };
+  const pushStructure = (entity: ValidationIssue['entity'], entityId: string, field: string, detail: string): void => {
+    push({
+      code: 'schema-unsupported',
+      severity: 'error',
+      message: `工程结构损坏：${detail}。`,
+      entity,
+      entityId,
+      field,
+    });
+  };
+
+  const assets = requireCollection<MediaAsset>(project.assets, 'assets');
+  const tracks = requireCollection<Track>(project.tracks, 'tracks');
+  const effects = requireCollection<Effect>(project.effects, 'effects');
+  const steps = requireCollection<TutorialStep>(project.steps, 'steps');
+  const variants = requireCollection<CanvasVariant>(project.variants, 'variants');
+  const markers = requireCollection<Project['markers'][number]>(project.markers, 'markers');
 
   // ---- 工程级 ----
   if (!Number.isInteger(project.schemaVersion) || project.schemaVersion < 1) {
@@ -284,7 +336,11 @@ export function validateProject(project: Project, options: ValidationOptions = {
   const assetIds = new Set<string>();
   const assetsById = new Map<string, MediaAsset>();
   const duplicateIds = new Set<string>();
-  for (const asset of project.assets ?? []) {
+  for (const asset of assets) {
+    if (!asset || typeof asset !== 'object') {
+      pushStructure('asset', '', 'assets[]', 'assets 中存在空条目');
+      continue;
+    }
     if (assetIds.has(asset.id)) duplicateIds.add(asset.id);
     assetIds.add(asset.id);
     assetsById.set(asset.id, asset);
@@ -362,8 +418,24 @@ export function validateProject(project: Project, options: ValidationOptions = {
   // ---- 轨道与片段 ----
   const duration = timelineDuration(project);
   const trackKinds = new Set<string>();
+  const trackIds = new Set<string>();
   const clipIds = new Set<string>();
-  for (const track of project.tracks ?? []) {
+  for (const track of tracks) {
+    if (!track || typeof track !== 'object') {
+      pushStructure('track', '', 'tracks[]', 'tracks 中存在空条目');
+      continue;
+    }
+    if (trackIds.has(track.id)) {
+      push({
+        code: 'id-duplicate',
+        severity: 'error',
+        message: `轨道 ID ${track.id} 重复。`,
+        entity: 'track',
+        entityId: track.id,
+        field: 'id',
+      });
+    }
+    trackIds.add(track.id);
     if (trackKinds.has(track.kind)) {
       push({
         code: 'track-kind-duplicate',
@@ -389,7 +461,16 @@ export function validateProject(project: Project, options: ValidationOptions = {
       }
     }
 
-    const sorted = [...track.clips].sort((a, b) => a.timelineInTicks - b.timelineInTicks);
+    if (!Array.isArray(track.clips)) {
+      pushStructure('track', track.id, 'clips', `轨道 ${track.id} 的 clips 必须是数组`);
+      continue;
+    }
+    const sorted = track.clips
+      .filter((clip): clip is NonNullable<typeof clip> => !!clip && typeof clip === 'object')
+      .sort((a, b) => (a.timelineInTicks - b.timelineInTicks) || 0);
+    // 已遍历片段的最大结束时间与对应片段：用于检出嵌套重叠（见下方注释）
+    let prevMaxEnd = -Infinity;
+    let prevMaxEndOwner: (typeof sorted)[number] | null = null;
     for (let i = 0; i < sorted.length; i++) {
       const clip = sorted[i];
       if (clipIds.has(clip.id)) {
@@ -476,14 +557,16 @@ export function validateProject(project: Project, options: ValidationOptions = {
       }
 
       if (checkOverlap && i > 0) {
-        const prev = sorted[i - 1];
-        const prevEnd = prev.timelineInTicks + scaleDuration(prev.sourceDurationTicks, prev.rate);
+        // 只和「紧邻的前一个」比较会漏掉嵌套重叠：
+        // A[0,10s) + B[2s,3s) + C[4s,5s) 里 C 的前一个是 B（3s < 4s），
+        // 但 C 整段落在 A 内部。用前面所有片段的最大结束时间判定才是正确的。
         const start = clip.timelineInTicks;
-        if (start < prevEnd) {
+        if (start < prevMaxEnd) {
+          const prevId = prevMaxEndOwner?.id ?? sorted[i - 1].id;
           push({
             code: 'clip-timeline-overlap',
             severity: 'error',
-            message: `同一轨道上片段 ${prev.id} 与 ${clip.id} 的时间线区间重叠（${prevEnd} > ${start}）。`,
+            message: `同一轨道上片段 ${prevId} 与 ${clip.id} 的时间线区间重叠（${prevMaxEnd} > ${start}）。`,
             entity: 'clip',
             entityId: clip.id,
             field: 'timelineInTicks',
@@ -491,11 +574,32 @@ export function validateProject(project: Project, options: ValidationOptions = {
           });
         }
       }
+      const end = clip.timelineInTicks + scaleDuration(clip.sourceDurationTicks, clip.rate);
+      if (end > prevMaxEnd) {
+        prevMaxEnd = end;
+        prevMaxEndOwner = clip;
+      }
     }
   }
 
   // ---- 效果 ----
-  for (const effect of project.effects ?? []) {
+  const effectIds = new Set<string>();
+  for (const effect of effects) {
+    if (!effect || typeof effect !== 'object') {
+      pushStructure('effect', '', 'effects[]', 'effects 中存在空条目');
+      continue;
+    }
+    if (effectIds.has(effect.id)) {
+      push({
+        code: 'id-duplicate',
+        severity: 'error',
+        message: `效果 ID ${effect.id} 重复（SetEffect 只会更新第一条，DeleteEffect 会删除全部）。`,
+        entity: 'effect',
+        entityId: effect.id,
+        field: 'id',
+      });
+    }
+    effectIds.add(effect.id);
     if (!checkRange(effect.range)) {
       push({
         code: 'effect-range-invalid',
@@ -563,8 +667,13 @@ export function validateProject(project: Project, options: ValidationOptions = {
         });
       }
       if (
+        // NaN 的 typeof 也是 'number'，且 NaN < 0 / NaN > 1 都为 false，
+        // 只用范围比较会让 focusX/focusY 为 NaN 的工程「校验通过」，
+        // 之后 evaluateZoom 把它带进合成器，drawImage 收到非有限值整帧不绘制。
         typeof p.focusX !== 'number' ||
+        !Number.isFinite(p.focusX) ||
         typeof p.focusY !== 'number' ||
+        !Number.isFinite(p.focusY) ||
         p.focusX < 0 ||
         p.focusX > 1 ||
         p.focusY < 0 ||
@@ -583,7 +692,23 @@ export function validateProject(project: Project, options: ValidationOptions = {
   }
 
   // ---- 步骤 ----
-  for (const step of project.steps ?? []) {
+  const stepIds = new Set<string>();
+  for (const step of steps) {
+    if (!step || typeof step !== 'object') {
+      pushStructure('step', '', 'steps[]', 'steps 中存在空条目');
+      continue;
+    }
+    if (stepIds.has(step.id)) {
+      push({
+        code: 'id-duplicate',
+        severity: 'error',
+        message: `步骤 ID ${step.id} 重复。`,
+        entity: 'step',
+        entityId: step.id,
+        field: 'id',
+      });
+    }
+    stepIds.add(step.id);
     if (!checkRange(step.sourceRange)) {
       push({
         code: 'step-range-invalid',
@@ -593,11 +718,13 @@ export function validateProject(project: Project, options: ValidationOptions = {
         entityId: step.id,
         field: 'sourceRange',
       });
-    } else if (duration > 0 && step.sourceRange.start >= duration) {
+    } else if (duration > 0 && !tracks.some((track) => track?.kind === 'primaryVideo' && Array.isArray(track.clips) &&
+      track.clips.some((clip) => clip && step.sourceRange.start < clip.sourceInTicks + clip.sourceDurationTicks &&
+        step.sourceRange.end > clip.sourceInTicks))) {
       push({
         code: 'step-range-out-of-project',
         severity: 'warning',
-        message: `步骤 ${step.id} 的区间在工程时长（${duration}）之外。`,
+        message: `步骤 ${step.id} 对应的源画面已不在成片中。`,
         entity: 'step',
         entityId: step.id,
         field: 'sourceRange',
@@ -613,11 +740,13 @@ export function validateProject(project: Project, options: ValidationOptions = {
         entityId: step.id,
         field: 'imageTick',
       });
-    } else if (duration > 0 && step.imageTick > duration) {
+    } else if (duration > 0 && !tracks.some((track) => track?.kind === 'primaryVideo' && Array.isArray(track.clips) &&
+      track.clips.some((clip) => clip && step.imageTick >= clip.sourceInTicks &&
+        step.imageTick < clip.sourceInTicks + clip.sourceDurationTicks))) {
       push({
         code: 'step-image-out-of-range',
         severity: 'warning',
-        message: `步骤 ${step.id} 的截图时间（${step.imageTick}）超过工程时长（${duration}）。`,
+        message: `步骤 ${step.id} 的截图画面已被剪掉，请重新选择截图时间。`,
         entity: 'step',
         entityId: step.id,
         field: 'imageTick',
@@ -627,7 +756,23 @@ export function validateProject(project: Project, options: ValidationOptions = {
   }
 
   // ---- 画幅 ----
-  for (const variant of project.variants ?? []) {
+  const variantIds = new Set<string>();
+  for (const variant of variants) {
+    if (!variant || typeof variant !== 'object') {
+      pushStructure('variant', '', 'variants[]', 'variants 中存在空条目');
+      continue;
+    }
+    if (variantIds.has(variant.id)) {
+      push({
+        code: 'id-duplicate',
+        severity: 'error',
+        message: `画幅 ID ${variant.id} 重复。`,
+        entity: 'variant',
+        entityId: variant.id,
+        field: 'id',
+      });
+    }
+    variantIds.add(variant.id);
     if (
       !Array.isArray(variant.aspect) ||
       variant.aspect.length !== 2 ||
@@ -646,8 +791,8 @@ export function validateProject(project: Project, options: ValidationOptions = {
       });
     }
   }
-  if (project.variants && project.variants.length > 0) {
-    if (!project.variants.some((v) => v.id === project.settings?.activeVariantId)) {
+  if (variants.length > 0) {
+    if (!variants.some((v) => v?.id === project.settings?.activeVariantId)) {
       push({
         code: 'variant-invalid',
         severity: 'error',
@@ -660,7 +805,23 @@ export function validateProject(project: Project, options: ValidationOptions = {
   }
 
   // ---- 标记 ----
-  for (const marker of project.markers ?? []) {
+  const markerIds = new Set<string>();
+  for (const marker of markers) {
+    if (!marker || typeof marker !== 'object') {
+      pushStructure('marker', '', 'markers[]', 'markers 中存在空条目');
+      continue;
+    }
+    if (markerIds.has(marker.id)) {
+      push({
+        code: 'id-duplicate',
+        severity: 'error',
+        message: `标记 ID ${marker.id} 重复。`,
+        entity: 'marker',
+        entityId: marker.id,
+        field: 'id',
+      });
+    }
+    markerIds.add(marker.id);
     if (!Number.isInteger(marker.mediaTick) || marker.mediaTick < 0) {
       push({
         code: 'marker-out-of-range',

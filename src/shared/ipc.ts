@@ -200,6 +200,11 @@ export interface ExportResult {
   bytes: number;
   /** 完整性检查结果 */
   verified: boolean;
+  /**
+   * 非致命降级说明（素材缺失、音频解码失败、临时文件未删掉……）。
+   * 导出成功但内容有降级时必须透出，不能只写进日志。
+   */
+  warnings?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +214,8 @@ export interface ExportResult {
 export const IPC = {
   // 采集
   captureListSources: 'capture:list-sources',
+  /** 显示器枚举（返回 DisplayInfo[]，含 bounds/scaleFactor），与来源列表是两件事 */
+  captureListDisplays: 'capture:list-displays',
   captureListDevices: 'capture:list-devices',
   captureStart: 'capture:start',
   capturePause: 'capture:pause',
@@ -231,7 +238,8 @@ export const IPC = {
   projectImportPack: 'project:import-pack',
   projectExportPack: 'project:export-pack',
   projectReadMedia: 'project:read-media',
-  projectMediaInfo: 'project:media-info',
+  /** 读取指针轨迹（预览/导出用；工程目录内的相对路径） */
+  projectReadPointerLog: 'project:read-pointer-log',
   projectRecoverable: 'project:list-recoverable',
   projectRecover: 'project:recover',
   projectDiscardRecovery: 'project:discard-recovery',
@@ -240,7 +248,8 @@ export const IPC = {
   exportStart: 'export:start',
   exportCancel: 'export:cancel',
   exportProgress: 'export:progress',
-  exportListJobs: 'export:list-jobs',
+  /** 导出渲染进程完成后回报（一次性事件，不是 invoke） */
+  exportComplete: 'export:complete',
 
   // 文件读写（导出/录制窗口专用；渲染进程没有 node:fs）
   fileWrite: 'file:write',
@@ -263,10 +272,15 @@ export const IPC = {
   windowSetAlwaysOnTop: 'window:set-always-on-top',
   windowMinimize: 'window:minimize',
   windowClose: 'window:close',
-  windowShow: 'window:show',
   windowOpenOverlay: 'window:open-overlay',
   windowCloseOverlay: 'window:close-overlay',
   windowUpdateOverlay: 'window:update-overlay',
+
+  // 悬浮窗（录制控制条）
+  /** 主进程 → 悬浮窗的命令（暂停/恢复/停止/标记）；悬浮窗就绪前发送会被丢弃 */
+  overlayCommand: 'overlay:command',
+  /** 悬浮窗 → 主进程：控制条已挂载，可接收命令 */
+  overlayReady: 'overlay:ready',
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];

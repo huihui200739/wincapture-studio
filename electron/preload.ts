@@ -1,4 +1,4 @@
-/**
+﻿/**
  * preload：通过 contextBridge 暴露 window.wcs（严格匹配 src/shared/api.ts 的 WcsApi）
  *
  * 安全约定：
@@ -37,7 +37,9 @@ const role: 'main' | 'overlay' | 'exporter' | 'recorder' | 'camera' = (() => {
 const api: WcsApi = {
   // ---- 采集 ----
   listSources: () => invoke(IPC.captureListSources),
-  listDisplays: () => invoke(IPC.captureListSources),
+  // 注意：listSources 返回 CaptureSourceInfo[]（含 display:0 临时 ID），
+  // listDisplays 必须是独立的 DisplayInfo[]（id=显示器 id、含 bounds/scaleFactor）。
+  listDisplays: () => invoke(IPC.captureListDisplays),
   listDevices: () => invoke(IPC.captureListDevices),
   qualityProfiles: async () => ({ ok: true, data: (await import('../src/shared/ipc')).QUALITY_PROFILES }),
   startCapture: (config) => invoke(IPC.captureStart, config),
@@ -59,7 +61,7 @@ const api: WcsApi = {
   deleteProject: (p) => invoke(IPC.projectDelete, p),
   revealProject: (p) => invoke(IPC.projectReveal, p),
   readMedia: (projectPath, relativePath) => invoke(IPC.projectReadMedia, projectPath, relativePath),
-  readPointerLog: (projectPath) => invoke('project:read-pointer-log', projectPath),
+  readPointerLog: (projectPath) => invoke(IPC.projectReadPointerLog, projectPath),
   listMediaSegments: (projectPath, relativePath) => invoke(IPC.fileListSegments, projectPath, relativePath),
   exportPack: (projectPath) => invoke(IPC.projectExportPack, projectPath),
   importPack: () => invoke(IPC.projectImportPack),
@@ -75,7 +77,7 @@ const api: WcsApi = {
     ipcRenderer.send(IPC.exportProgress, progress);
   },
   completeExport: (result) => {
-    ipcRenderer.send('export:complete', result);
+    ipcRenderer.send(IPC.exportComplete, result);
   },
 
   // ---- 系统 ----
@@ -106,12 +108,14 @@ const api: WcsApi = {
   overlay:
     role === 'overlay'
       ? {
+          // 走 invoke 而不是 send：主进程侧用 ipcMain.handle 注册了该通道，
+          // 原来用 send 时消息永远到不了 handler（静默丢失）。
           update: (payload) => {
-            ipcRenderer.send(IPC.windowUpdateOverlay, payload);
+            void invoke(IPC.windowUpdateOverlay, payload);
           },
-          onCommand: (cb) => subscribe('overlay:command', cb),
+          onCommand: (cb) => subscribe(IPC.overlayCommand, cb),
           ready: () => {
-            ipcRenderer.send('overlay:ready');
+            ipcRenderer.send(IPC.overlayReady);
           },
         }
       : null,

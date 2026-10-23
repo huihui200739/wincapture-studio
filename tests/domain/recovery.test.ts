@@ -414,3 +414,54 @@ describe('rebuildFromJournal: 属性测试（固定种子 200 组）', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 回归：崩溃暂停判定与重复段记录
+// ---------------------------------------------------------------------------
+
+describe('回归：endedDuringPause 只看 pause/resume', () => {
+  it('最后事件是 segment-begin 时不算「暂停中崩溃」', () => {
+    const entries: RecoveryJournalEntry[] = [
+      entry(1, 'session-start'),
+      entry(2, 'segment-begin', { path: 'a.mp4' }),
+    ];
+    const plan = rebuildFromJournal(entries, []);
+    expect(plan.endedDuringPause).toBe(false);
+    expect(plan.summary).not.toContain('暂停');
+  });
+
+  it('暂停后只有 heartbeat 时仍视为暂停中崩溃', () => {
+    const entries: RecoveryJournalEntry[] = [
+      entry(1, 'session-start'),
+      entry(2, 'pause', { mediaTick: S }),
+      entry(3, 'heartbeat', { mediaTick: S }),
+    ];
+    expect(rebuildFromJournal(entries, []).endedDuringPause).toBe(true);
+  });
+
+  it('pause 之后有 resume 则不算暂停中崩溃', () => {
+    const entries: RecoveryJournalEntry[] = [
+      entry(1, 'session-start'),
+      entry(2, 'pause', { mediaTick: S }),
+      entry(3, 'resume', { mediaTick: 2 * S }),
+      entry(4, 'segment-begin', { path: 'a.mp4' }),
+    ];
+    expect(rebuildFromJournal(entries, []).endedDuringPause).toBe(false);
+  });
+});
+
+describe('回归：重复的段记录不会重复进入已提交清单', () => {
+  it('同一路径的两条记录只保留一条，另一条计入 discarded', () => {
+    const entries: RecoveryJournalEntry[] = [
+      entry(1, 'session-start'),
+      entry(2, 'segment-begin', { path: 'a.mp4' }),
+      entry(3, 'segment-commit', { path: 'a.mp4' }),
+    ];
+    const record = seg(1, 'video', 'a.mp4', 0, 2 * S);
+    const plan = rebuildFromJournal(entries, [record, { ...record }]);
+    expect(plan.committed).toHaveLength(1);
+    expect(plan.discarded).toHaveLength(1);
+    expect(plan.discarded[0].reason).toContain('重复');
+    expect(toMediaRefs(plan)).toHaveLength(1);
+  });
+});

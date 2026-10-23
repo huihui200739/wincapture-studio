@@ -12,22 +12,77 @@ import type { PointerEventLike } from '@domain/types';
 import { findTrack, timelineDuration } from '@domain/project';
 import { evaluateScene } from '@domain/scene';
 import { drawScene, type SceneResources } from '../../media/compositor';
-import { buildStepDrafts } from '@domain/tutorial';
-import { TICKS_PER_SECOND, formatDuration, secondsToTicks, ticksToSeconds, parseDuration } from '@domain/timebase';
+import { buildStepDrafts, stepTimelineTick, timelineTickToStepSource } from '@domain/tutorial';
+import { TimeMap } from '@domain/timeMap';
+import { TICKS_PER_SECOND, formatDuration, secondsToTicks, parseDuration } from '@domain/timebase';
 import type { SetStepCommand } from '@domain/commands';
 import { useApp } from '../lib/store';
-import { Badge, Button, EmptyState, Field, Icon, IconButton, InlineNote, Panel, Spinner, TextInput } from '../components/ui';
+import { Badge, Button, EmptyState, Field, IconButton, InlineNote, Panel, TextInput } from '../components/ui';
 import { cn, unwrap } from '../lib/format';
 import { wcs } from '../lib/wcs';
 import { syntheticCamera, syntheticScreen } from '../lib/syntheticMedia';
+import {
+  paintPreviewPlaceholder,
+  shouldUseSyntheticPreview,
+  usePreviewMedia,
+  type PreviewMediaCache,
+} from '../lib/previewSource';
 
-function stepImageTick(project: Parameters<typeof evaluateScene>[0], step: TutorialStep): number {
-  const duration = timelineDuration(project);
-  return Math.max(0, Math.min(step.imageTick, Math.max(0, duration - 1)));
+/** 步骤标题上限：Markdown 标题/步骤卡片都会展示，过长会破坏排版。 */
+export const MAX_STEP_TITLE_LENGTH = 120;
+/** 步骤说明上限。 */
+export const MAX_STEP_DESCRIPTION_LENGTH = 2000;
+
+/**
+ * 截图时间夹紧：落在 [步骤开始, 步骤结束) 内，且不超过工程时长。
+ *
+ * 领域层在删除区间时会把 imageTick 收进保留下来的步骤区间
+ * （commands.ts deleteRange），说明截图本就应与步骤区间绑定；
+ * 这里用同一口径，避免出现「步骤 2 的截图拍到步骤 5 的画面」。
+ */
+export function clampImageTickForStep(
+  intended: number,
+  sourceRange: { start: number; end: number },
+  durationTicks: number,
+): number {
+  const maxTick = Math.max(0, Math.round(durationTicks) - 1);
+  const lower = Math.max(0, Math.min(maxTick, Math.round(sourceRange.start)));
+  const upper = Math.max(lower, Math.min(maxTick, Math.round(sourceRange.end) - 1));
+  const value = Number.isFinite(intended) ? Math.round(intended) : lower;
+  return Math.max(lower, Math.min(upper, value));
 }
 
-/** 步骤截图（与预览同一路径）。 */
-function StepThumb({ step, tick, maxWidth = 560 }: { step: TutorialStep; tick: number; maxWidth?: number }) {
+/**
+ * 截图时刻在成片时间线上的位置。
+ *
+ * step.imageTick 存的是源时间（与标记、指针日志同一时间轴），播放头/预览都是成片时间，
+ * 必须经 TimeMap 映射。旧实现直接拿源时间当时间线时间用，一旦修剪或删除过前段，
+ * 缩略图与「定位」都会拍到错位的画面。
+ */
+function stepImageTick(project: Parameters<typeof evaluateScene>[0], step: TutorialStep): number {
+  const duration = timelineDuration(project);
+  const maxTick = Math.max(0, duration - 1);
+  const mapped = stepTimelineTick(project, step);
+  if (mapped === null) {
+    // 该时刻已被剪掉：退化为按源时间夹紧，界面另有「截图待更新」提示
+    return clampImageTickForStep(step.imageTick, step.sourceRange, duration);
+  }
+  return Math.max(0, Math.min(maxTick, Math.round(mapped)));
+}
+
+/** 步骤截图（与预览/导出同一路径：真实工程解真实素材，mock 才用合成画面）。 */
+function StepThumb({
+  step,
+  tick,
+  media,
+  maxWidth = 560,
+}: {
+  step: TutorialStep;
+  tick: number;
+  /** 真实模式的共享解码缓存；null 表示 mock 或工程未打开 */
+  media: PreviewMediaCache | null;
+  maxWidth?: number;
+}) {
   const { project } = useApp();
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -40,24 +95,86 @@ function StepThumb({ step, tick, maxWidth = 560 }: { step: TutorialStep; tick: n
     const height = Math.round((maxWidth * ah) / aw);
     canvas.width = width;
     canvas.height = height;
-    const ctx = canvas.getContext('2d', { alpha: false });
-    if (!ctx) return;
-    const seconds = tick / TICKS_PER_SECOND;
-    try {
-      const scene = evaluateScene(project, tick, { outputWidth: width, outputHeight: height, variantId: variant.id });
-      const hasCamera = !!findTrack(project, 'camera')?.clips.length;
+    let cancelled = false;
+
+    const drawWith = (
+      ctx: CanvasRenderingContext2D,
+      scene: Parameters<typeof drawScene>[1],
+      screen: CanvasImageSource | null,
+      screenWidth: number,
+      screenHeight: number,
+      camera: CanvasImageSource | null,
+    ) => {
       const resources: SceneResources = {
-        screen: syntheticScreen(seconds),
-        screenWidth: 1600,
-        screenHeight: 900,
-        camera: hasCamera && scene.camera.visible ? syntheticCamera(seconds) : null,
+        screen,
+        screenWidth,
+        screenHeight,
+        camera,
         cursor: null,
       };
       drawScene(ctx, scene, resources);
+    };
+
+    try {
+      const scene = evaluateScene(project, tick, { outputWidth: width, outputHeight: height, variantId: variant.id });
+      const ctx = canvas.getContext('2d', { alpha: false });
+      if (!ctx) return;
+
+      // mock 模式：合成演示画面（无 window.wcs 时的独立演示）
+      if (shouldUseSyntheticPreview()) {
+        const seconds = tick / TICKS_PER_SECOND;
+        const hasCamera = !!findTrack(project, 'camera')?.clips.length;
+        drawWith(
+          ctx,
+          scene,
+          syntheticScreen(seconds),
+          1600,
+          900,
+          hasCamera && scene.camera.visible ? syntheticCamera(seconds) : null,
+        );
+        return;
+      }
+
+      // 真实模式：异步解码工程里的真实源帧，绝不回退到合成画面
+      if (!media) {
+        paintPreviewPlaceholder(ctx, width, height, '预览解码准备中…');
+        return;
+      }
+      paintPreviewPlaceholder(ctx, width, height, '正在解码截图…');
+      void media
+        .resolve(project, scene, tick, canvas)
+        .then((result) => {
+          if (cancelled || canvasRef.current !== canvas) return;
+          const target = canvas.getContext('2d', { alpha: false });
+          if (!target) return;
+          if (result && (result.screen || !scene.hasSourceFrame)) {
+            drawWith(
+              target,
+              evaluateScene(project, tick, { outputWidth: width, outputHeight: height,
+                variantId: variant.id, pointer: result.pointer }),
+              result.screen,
+              result.screenWidth || width,
+              result.screenHeight || height,
+              result.camera,
+            );
+          } else {
+            paintPreviewPlaceholder(target, width, height, result?.message ?? '正在解码截图…');
+          }
+        })
+        .catch((error) => {
+          if (cancelled || canvasRef.current !== canvas) return;
+          console.error('[tutorial] 截图解码失败', error);
+          const target = canvas.getContext('2d', { alpha: false });
+          if (target) paintPreviewPlaceholder(target, width, height, '截图解码失败，导出画面不受影响');
+        });
     } catch (error) {
       console.error('[tutorial] 截图渲染失败', error);
     }
-  }, [project, tick, maxWidth]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [project, tick, maxWidth, media]);
 
   return <canvas ref={canvasRef} width={maxWidth} height={Math.round((maxWidth * 9) / 16)} aria-label={`步骤 ${step.title} 截图`} />;
 }
@@ -82,23 +199,54 @@ export function TutorialView() {
   const [editingTitle, setEditingTitle] = useState('');
   const [editingDesc, setEditingDesc] = useState('');
   const [editingImage, setEditingImage] = useState('');
-  const [editingId, setEditingId] = useState<string | null>(null);
+
+  /** 真实模式的共享解码缓存（mock 模式为 null，截图用合成演示画面）。 */
+  const previewMedia = usePreviewMedia(projectPath);
 
   const steps = project?.steps ?? [];
   const current = useMemo(() => steps.find((s) => s.id === selectedStepId) ?? steps[0] ?? null, [selectedStepId, steps]);
   const duration = useMemo(() => (project ? timelineDuration(project) : 0), [project]);
+  /** 步骤截图在成片时间线上的位置（源时间 → 时间线时间映射的唯一入口） */
+  const displayImageTickOf = useCallback(
+    (step: TutorialStep) => (project ? stepImageTick(project, step) : 0),
+    [project],
+  );
+
+  /**
+   * 编辑器字段与工程数据的同步基准。
+   *
+   * 只在「切换步骤」或「工程里的值真的变了」时重置输入框；用户正在输入时
+   * 工程值没变，所以不会被覆盖。撤销/重做会改变 current.title 等值，
+   * 这里会跟着回填——否则撤销之后输入框仍显示被撤销的新文案，
+   * 用户一失焦又会把旧值重新写回去。
+   */
+  const syncedStepRef = useRef<{ id: string; title: string; description: string; imageTick: number } | null>(null);
 
   useEffect(() => {
     if (!current) {
-      setEditingId(null);
+      syncedStepRef.current = null;
       return;
     }
-    if (editingId === current.id) return;
-    setEditingId(current.id);
+    const prev = syncedStepRef.current;
+    const sameStep = prev !== null && prev.id === current.id;
+    if (
+      sameStep &&
+      prev.title === current.title &&
+      prev.description === current.description &&
+      prev.imageTick === current.imageTick
+    ) {
+      return;
+    }
+    syncedStepRef.current = {
+      id: current.id,
+      title: current.title,
+      description: current.description,
+      imageTick: current.imageTick,
+    };
     setEditingTitle(current.title);
     setEditingDesc(current.description);
-    setEditingImage(formatDuration(current.imageTick));
-  }, [current, editingId]);
+    setEditingImage(formatDuration(displayImageTickOf(current)));
+  }, [current, displayImageTickOf]);
 
   const saveStep = useCallback(
     (patch: Partial<TutorialStep>) => {
@@ -106,6 +254,29 @@ export function TutorialView() {
       execute<SetStepCommand>({ kind: 'SetStep', step: { ...current, ...patch } }, '编辑教程步骤');
     },
     [current, execute],
+  );
+
+  /** 提交截图时间：输入是成片时间，转回步骤的源时间后夹紧到步骤区间内。 */
+  const commitImageTick = useCallback(
+    (intended: number) => {
+      if (!current || !project) return;
+      const mapped = timelineTickToStepSource(project, current, intended);
+      if (mapped === null) {
+        // 输入落在片段之间的空隙：不能猜一个位置，明确告诉用户
+        pushToast({
+          tone: 'warn',
+          title: '这个时间点没有画面',
+          message: '请填一个有视频画面的时间，或先把播放头移到目标位置再读当前时间。',
+        });
+        setEditingImage(formatDuration(displayImageTickOf(current)));
+        return;
+      }
+      const clamped = clampImageTickForStep(mapped, current.sourceRange, Number.MAX_SAFE_INTEGER);
+      setEditingImage(formatDuration(stepImageTick(project, { ...current, imageTick: clamped })));
+      if (clamped === current.imageTick) return;
+      execute<SetStepCommand>({ kind: 'SetStep', step: { ...current, imageTick: clamped } }, '编辑教程步骤');
+    },
+    [current, displayImageTickOf, execute, project, pushToast],
   );
 
   const generateDrafts = async () => {
@@ -122,10 +293,12 @@ export function TutorialView() {
       } catch {
         clicks = [];
       }
+      // markers/clicks 是录制期的源时间，可能大于成片时长（前面被剪掉了）。
+      // 这里不按成片时长预过滤，先生成再按 TimeMap 映射判断是否还在成片里。
       const drafts = buildStepDrafts(
-        { markers: project.markers, clicks, durationTicks: timelineDuration(project) },
+        { markers: project.markers, clicks, durationTicks: Number.MAX_SAFE_INTEGER },
         { includeClicks: false },
-      );
+      ).filter((draft) => stepTimelineTick(project, draft) !== null);
       if (drafts.length === 0) {
         pushToast({
           tone: 'warn',
@@ -134,13 +307,32 @@ export function TutorialView() {
         });
         return;
       }
-      for (const draft of drafts) {
-        execute<SetStepCommand>({ kind: 'SetStep', step: draft }, '生成教程步骤草稿');
+      // 重复点「由标记生成草稿」不应该把同一条标记变成两个步骤：
+      // 同一个标记时间点已有步骤时跳过（domain 生成的 id 带随机后缀，无法靠 id 去重）。
+      const existingStarts = new Set(
+        project.steps.filter((step) => step.source === 'marker').map((step) => step.sourceRange.start),
+      );
+      const fresh = drafts.filter((draft) => !existingStarts.has(draft.sourceRange.start));
+      if (fresh.length === 0) {
+        pushToast({
+          tone: 'info',
+          title: '步骤已是最新',
+          message: `这 ${drafts.length} 个标记都已经有对应步骤，没有新增。`,
+        });
+        return;
       }
-      selectStep(drafts[0].id);
+      for (const draft of fresh) {
+        // 截图是实时按当前遮挡生成的，新建步骤的隐私版本必须跟随工程，
+        // 否则 buildStepDrafts 写死的 0 会让步骤立刻显示「截图待更新」。
+        execute<SetStepCommand>(
+          { kind: 'SetStep', step: { ...draft, privacyVersion: project.privacyVersion } },
+          '生成教程步骤草稿',
+        );
+      }
+      selectStep(fresh[0].id);
       pushToast({
         tone: 'ok',
-        title: `已生成 ${drafts.length} 个步骤草稿`,
+        title: `已生成 ${fresh.length} 个步骤草稿${fresh.length < drafts.length ? `（跳过 ${drafts.length - fresh.length} 个已存在）` : ''}`,
         message: '草稿标题来自标记备注，请逐个核对标题、说明与截图时间。',
       });
     } catch (error) {
@@ -152,14 +344,28 @@ export function TutorialView() {
 
   const addManualStep = () => {
     if (!project) return;
-    const id = `step-manual-${Date.now().toString(36)}`;
-    const start = Math.max(0, Math.min(tick, Math.max(0, duration - secondsToTicks(2))));
+    if (duration <= 0) {
+      pushToast({ tone: 'warn', title: '工程里还没有画面', message: '先录制或导入素材，再新建教程步骤。' });
+      return;
+    }
+    const id = `step-manual-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+    // 播放头是成片时间，而步骤存的是源时间：先换回源时间，否则剪辑后新步骤会指向错画面
+    const hit = new TimeMap(project).toSource('primaryVideo', Math.max(0, Math.round(tick)));
+    if (!hit) {
+      pushToast({ tone: 'warn', title: '播放头不在视频片段内', message: '把播放头移到有画面的位置再新建步骤。' });
+      return;
+    }
+    // 区间必须保证 start < end，且不越过源片段末尾，否则会写出校验判为 error 的步骤
+    const clipSourceEnd = hit.clip.sourceInTicks + hit.clip.sourceDurationTicks;
+    const start = Math.max(0, Math.min(hit.sourceTick, clipSourceEnd - 1));
+    const end = Math.max(start + 1, Math.min(clipSourceEnd, start + secondsToTicks(3)));
+    const sourceRange = { start, end };
     const step: TutorialStep = {
       id,
-      sourceRange: { start, end: Math.min(duration, start + secondsToTicks(3)) },
+      sourceRange,
       title: `步骤 ${steps.length + 1} 待补充说明`,
       description: '',
-      imageTick: Math.min(Math.max(0, duration - 1), start + secondsToTicks(0.6)),
+      imageTick: clampImageTickForStep(start + secondsToTicks(0.6), sourceRange, Number.MAX_SAFE_INTEGER),
       actionRect: null,
       source: 'manual',
       privacyVersion: project.privacyVersion,
@@ -220,13 +426,14 @@ export function TutorialView() {
       return;
     }
     const first: TutorialStep = { ...step, sourceRange: { start: step.sourceRange.start, end: cut } };
+    const secondRange = { start: cut, end: step.sourceRange.end };
     const second: TutorialStep = {
       ...step,
-      id: `step-split-${Date.now().toString(36)}`,
-      sourceRange: { start: cut, end: step.sourceRange.end },
+      id: `step-split-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+      sourceRange: secondRange,
       title: `${step.title}（续）`,
       description: '',
-      imageTick: Math.min(step.sourceRange.end - 1, cut + secondsToTicks(0.4)),
+      imageTick: clampImageTickForStep(cut + secondsToTicks(0.4), secondRange, Number.MAX_SAFE_INTEGER),
     };
     execute<SetStepCommand>({ kind: 'SetStep', step: first }, '拆分教程步骤');
     execute<SetStepCommand>({ kind: 'SetStep', step: second }, '拆分教程步骤');
@@ -236,7 +443,12 @@ export function TutorialView() {
 
   const syncPrivacyVersion = () => {
     if (!project) return;
-    for (const step of steps) {
+    const stale = steps.filter((step) => step.privacyVersion !== project.privacyVersion);
+    if (stale.length === 0) {
+      pushToast({ tone: 'info', title: '遮挡版本已是最新', message: '没有需要同步的步骤截图。' });
+      return;
+    }
+    for (const step of stale) {
       execute<SetStepCommand>(
         { kind: 'SetStep', step: { ...step, privacyVersion: project.privacyVersion } },
         '同步遮挡版本',
@@ -342,12 +554,12 @@ export function TutorialView() {
                     tabIndex={0}
                     onClick={() => {
                       selectStep(step.id);
-                      setTick(stepImageTick(project, step));
+                      setTick(displayImageTickOf(step));
                     }}
                     onKeyDown={(event) => {
                       if (event.key === 'Enter') {
                         selectStep(step.id);
-                        setTick(stepImageTick(project, step));
+                        setTick(displayImageTickOf(step));
                       }
                     }}
                   >
@@ -357,7 +569,7 @@ export function TutorialView() {
                       {step.description && <span className="step-desc">{step.description}</span>}
                       <span className="step-meta">
                         <span>{formatDuration(step.sourceRange.start)} → {formatDuration(step.sourceRange.end)}</span>
-                        <span>截图 {formatDuration(step.imageTick)}</span>
+                        <span>截图 {formatDuration(displayImageTickOf(step))}</span>
                         {step.source === 'marker' && <Badge tone="muted">标记</Badge>}
                         {step.source === 'manual' && <Badge tone="muted">手动</Badge>}
                         {step.source === 'click' && <Badge tone="muted">点击</Badge>}
@@ -382,7 +594,7 @@ export function TutorialView() {
               <Panel
                 title={`步骤 ${steps.findIndex((s) => s.id === current.id) + 1} · 编辑`}
                 icon="editor"
-                subtitle={`截图时间 ${formatDuration(current.imageTick)}`}
+                subtitle={`截图时间 ${formatDuration(displayImageTickOf(current))}`}
                 actions={
                   <>
                     <Button size="sm" variant="ghost" icon="merge" onClick={() => mergeWithNext(current.id)}>
@@ -396,32 +608,51 @@ export function TutorialView() {
               >
                 <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 14 }}>
                   <div>
-                    <Field label="标题" htmlFor="step-title">
+                    <Field
+                      label="标题"
+                      htmlFor="step-title"
+                      hint={`最多 ${MAX_STEP_TITLE_LENGTH} 个字符；清空后失焦会恢复原标题。`}
+                    >
                       <TextInput
                         id="step-title"
                         value={editingTitle}
+                        maxLength={MAX_STEP_TITLE_LENGTH}
                         onChange={(event) => setEditingTitle(event.target.value)}
                         onBlur={() => {
-                          const next = editingTitle.trim();
-                          if (next && next !== current.title) saveStep({ title: next });
+                          const next = editingTitle.trim().slice(0, MAX_STEP_TITLE_LENGTH);
+                          if (!next) {
+                            // 空标题直接丢弃会让输入框看起来「已清空」、工程里却还是旧标题
+                            setEditingTitle(current.title);
+                            pushToast({ tone: 'warn', title: '标题不能为空', message: '已恢复原标题。' });
+                            return;
+                          }
+                          if (next !== current.title) saveStep({ title: next });
+                          else if (next !== editingTitle) setEditingTitle(next);
                         }}
                         placeholder="例如：填写联系人信息"
                       />
                     </Field>
-                    <Field label="说明" htmlFor="step-desc" hint="说明写清楚「在哪、做什么、会看到什么」，不要编造界面功能">
+                    <Field
+                      label="说明"
+                      htmlFor="step-desc"
+                      hint="说明写清楚「在哪、做什么、会看到什么」，不要编造界面功能"
+                    >
                       <textarea
                         id="step-desc"
                         className="wcs-textarea"
                         rows={4}
                         value={editingDesc}
+                        maxLength={MAX_STEP_DESCRIPTION_LENGTH}
                         onChange={(event) => setEditingDesc(event.target.value)}
                         onBlur={() => {
-                          if (editingDesc !== current.description) saveStep({ description: editingDesc });
+                          if (editingDesc !== current.description) {
+                            saveStep({ description: editingDesc.slice(0, MAX_STEP_DESCRIPTION_LENGTH) });
+                          }
                         }}
                         placeholder="描述这一步的操作与预期结果"
                       />
                     </Field>
-                    <Field label="截图时间" htmlFor="step-image" hint="输入 mm:ss.cc 或纯秒数，回车或失焦生效">
+                    <Field label="截图时间" htmlFor="step-image" hint="输入 mm:ss.cc 或纯秒数，回车或失焦生效；会夹紧到步骤区间内">
                       <div style={{ display: 'flex', gap: 6 }}>
                         <TextInput
                           id="step-image"
@@ -431,29 +662,16 @@ export function TutorialView() {
                             const parsed = parseDuration(editingImage);
                             if (parsed == null) {
                               pushToast({ tone: 'warn', title: '时间格式无法识别', message: '请使用 mm:ss.cc 或纯秒数。' });
-                              setEditingImage(formatDuration(current.imageTick));
+                              setEditingImage(formatDuration(displayImageTickOf(current)));
                               return;
                             }
-                            const clamped = Math.max(
-                              current.sourceRange.start,
-                              Math.min(Math.max(0, duration - 1), parsed),
-                            );
-                            saveStep({ imageTick: clamped });
-                            setEditingImage(formatDuration(clamped));
+                            commitImageTick(parsed);
                           }}
                           onKeyDown={(event) => {
                             if (event.key === 'Enter') (event.target as HTMLInputElement).blur();
                           }}
                         />
-                        <Button
-                          size="sm"
-                          icon="clock"
-                          onClick={() => {
-                            const clamped = Math.max(current.sourceRange.start, Math.min(Math.max(0, duration - 1), tick));
-                            saveStep({ imageTick: clamped });
-                            setEditingImage(formatDuration(clamped));
-                          }}
-                        >
+                        <Button size="sm" icon="clock" onClick={() => commitImageTick(tick)}>
                           取播放头
                         </Button>
                       </div>
@@ -463,7 +681,7 @@ export function TutorialView() {
                         size="sm"
                         icon="play"
                         onClick={() => {
-                          setTick(stepImageTick(project, current));
+                          setTick(displayImageTickOf(current));
                           setView('editor');
                         }}
                       >
@@ -476,7 +694,7 @@ export function TutorialView() {
                   </div>
                   <div>
                     <div className="step-editor-preview">
-                      <StepThumb step={current} tick={stepImageTick(project, current)} maxWidth={560} />
+                      <StepThumb step={current} tick={displayImageTickOf(current)} media={previewMedia} maxWidth={560} />
                     </div>
                     <p className="wcs-field-hint" style={{ marginTop: 6 }}>
                       截图由 evaluateScene + drawScene 生成，与视频导出使用同一份遮挡结果（当前遮挡版本 v
@@ -520,22 +738,34 @@ export function TutorialView() {
                   <Button
                     size="sm"
                     variant="ghost"
-                    onClick={() =>
+                    onClick={() => {
+                      // 区间必须保持 start < end：若播放头已经越过结束点，
+                      // 直接取 tick 会写出零长度/反向区间（domain 校验判为 error）
+                      const end = Math.max(1, current.sourceRange.end);
+                      const start = Math.max(0, Math.min(Math.round(tick), end - 1));
+                      const range = { start, end };
                       saveStep({
-                        sourceRange: { start: Math.min(tick, current.sourceRange.end), end: current.sourceRange.end },
-                      })
-                    }
+                        sourceRange: range,
+                        imageTick: clampImageTickForStep(current.imageTick, range, duration),
+                      });
+                    }}
                   >
                     开始设为播放头
                   </Button>
                   <Button
                     size="sm"
                     variant="ghost"
-                    onClick={() =>
+                    onClick={() => {
+                      const start = current.sourceRange.start;
+                      const desiredEnd = Math.max(Math.round(tick), start + 1, start + secondsToTicks(0.2));
+                      const maxEnd = Math.max(start + 1, duration);
+                      const end = Math.min(desiredEnd, maxEnd);
+                      const range = { start, end };
                       saveStep({
-                        sourceRange: { start: current.sourceRange.start, end: Math.max(tick, current.sourceRange.start + secondsToTicks(0.2)) },
-                      })
-                    }
+                        sourceRange: range,
+                        imageTick: clampImageTickForStep(current.imageTick, range, duration),
+                      });
+                    }}
                   >
                     结束设为播放头
                   </Button>

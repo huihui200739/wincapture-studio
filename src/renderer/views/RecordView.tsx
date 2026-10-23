@@ -25,7 +25,6 @@ import {
   EmptyState,
   Field,
   Icon,
-  IconButton,
   InlineNote,
   LevelMeter,
   Panel,
@@ -46,9 +45,99 @@ import {
 } from '../lib/format';
 import { wcs } from '../lib/wcs';
 import { syntheticCamera, syntheticScreen } from '../lib/syntheticMedia';
-import { TICKS_PER_SECOND } from '@domain/timebase';
+import { isSourceInKind, pickSourceForKind } from '../uiSync';
 
 const MIN_FREE_BYTES = 512 * 1024 * 1024;
+
+/**
+ * 枚举摄像头设备。
+ *
+ * 主进程的 capture:list-devices 只返回音频设备，video 固定为空数组
+ * （注释写着「视频设备由渲染进程通过 navigator.mediaDevices 枚举后回传」），
+ * 但旧版 RecordView 没有实现这段枚举，导致：
+ *  - 摄像头设备下拉框永远只有「系统默认摄像头」；
+ *  - 面板永远显示「没有检测到摄像头」，即使机器上有摄像头。
+ * 这里补上真实枚举；未授权时 label 为空串，给可读兜底名。
+ */
+async function enumerateVideoDevices(): Promise<VideoDeviceInfo[]> {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices
+    .filter((device) => device.kind === 'videoinput')
+    .map((device, index) => ({
+      deviceId: device.deviceId,
+      label: device.label || `摄像头 ${index + 1}`,
+    }));
+}
+
+/**
+ * 数值输入框（本地草稿 + 合法时即时提交）。
+ *
+ * 直接受控绑定数字值时：清空会被 Number('') === 0 当成 0 立刻提交（宽/高瞬间变 0），
+ * 输入 '-' 得到 NaN 被静默丢弃，用户既打不出负号也看不到解释。
+ * 这里保留字符串草稿，只有解析成功且非空才提交，失焦时再夹紧并回填。
+ */
+function NumberDraftInput({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onCommit: (next: number) => void;
+}) {
+  const [draft, setDraft] = useState(() => String(value));
+  // 外部值变化（切换来源、区域被夹紧）时同步草稿，但不打断正在输入的内容
+  useEffect(() => {
+    setDraft((prev) => (Number(prev) === value && prev.trim() !== '' ? prev : String(value)));
+  }, [value]);
+
+  const normalize = (raw: string): number | null => {
+    const trimmed = raw.trim();
+    if (trimmed === '' || trimmed === '-' || trimmed === '+') return null;
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.round(parsed);
+  };
+
+  return (
+    <TextInput
+      type="number"
+      min={min}
+      max={max}
+      step={step}
+      value={draft}
+      onChange={(event) => {
+        const raw = event.target.value;
+        setDraft(raw);
+        const parsed = normalize(raw);
+        if (parsed === null) return;
+        if (parsed < min || parsed > max) return;
+        onCommit(parsed);
+      }}
+      onBlur={() => {
+        const parsed = normalize(draft);
+        if (parsed === null) {
+          setDraft(String(value));
+          return;
+        }
+        const clamped = Math.max(min, Math.min(max, parsed));
+        onCommit(clamped);
+        setDraft(String(clamped));
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') (event.target as HTMLInputElement).blur();
+      }}
+      aria-label={label}
+    />
+  );
+}
 
 export function RecordView() {
   const {
@@ -56,8 +145,6 @@ export function RecordView() {
     updateConfig,
     startRecording,
     capture,
-    capturing,
-    cancelRecording,
     stopRecording,
     pushToast,
     pushError,
@@ -75,20 +162,62 @@ export function RecordView() {
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [sourceKind, setSourceKind] = useState<'screen' | 'window'>('screen');
+  const [sourceKind, setSourceKind] = useState<'screen' | 'window'>(config.sourceKind ?? 'screen');
   const [regionEnabled, setRegionEnabled] = useState(false);
   const [freeBytes, setFreeBytes] = useState<number | null>(null);
   const [pathCheck, setPathCheck] = useState<{ ok: boolean; writable: boolean; reason?: string } | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [levels, setLevels] = useState({ mic: 0, system: 0 });
   const [devicesError, setDevicesError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  /** 待启动时记录「界面倒计时用掉的秒数」，启动后要恢复用户设置 */
+  const [pendingStart, setPendingStart] = useState<number | null>(null);
 
   const cameraRef = useRef<HTMLCanvasElement | null>(null);
   const previewRef = useRef<HTMLCanvasElement | null>(null);
   const countdownTimer = useRef<number | null>(null);
+  /** 倒计时是否有效（timer 回调里同步判断，避免旧定时器在多轮点击后继续推进） */
+  const countdownActiveRef = useRef(false);
+  /** 启动请求是否已发出（同步挡双击） */
+  const startingRef = useRef(false);
+  /** 设备枚举的请求代号：只接受最后一次请求的结果，避免旧结果覆盖新选择 */
+  const loadGeneration = useRef(0);
+  const mountedRef = useRef(true);
+  /** 最新 config / startRecording：异步回调里读当前值，避免闭包拿到旧配置 */
+  const configRef = useRef(config);
+  configRef.current = config;
+  const startRecordingRef = useRef(startRecording);
+  startRecordingRef.current = startRecording;
+
+  // ---- 卸载标记：异步回调里不再 setState ----
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  /** 只刷新摄像头列表（热插拔 / devicechange 用，避免整页重新枚举闪一下）。 */
+  const refreshVideoDevices = useCallback(async () => {
+    try {
+      const list = await enumerateVideoDevices();
+      if (!mountedRef.current) return;
+      setVideoDevices(list);
+      setDevicesError(null);
+      const current = configRef.current;
+      if (list.length > 0 && !list.some((device) => device.deviceId === current.cameraDeviceId)) {
+        // 之前选的摄像头被拔掉了：回退到默认设备，而不是留着一个不存在的 deviceId
+        updateConfig({ cameraDeviceId: list[0].deviceId });
+      }
+    } catch (error) {
+      if (!mountedRef.current) return;
+      setDevicesError(`摄像头枚举失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [updateConfig]);
 
   // ---- 读取设备与来源 ----
   const loadAll = useCallback(async () => {
+    const generation = ++loadGeneration.current;
     setLoading(true);
     setLoadError(null);
     setDevicesError(null);
@@ -100,33 +229,52 @@ export function RecordView() {
         wcs().qualityProfiles(),
         wcs().systemInfo(),
       ]);
+      // 别让「先点刷新、再点重试」时较慢的旧请求覆盖新结果
+      if (loadGeneration.current !== generation) return;
       const sourceList = unwrap(src);
       setSources(sourceList);
       setDisplays(unwrap(disp));
       const deviceBundle = unwrap(dev);
       setAudioDevices(deviceBundle.audio);
-      setVideoDevices(deviceBundle.video);
       setProfiles(unwrap(prof));
       setSystem(unwrap(sys));
 
-      // 默认选中第一个可用来源
-      if (!config.sourceId) {
-        const firstScreen = sourceList.find((s) => s.kind === 'screen' && s.available);
-        if (firstScreen) {
-          updateConfig({ sourceId: firstScreen.id, sourceKind: 'screen' });
-          setSourceKind('screen');
+      // 摄像头设备主进程不返回，改由渲染进程枚举（见 enumerateVideoDevices）
+      let videoList = deviceBundle.video;
+      if (videoList.length === 0) {
+        try {
+          videoList = await enumerateVideoDevices();
+        } catch (error) {
+          setDevicesError(`摄像头枚举失败：${error instanceof Error ? error.message : String(error)}`);
         }
+        if (loadGeneration.current !== generation) return;
       }
-      const micDefault = deviceBundle.audio.find((d) => d.kind === 'audioinput' && d.isDefault) ?? deviceBundle.audio.find((d) => d.kind === 'audioinput');
-      if (micDefault && !config.microphoneDeviceId) updateConfig({ microphoneDeviceId: micDefault.deviceId });
-      const camDefault = deviceBundle.video[0];
-      if (camDefault && !config.cameraDeviceId) updateConfig({ cameraDeviceId: camDefault.deviceId });
+      setVideoDevices(videoList);
+
+      // 默认选中来源：优先当前选中项，其次第一个可用来源
+      const current = configRef.current;
+      if (!current.sourceId || !sourceList.some((item) => item.id === current.sourceId)) {
+        const first =
+          sourceList.find((item) => item.id === current.sourceId) ??
+          sourceList.find((item) => item.kind === current.sourceKind && item.available) ??
+          sourceList.find((item) => item.available);
+        if (first) updateConfig({ sourceId: first.id, sourceKind: first.kind });
+      }
+      const micDefault =
+        deviceBundle.audio.find((d) => d.kind === 'audioinput' && d.isDefault) ??
+        deviceBundle.audio.find((d) => d.kind === 'audioinput');
+      if (micDefault && !current.microphoneDeviceId) updateConfig({ microphoneDeviceId: micDefault.deviceId });
+      const camDefault = videoList[0];
+      if (camDefault && !current.cameraDeviceId) updateConfig({ cameraDeviceId: camDefault.deviceId });
     } catch (error) {
+      if (loadGeneration.current !== generation) return;
       const presented = pushError(error, '读取录制设备失败');
       setLoadError(presented.message);
     } finally {
-      setLoading(false);
+      if (loadGeneration.current === generation) setLoading(false);
     }
+    // 依赖保持为空：设备枚举只应在挂载与手动「重新检测」时触发，
+    // 当前选择从 configRef 读，避免每次改配置都重枚举一次设备。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -135,21 +283,60 @@ export function RecordView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 摄像头热插拔：设备变化时只刷新摄像头列表并纠正失效选择
+  useEffect(() => {
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.addEventListener) return;
+    let timer = 0;
+    const onChange = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => void refreshVideoDevices(), 300);
+    };
+    mediaDevices.addEventListener('devicechange', onChange);
+    return () => {
+      window.clearTimeout(timer);
+      mediaDevices.removeEventListener('devicechange', onChange);
+    };
+  }, [refreshVideoDevices]);
+
   // ---- 磁盘检查 ----
+  const videosPath = system?.videosPath ?? '';
   const checkDisk = useCallback(async () => {
+    // 系统信息还没回来时不要拿空串去检查：checkPath('') 会落到进程工作目录，
+    // 读出一个和真实输出目录无关的剩余空间，界面会显示错误的可录时长。
+    if (!videosPath) {
+      setFreeBytes(null);
+      setPathCheck(null);
+      return;
+    }
     try {
-      const result = unwrap(await wcs().checkPath(system?.videosPath ?? ''));
+      const result = unwrap(await wcs().checkPath(videosPath));
+      if (!mountedRef.current) return;
       setFreeBytes(result.freeBytes);
       setPathCheck({ ok: result.ok, writable: result.writable, reason: result.reason });
     } catch (error) {
+      if (!mountedRef.current) return;
       setPathCheck({ ok: false, writable: false, reason: describeSafe(error) });
       setFreeBytes(null);
     }
-  }, [system?.videosPath]);
+  }, [videosPath]);
 
   useEffect(() => {
     void checkDisk();
   }, [checkDisk]);
+
+  /** 打开录制输出目录（产物目录由主进程固定为系统「视频」目录，界面不能改）。 */
+  const openOutputDir = useCallback(async () => {
+    if (!videosPath) {
+      pushToast({ tone: 'warn', title: '输出目录还未就绪', message: '系统信息加载完成后再试一次。' });
+      return;
+    }
+    try {
+      unwrap(await wcs().openPath(videosPath));
+    } catch (error) {
+      pushError(error, '打开输出目录失败');
+    }
+  }, [pushError, pushToast, videosPath]);
 
   // ---- 电平：录制中取主进程推送，空闲时用本地动画表示「设备已就绪」 ----
   useEffect(() => {
@@ -157,20 +344,35 @@ export function RecordView() {
       setLevels(capture.levels);
       return;
     }
+    if (apiMode !== 'mock') {
+      setLevels({ mic: 0, system: 0 });
+      return;
+    }
+    // 旧实现的清理只 cancelAnimationFrame(raf)，但真正的循环节拍在 setTimeout 里：
+    // 卸载瞬间如果正停在 timeout 窗口内，取消 rAF 是空操作，tick 会继续排下一轮，
+    // 于是组件卸载后仍然每 90ms setState（长时间开着页面/反复切视图会累积计时器）。
+    let cancelled = false;
     let raf = 0;
+    let timeout = 0;
     const tick = () => {
+      if (cancelled) return;
       const t = performance.now() / 1000;
       setLevels({
         mic: config.microphoneEnabled ? Math.max(0, 0.3 + Math.sin(t * 4.1) * 0.2 + Math.sin(t * 9.3) * 0.09) : 0,
         system: config.systemAudioEnabled ? Math.max(0, 0.16 + Math.sin(t * 2.7 + 1) * 0.13 + Math.sin(t * 7.9) * 0.05) : 0,
       });
-      raf = requestAnimationFrame(() => window.setTimeout(tick, 90));
+      timeout = window.setTimeout(() => {
+        if (cancelled) return;
+        raf = requestAnimationFrame(tick);
+      }, 90);
     };
     tick();
     return () => {
+      cancelled = true;
       cancelAnimationFrame(raf);
+      window.clearTimeout(timeout);
     };
-  }, [capture, config.microphoneEnabled, config.systemAudioEnabled]);
+  }, [capture, config.microphoneEnabled, config.systemAudioEnabled, apiMode]);
 
   // ---- 摄像头预览 ----
   useEffect(() => {
@@ -243,6 +445,33 @@ export function RecordView() {
   }, [selectedSource?.id]);
 
   useEffect(() => {
+    if (apiMode !== 'mock') {
+      const canvas = previewRef.current;
+      const ctx = canvas?.getContext('2d');
+      if (!canvas || !ctx) return;
+      let cancelled = false;
+      ctx.fillStyle = '#101418';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      const image = new Image();
+      image.onload = () => {
+        if (cancelled) return;
+        const crop = regionEnabled ? region : { x: 0, y: 0, width: selectedSource?.width ?? 1, height: selectedSource?.height ?? 1 };
+        const sx = crop.x / (selectedSource?.width || 1) * image.width;
+        const sy = crop.y / (selectedSource?.height || 1) * image.height;
+        const sw = crop.width / (selectedSource?.width || 1) * image.width;
+        const sh = crop.height / (selectedSource?.height || 1) * image.height;
+        const scale = Math.min(canvas.width / sw, canvas.height / sh);
+        ctx.fillStyle = '#101418';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(image, sx, sy, sw, sh, (canvas.width - sw * scale) / 2, (canvas.height - sh * scale) / 2, sw * scale, sh * scale);
+      };
+      if (selectedSource?.thumbnail) image.src = selectedSource.thumbnail;
+      else {
+        ctx.fillStyle = '#a4adba'; ctx.font = '16px "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('选择来源并刷新缩略图以预览', canvas.width / 2, canvas.height / 2);
+      }
+      return () => { cancelled = true; image.onload = null; image.onerror = null; };
+    }
     let raf = 0;
     const draw = () => {
       const canvas = previewRef.current;
@@ -261,7 +490,7 @@ export function RecordView() {
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [apiMode, selectedSource, regionEnabled, region]);
 
   const filteredSources = useMemo(() => sources.filter((s) => s.kind === sourceKind), [sources, sourceKind]);
 
@@ -272,36 +501,101 @@ export function RecordView() {
   const diskTight = freeBytes != null && !diskInsufficient && freeBytes < 2 * 1024 ** 3;
 
   const sourcePixelHint = useMemo(() => {
+    // 自定义区域录制时输出就是区域原生像素，不做缩放，缩放提示不适用
+    if (regionEnabled) return null;
     if (!selectedSource) return null;
     if (selectedSource.width === quality.width && selectedSource.height === quality.height) return null;
     if (selectedSource.width > quality.width) {
       return `来源 ${selectedSource.width} × ${selectedSource.height} 高于所选档位，会按 ${quality.width} × ${quality.height} 缩放输出（文字可能变软）。`;
     }
     return `来源 ${selectedSource.width} × ${selectedSource.height} 低于所选档位，会放大到 ${quality.width} × ${quality.height}，清晰度受源限制。`;
-  }, [selectedSource, quality]);
+  }, [regionEnabled, selectedSource, quality]);
+
+  // 切换到「窗口 / 显示器」分栏时，选中项必须跟着收敛到该分栏，
+  // 否则会拿上一个分栏的来源去开录（界面显示「窗口」，实际录的是显示器）。
+  useEffect(() => {
+    if (config.sourceKind === sourceKind) return;
+    const selection = pickSourceForKind(sources, sourceKind, config.sourceId);
+    updateConfig(selection);
+  }, [config.sourceId, config.sourceKind, sourceKind, sources, updateConfig]);
 
   // ---- 倒计时 ----
-  const beginCountdown = useCallback(() => {
-    if (countdown !== null) return;
-    const seconds = Math.max(0, config.countdownSeconds);
-    if (seconds === 0) {
-      void startRecording();
+  /**
+   * 真正发出启动请求。
+   *
+   * 关键修复：界面已经在本页做过一次倒计时，采集引擎内部还会按
+   * config.countdownSeconds 再倒计时一次（store.startRecording 原样传 config），
+   * 实测点「开始录制」后要等约 6 秒才真正出画面，中间 3 秒没有任何提示。
+   * 这里先把 config 置 0 并用「置 0 后的 render」里的 startRecording 发请求，
+   * 请求发出后立刻恢复用户设置（见下方 pendingStart effect）。
+   * store.startRecording 增加 countdownSeconds 覆盖参数后可以删掉这段兼容逻辑。
+   */
+  const finishStart = useCallback(
+    (restoreCountdown: number | null) => {
+      const started = startRecordingRef.current();
+      void started
+        .catch(() => {
+          // store.startRecording 内部已经 pushError；这里只保证 finally 一定跑
+        })
+        .finally(() => {
+          startingRef.current = false;
+          if (mountedRef.current) setStarting(false);
+          if (restoreCountdown !== null) updateConfig({ countdownSeconds: restoreCountdown });
+        });
+    },
+    [updateConfig],
+  );
+
+  const startEngine = useCallback(() => {
+    if (startingRef.current) return;
+    startingRef.current = true;
+    setStarting(true);
+    const seconds = Math.max(0, Math.round(configRef.current.countdownSeconds));
+    if (seconds > 0) {
+      setPendingStart(seconds);
+      updateConfig({ countdownSeconds: 0 });
       return;
     }
+    finishStart(null);
+  }, [finishStart, updateConfig]);
+
+  useEffect(() => {
+    if (pendingStart === null) return;
+    if (config.countdownSeconds !== 0) {
+      // 等待期间用户又改了倒计时设置：再压回 0，避免启动流程永远等不到条件
+      updateConfig({ countdownSeconds: 0 });
+      return;
+    }
+    setPendingStart(null);
+    finishStart(pendingStart);
+  }, [config.countdownSeconds, finishStart, pendingStart, updateConfig]);
+
+  const beginCountdown = useCallback(() => {
+    if (startingRef.current || countdownActiveRef.current || pendingStart !== null) return;
+    const seconds = Math.max(0, Math.round(configRef.current.countdownSeconds));
+    if (seconds === 0) {
+      startEngine();
+      return;
+    }
+    countdownActiveRef.current = true;
     setCountdown(seconds);
     const step = (remaining: number) => {
+      if (!countdownActiveRef.current) return;
       if (remaining <= 0) {
+        countdownActiveRef.current = false;
+        countdownTimer.current = null;
         setCountdown(null);
-        void startRecording();
+        startEngine();
         return;
       }
       setCountdown(remaining);
       countdownTimer.current = window.setTimeout(() => step(remaining - 1), 1000);
     };
     countdownTimer.current = window.setTimeout(() => step(seconds - 1), 1000);
-  }, [config.countdownSeconds, countdown, startRecording]);
+  }, [pendingStart, startEngine]);
 
   const cancelCountdown = useCallback(() => {
+    countdownActiveRef.current = false;
     if (countdownTimer.current !== null) {
       window.clearTimeout(countdownTimer.current);
       countdownTimer.current = null;
@@ -310,8 +604,23 @@ export function RecordView() {
     pushToast({ tone: 'info', title: '已取消倒计时', message: '没有开始采集。' });
   }, [pushToast]);
 
+  // Esc 取消倒计时：界面文案一直写着「取消（Esc）」，但旧实现只绑了按钮。
+  useEffect(() => {
+    if (countdown === null) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        cancelCountdown();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [cancelCountdown, countdown]);
+
+  // 卸载时清掉倒计时定时器
   useEffect(
     () => () => {
+      countdownActiveRef.current = false;
       if (countdownTimer.current !== null) window.clearTimeout(countdownTimer.current);
     },
     [],
@@ -320,20 +629,39 @@ export function RecordView() {
   // 录制中状态：显示悬浮控制条预览与停止入口
   const recording = !!capture && ['Preparing', 'Countdown', 'Recording', 'Pausing', 'Paused', 'Resuming', 'Stopping', 'Finalizing'].includes(capture.state);
 
+  /** 实际会输出的分辨率：录制开始后以主进程回报的 effective 为准（区域录制会小于来源）。 */
+  const effectiveResolution = useMemo(() => {
+    if (capture?.effective) return `${capture.effective.width} × ${capture.effective.height}`;
+    if (regionEnabled && selectedSource) return `${region.width} × ${region.height}`;
+    return selectedSource ? `${selectedSource.width} × ${selectedSource.height}` : '未选择来源';
+  }, [capture?.effective, region.width, region.height, regionEnabled, selectedSource]);
+
+  const cameraDegradation = useMemo(() => {
+    const reason = capture?.degradation;
+    return reason && /摄像头/.test(reason) ? reason : null;
+  }, [capture?.degradation]);
+
   const blockedReason = useMemo(() => {
     if (!config.sourceId) return '请先选择一个录制来源。';
+    // 选中项必须属于当前分栏，否则「开始录制」会拿一个界面上看不见的来源开录
+    if (!isSourceInKind(sources, sourceKind, config.sourceId)) {
+      return `当前分栏（${sourceKind === 'screen' ? '显示器' : '窗口'}）还没有选择录制对象，请先选择一个。`;
+    }
     if (selectedSource && !selectedSource.available) return '该来源受系统保护或已关闭，请换一个来源。';
-    if (diskInsufficient) return `磁盘可用空间不足 ${formatBytes(MIN_FREE_BYTES)}，请清理磁盘或换输出目录。`;
-    if (pathCheck && !pathCheck.writable) return pathCheck.reason || '输出目录不可写，请在设置里换一个目录。';
+    if (diskInsufficient) return `磁盘可用空间不足 ${formatBytes(MIN_FREE_BYTES)}，请清理磁盘或打开输出目录清理。`;
+    if (pathCheck && !pathCheck.writable) return pathCheck.reason || '输出目录不可写，请检查磁盘权限。';
     return null;
-  }, [config.sourceId, selectedSource, diskInsufficient, pathCheck]);
+  }, [config.sourceId, diskInsufficient, pathCheck, selectedSource, sourceKind, sources]);
 
   return (
     <div className="view">
       <div className="view-head">
         <div>
           <h1>录制设置</h1>
-          <p>选择来源、检查设备与磁盘，确认预览后开始 3 秒倒计时。</p>
+          <p>
+            选择来源、检查设备与磁盘，确认预览后
+            {config.countdownSeconds > 0 ? `开始 ${config.countdownSeconds} 秒倒计时。` : '立即开始录制。'}
+          </p>
         </div>
         <div className="view-actions">
           <Button size="sm" variant="ghost" icon="refresh" onClick={() => void loadAll()} disabled={loading}>
@@ -353,12 +681,12 @@ export function RecordView() {
               size="md"
               variant="primary"
               icon="record"
-              disabled={!!blockedReason || busy.capture}
-              loading={busy.capture}
+              disabled={!!blockedReason || busy.capture || starting || countdown !== null}
+              loading={busy.capture || starting}
               onClick={beginCountdown}
-              title={blockedReason ?? '开始 3 秒倒计时'}
+              title={blockedReason ?? (config.countdownSeconds > 0 ? `开始 ${config.countdownSeconds} 秒倒计时` : '立即开始录制')}
             >
-              开始录制
+              {starting ? '正在启动采集…' : countdown !== null ? `倒计时 ${countdown}…` : '开始录制'}
             </Button>
           )}
         </div>
@@ -387,12 +715,13 @@ export function RecordView() {
             {diskInsufficient && (
               <div style={{ marginTop: 6, display: 'flex', gap: 6 }}>
                 <Button size="sm" onClick={() => void checkDisk()}>重新检查磁盘</Button>
-                <Button size="sm" variant="ghost" onClick={() => void wcs().pickDirectory()}>更换输出目录</Button>
+                <Button size="sm" variant="ghost" icon="folder" onClick={() => void openOutputDir()}>打开输出目录</Button>
               </div>
             )}
             {pathCheck && !pathCheck.writable && (
-              <div style={{ marginTop: 6 }}>
-                <Button size="sm" onClick={() => void wcs().pickDirectory()}>选择可写目录</Button>
+              <div style={{ marginTop: 6, display: 'flex', gap: 6 }}>
+                <Button size="sm" onClick={() => void checkDisk()}>重新检查</Button>
+                <Button size="sm" variant="ghost" icon="folder" onClick={() => void openOutputDir()}>打开输出目录</Button>
               </div>
             )}
           </InlineNote>
@@ -533,18 +862,15 @@ export function RecordView() {
                       ] as const
                     ).map((item) => (
                       <Field key={item.key} label={item.label}>
-                        <TextInput
-                          type="number"
+                        <NumberDraftInput
+                          label={item.label}
                           min={item.min}
                           max={item.max}
                           step={2}
                           value={region[item.key]}
-                          onChange={(event) => {
-                            const raw = Number(event.target.value);
-                            if (!Number.isFinite(raw)) return;
-                            updateRegion({ [item.key]: Math.round(raw) } as Partial<typeof region>);
-                          }}
-                          aria-label={item.label}
+                          onCommit={(next) =>
+                            updateRegion({ [item.key]: next } as Partial<typeof region>)
+                          }
                         />
                       </Field>
                     ))}
@@ -571,7 +897,7 @@ export function RecordView() {
                 <canvas ref={previewRef} width={640} height={360} style={{ width: '100%', display: 'block' }} />
                 <div style={{ position: 'absolute', left: 8, top: 8, display: 'flex', gap: 5 }}>
                   <Badge tone="accent" icon="record">
-                    预览 · 未开始采集
+                    {apiMode === 'mock' ? '示例预览' : '来源快照 · 点击刷新更新'}
                   </Badge>
                   {selectedSource && <Badge tone="neutral">{`${selectedSource.width} × ${selectedSource.height}`}</Badge>}
                 </div>
@@ -591,7 +917,7 @@ export function RecordView() {
               </div>
             </Panel>
 
-            <Panel title="声音" icon="mic" subtitle="实时电平">
+            <Panel title="声音" icon="mic" subtitle={capture ? '实时电平' : apiMode === 'mock' ? '示例电平' : '开始录制后显示电平'}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <Toggle
                   checked={config.microphoneEnabled}
@@ -638,21 +964,25 @@ export function RecordView() {
                       : '录制中会显示真实电平；此处为设备就绪指示。'
                   }
                 />
-                {devicesError && <InlineNote tone="warn">{devicesError}</InlineNote>}
               </div>
             </Panel>
           </div>
 
           {/* ---- 摄像头 ---- */}
-          <Panel title="摄像头" icon="camera" subtitle={config.cameraEnabled ? '画中画预览' : '已关闭'}>
+          <Panel
+            title="摄像头"
+            icon="camera"
+            subtitle={config.cameraEnabled ? '画中画示意' : '已关闭'}
+          >
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1.6fr)', gap: 14 }}>
               <div>
                 <div className="camera-preview">
                   {config.cameraEnabled ? (
                     <>
-                      <canvas ref={cameraRef} width={480} height={360} aria-label="摄像头预览" />
+                      <canvas ref={cameraRef} width={480} height={360} aria-label="摄像头预览（示意画面）" />
                       <div className="camera-preview-overlay">
-                        <Badge tone="ok" icon="camera">设备就绪</Badge>
+                        {/* 这里是合成示意画面：真开摄像头会占用设备，录制时独立采集窗口就打不开了 */}
+                        <Badge tone="neutral" icon="camera">示意画面 · 不占用摄像头</Badge>
                       </div>
                     </>
                   ) : (
@@ -664,6 +994,9 @@ export function RecordView() {
                     </div>
                   )}
                 </div>
+                <p className="wcs-field-hint" style={{ marginTop: 8 }}>
+                  预览是示意画面。真实取景在录制时由独立的采集窗口完成，避免预览把摄像头占住导致录制缺画中画。
+                </p>
               </div>
               <div>
                 <Toggle
@@ -672,7 +1005,7 @@ export function RecordView() {
                   label="录制摄像头画中画"
                   description="录制后在编辑器里可调整位置、大小与圆角"
                 />
-                <Field label="摄像头设备" htmlFor="cam-device">
+                <Field label="摄像头设备" htmlFor="cam-device" hint={videoDevices.length === 0 ? '未检测到摄像头设备' : undefined}>
                   <Select
                     id="cam-device"
                     ariaLabel="摄像头设备"
@@ -684,12 +1017,20 @@ export function RecordView() {
                     ]}
                   />
                 </Field>
-                {system && !system.captureCapabilities.camera && (
-                  <InlineNote tone="warn">当前设备没有可用摄像头，录制时会跳过摄像头轨。</InlineNote>
-                )}
-                {videoDevices.length === 0 && (
+                {devicesError && <InlineNote tone="warn">{devicesError}</InlineNote>}
+                {cameraDegradation && (
                   <InlineNote tone="warn">
-                    没有检测到摄像头。可以继续录制屏幕与声音，之后在编辑器里关闭画中画。
+                    <strong>摄像头已降级，录制仍在继续：</strong> {cameraDegradation}
+                  </InlineNote>
+                )}
+                {videoDevices.length === 0 && !devicesError && (
+                  <InlineNote tone="warn">
+                    没有检测到摄像头（或摄像头权限未授予）。可以继续录制屏幕与声音，之后在编辑器里关闭画中画。
+                    <div style={{ marginTop: 6 }}>
+                      <Button size="sm" variant="ghost" icon="refresh" onClick={() => void refreshVideoDevices()}>
+                        重新检测摄像头
+                      </Button>
+                    </div>
                   </InlineNote>
                 )}
               </div>
@@ -701,7 +1042,9 @@ export function RecordView() {
             <div className="quality-list">
               {profiles.map((profile) => {
                 const selected = profile.id === config.qualityId;
-                const downgraded = selectedSource ? selectedSource.width < profile.width : false;
+                // 区域录制时输出尺寸是区域大小，不是整屏来源大小
+                const actualWidth = regionEnabled && selectedSource ? region.width : selectedSource?.width;
+                const downgraded = actualWidth != null ? actualWidth < profile.width : false;
                 return (
                   <button
                     key={profile.id}
@@ -746,7 +1089,7 @@ export function RecordView() {
                   <tr>
                     <td>分辨率</td>
                     <td>{quality.width} × {quality.height}</td>
-                    <td>{selectedSource ? `${selectedSource.width} × ${selectedSource.height}` : '未选择来源'}</td>
+                    <td>{effectiveResolution}</td>
                   </tr>
                   <tr>
                     <td>帧率</td>
@@ -815,10 +1158,14 @@ export function RecordView() {
               <Button size="sm" variant="ghost" icon="refresh" onClick={() => void checkDisk()}>
                 重新检查
               </Button>
-              <Button size="sm" variant="ghost" icon="folder" onClick={() => void wcs().pickDirectory()}>
-                更换目录
+              <Button size="sm" variant="ghost" icon="folder" onClick={() => void openOutputDir()}>
+                打开输出目录
               </Button>
             </div>
+            <p className="wcs-field-hint" style={{ marginTop: 8 }}>
+              录制产物固定保存在系统「视频」目录（工程目录），导出时可以另存到别处；
+              空间不足时请清理该目录或换一块盘的视频目录。
+            </p>
           </Panel>
 
           <Panel title="录制选项" icon="settings">
@@ -872,9 +1219,16 @@ export function RecordView() {
               <div className="check-hint">
                 {blockedReason ? (
                   <InlineNote tone="warn">{blockedReason}</InlineNote>
+                ) : starting ? (
+                  <span className="check-hint-text">
+                    <Spinner size={13} /> 正在启动采集窗口，准备完成后开始写入画面与声音…
+                  </span>
                 ) : (
                   <span className="check-hint-text">
-                    <Icon name="check" size={13} /> 全部就绪，点右上角「开始录制」即可（{config.countdownSeconds} 秒倒计时）。
+                    <Icon name="check" size={13} />{' '}
+                    {config.countdownSeconds > 0
+                      ? `全部就绪，点右上角「开始录制」即可（${config.countdownSeconds} 秒倒计时）。`
+                      : '全部就绪，点右上角「开始录制」立即开始采集。'}
                   </span>
                 )}
               </div>

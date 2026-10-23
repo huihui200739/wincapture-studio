@@ -124,6 +124,17 @@ describe('planAutoZoom: 基本规划', () => {
     // 点击镜头覆盖了停留区域，不应再叠加
     expect(effects).toHaveLength(1);
   });
+
+  it('停留镜头对准停留位置，而不是画面正中心', () => {
+    const pointers: PointerSample[] = [];
+    for (let t = 0; t <= 5 * S; t += S / 10) pointers.push({ tick: t, x: 0.08, y: 0.1 });
+    const effects = planAutoZoom([], pointers);
+    expect(effects).toHaveLength(1);
+    const p = effects[0].parameters as { focusX: number; focusY: number };
+    // 焦点被夹到可视窗口内（半宽 1/(2·scale)），必须明显偏左上而不是死居中
+    expect(p.focusX).toBeLessThan(0.5);
+    expect(p.focusY).toBeLessThan(0.5);
+  });
 });
 
 describe('regenerateAutoZoom: 手动优先，只替换未锁定', () => {
@@ -174,6 +185,15 @@ describe('regenerateAutoZoom: 手动优先，只替换未锁定', () => {
     const a = regenerateAutoZoom([], planned);
     const b = regenerateAutoZoom([], planned);
     expect(a.map((e) => e.range)).toEqual(b.map((e) => e.range));
+  });
+
+  it('新生成的自动片段不会与被保留的手动片段撞 ID', () => {
+    // 「重生成 → 手改锁定 → 再重生成」：手动片段保留原名，自动片段必须避让
+    const manual = zoom('auto-1-0', 0, 2 * S, 2, true);
+    const out = regenerateAutoZoom([manual], [zoom('auto-1', 0, 3 * S)]);
+    const ids = out.map((e) => e.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toContain('auto-1-0');
   });
 });
 
@@ -249,5 +269,59 @@ describe('evaluateZoom: 曲线求值', () => {
       const b = evaluateZoom(effects, tick);
       expect(a).toEqual(b);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 回归测试：自动运镜重叠与求值确定性
+// ---------------------------------------------------------------------------
+
+describe('回归：planAutoZoom 不产生相互重叠的镜头', () => {
+  it('镜头被合并延长后，后续镜头按新结束时间判断最小间隔', () => {
+    // 点击 1（10s）与点击 2（11s）空间很远 → 两个聚类；但点击 2 与镜头 1 太近，
+    // 会延长镜头 1 到 12.4s。点击 3（12.7s）距旧结束时间 > minGap，旧实现会
+    // 另起一个与镜头 1 重叠的镜头。
+    const effects = planAutoZoom(
+      [click(10 * S, 0.1, 0.1), click(11 * S, 0.9, 0.9), click(12.7 * S, 0.2, 0.8)],
+      [],
+    );
+    expect(effects.length).toBeGreaterThan(0);
+    for (let i = 1; i < effects.length; i++) {
+      expect(effects[i].range.start).toBeGreaterThanOrEqual(effects[i - 1].range.end);
+    }
+  });
+});
+
+describe('回归：evaluateZoom 取「当前有效放大值」最大者，且与数组顺序无关', () => {
+  function zoomWithEase(id: string, scale: number, easeTicks: number, focusX = 0.5): Effect {
+    return {
+      id,
+      kind: 'zoom',
+      range: { start: 0, end: 10 * S },
+      parameters: { scale, focusX, focusY: 0.5, easeInTicks: easeTicks, easeOutTicks: easeTicks },
+      origin: 'automatic',
+      locked: false,
+    };
+  }
+
+  it('强镜头仍在缓入、弱镜头已缓入一半时，结果与 effects 顺序无关（取较大有效值）', () => {
+    // 强镜头 2.4 倍、缓入 2s；弱镜头 1.5 倍、缓入 1s。t=0.5s：
+    // 强 ≈ 1.219，弱 = 1.25 → 应取 1.25；旧实现按数组顺序得到 1.219 或 1.25。
+    const strong = zoomWithEase('a-strong', 2.4, 2 * S);
+    const weak = zoomWithEase('b-weak', 1.5, S);
+    const tick = 0.5 * S;
+    const ab = evaluateZoom([strong, weak], tick);
+    const ba = evaluateZoom([weak, strong], tick);
+    expect(ab.scale).toBeCloseTo(1.25, 6);
+    expect(ba.scale).toBeCloseTo(ab.scale, 9);
+    expect(ba.focusX).toBeCloseTo(ab.focusX, 9);
+    expect(ba.focusY).toBeCloseTo(ab.focusY, 9);
+  });
+
+  it('相同有效倍数时结果稳定（按 id 决胜，不随顺序变化）', () => {
+    const a = zoomWithEase('a', 2, S, 0.2);
+    const b = zoomWithEase('b', 2, S, 0.8);
+    expect(evaluateZoom([a, b], 5 * S)).toEqual(evaluateZoom([b, a], 5 * S));
+    expect(evaluateZoom([a, b], 5 * S).scale).toBeCloseTo(2, 6);
   });
 });

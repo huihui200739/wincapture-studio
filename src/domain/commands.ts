@@ -13,12 +13,15 @@ import type { Ticks, TickRange } from './timebase';
 import { rangeLength } from './timebase';
 import { TimeMap } from './timeMap';
 import { AppError } from '../shared/errors';
+import { planGroupMove, linkedClips } from './clipEditing';
+import { retimeClip } from './retime';
 
 export type CommandKind =
   | 'SplitClip'
   | 'TrimClip'
   | 'DeleteRange'
   | 'MoveClip'
+  | 'SetClipRate'
   | 'SetEffect'
   | 'DeleteEffect'
   | 'SetVariantOverride'
@@ -67,6 +70,12 @@ export interface MoveClipCommand extends CommandBase {
   kind: 'MoveClip';
   clipId: string;
   timelineInTicks: Ticks;
+}
+
+export interface SetClipRateCommand extends CommandBase {
+  kind: 'SetClipRate';
+  clipId: string;
+  rate: Clip['rate'];
 }
 
 export interface SetEffectCommand extends CommandBase {
@@ -135,6 +144,7 @@ export type ProjectCommand =
   | TrimClipCommand
   | DeleteRangeCommand
   | MoveClipCommand
+  | SetClipRateCommand
   | SetEffectCommand
   | DeleteEffectCommand
   | SetVariantOverrideCommand
@@ -215,6 +225,7 @@ function splitOne(project: Project, tick: Ticks): CommandDiff {
       const left = { ...clip, sourceDurationTicks: leftDurationTicks };
       const right = {
         ...clip,
+        linkGroupId: clip.linkGroupId ? `${clip.linkGroupId}:split:${tick}` : '',
         id: uniqueId(`${clip.id}-b`, takenIds),
         sourceInTicks: clip.sourceInTicks + leftDurationTicks,
         sourceDurationTicks: clip.sourceDurationTicks - leftDurationTicks,
@@ -302,7 +313,9 @@ function deleteRange(project: Project, range: TickRange, ripple: boolean): Comma
           ...clip,
           sourceInTicks: clip.sourceInTicks + dropSource,
           sourceDurationTicks: newDuration,
-          timelineInTicks: ripple ? range.start : start,
+          // ripple：后方内容前移到删除区间起点；非 ripple：存活内容保持原时间线位置，
+          // 因此起点必须落到 range.end（删除区间右开边界），否则音画会整体提前。
+          timelineInTicks: ripple ? range.start : range.end,
         });
         continue;
       }
@@ -329,6 +342,7 @@ function deleteRange(project: Project, range: TickRange, ripple: boolean): Comma
       nextClips.push({
         ...clip,
         id: uniqueId(`${clip.id}-r`, takenIds),
+        linkGroupId: clip.linkGroupId ? `${clip.linkGroupId}:cut:${range.end}` : '',
         sourceInTicks: clip.sourceInTicks + rightDropSource,
         sourceDurationTicks: rightDuration,
         timelineInTicks: ripple ? range.start : range.end,
@@ -439,6 +453,68 @@ function uniqueId(base: string, taken: Set<string>): string {
   return id;
 }
 
+/**
+ * 片段在时间线上占据的长度。
+ *
+ * rate 是「播放速度倍数」：rate=2 表示源 10s 只占时间线 5s，
+ * 因此时长 = sourceDuration × den/num（与 TimeMap 的 source = timeline × rate 互逆）。
+ */
+function timelineSpanOf(clip: Clip): Ticks {
+  const num = clip.rate.num > 0 ? clip.rate.num : 1;
+  const den = clip.rate.den > 0 ? clip.rate.den : 1;
+  return Math.round((clip.sourceDurationTicks * den) / num);
+}
+
+/** 在执行中的工程里按 ID 找片段及其所属轨道。 */
+function findClipById(
+  project: Project,
+  clipId: string,
+): { clip: Clip; track: Project['tracks'][number] } | null {
+  for (const track of project.tracks) {
+    const clip = track.clips.find((candidate) => candidate.id === clipId);
+    if (clip) return { clip, track };
+  }
+  return null;
+}
+
+/**
+ * 与给定片段共用 linkGroupId 的全部片段（含自身）。
+ *
+ * 录制产物按「画面 / 摄像头 / 麦克风 / 系统声音」各一条片段，共用同一个 linkGroupId；
+ * 编辑时必须整组移动，否则音画会从移动点开始永久错位。
+ * linkGroupId 为空表示未关联，只有它自己。
+ */
+function groupClips(project: Project, clip: Clip): Clip[] {
+  return linkedClips(project, clip);
+}
+
+/** 深拷贝命令载荷后再写入工程。
+ *
+ * applyCommand 的契约是「返回新工程、不改动传入对象」，但只浅拷贝命令里的
+ * effect/canvas/layoutOverrides 会让工程与调用方共享同一个 parameters 对象：
+ * 调用方之后修改自己持有的命令对象，工程内容就悄悄变了而 revision 不变，
+ * 依赖 cacheKey 的预览缓存、以及历史里的 after 快照都会失真。
+ */
+function clonePayload<T>(value: T): T {
+  if (value === null || typeof value !== 'object') return value;
+  return structuredClone(value);
+}
+
+function assertEditedClips(project: Project, ids: readonly string[]): void {
+  for (const track of project.tracks) {
+    for (const clip of track.clips.filter((c) => ids.includes(c.id))) {
+      const asset = project.assets.find((a) => a.id === clip.assetId);
+      if (asset && asset.durationTicks > 0 && clip.sourceInTicks + clip.sourceDurationTicks > asset.durationTicks) {
+        throw invalidCommand('裁剪范围超过关联素材可用长度');
+      }
+      if (track.clips.some((other) => other.id !== clip.id &&
+        clip.timelineInTicks < clipEnd(other) && other.timelineInTicks < clipEnd(clip))) {
+        throw invalidCommand('裁剪范围与同轨或关联轨道上的其它片段重叠');
+      }
+    }
+  }
+}
+
 /** 执行一条命令，返回新工程（不改动传入对象）。 */
 export function applyCommand(project: Project, command: ProjectCommand): ApplyResult {
   assertRevision(project, command);
@@ -447,46 +523,143 @@ export function applyCommand(project: Project, command: ProjectCommand): ApplyRe
 
   switch (command.kind) {
     case 'SplitClip': {
+      assertFiniteTick('分割时间', command.timelineTick);
       diff = splitOne(next, command.timelineTick);
       break;
     }
     case 'TrimClip': {
+      if (command.sourceInTicks !== undefined) assertFiniteTick('源起点', command.sourceInTicks);
+      if (command.sourceDurationTicks !== undefined) assertFiniteTick('源时长', command.sourceDurationTicks);
+      if (command.timelineInTicks !== undefined) assertFiniteTick('时间线起点', command.timelineInTicks);
       diff = { kind: 'TrimClip', tracks: [], removed: [], added: [], entities: [command.clipId] };
       for (const track of next.tracks) {
         const clip = track.clips.find((c) => c.id === command.clipId);
         if (!clip) continue;
+        const oldStart = clip.timelineInTicks;
+        const oldEnd = oldStart + timelineSpanOf(clip);
+        const oldSourceIn = clip.sourceInTicks;
         if (command.sourceInTicks !== undefined) clip.sourceInTicks = Math.max(0, command.sourceInTicks);
         if (command.sourceDurationTicks !== undefined) {
           clip.sourceDurationTicks = Math.max(MIN_CLIP_TICKS, command.sourceDurationTicks);
         }
         if (command.timelineInTicks !== undefined) clip.timelineInTicks = Math.max(0, command.timelineInTicks);
+
+        // 关联组联动裁剪：录制的画面/摄像头/麦克风/系统声音必须保持等长且同起点。
+        // 只裁其中一条会让另一条多出（或缺少）一段，导出时音画从裁剪点开始错位。
+        // 左边缘变化同时平移起点与源入点；右边缘变化只改时长（扩展时不动，
+        // 音频比画面短本来就是「末尾静音」的正常结果）。
+        const newStart = clip.timelineInTicks;
+        const newEnd = newStart + timelineSpanOf(clip);
+        const leftDelta = newStart - oldStart;
+        const endShift = newEnd - oldEnd;
+        const sourceShift = (clip.sourceInTicks - oldSourceIn) / (clip.rate.num / clip.rate.den);
+        const spanShift = (newEnd - newStart) - (oldEnd - oldStart);
+        const linked = groupClips(next, clip);
+        if (leftDelta !== 0 || spanShift !== 0 || sourceShift !== 0) {
+          for (const other of linked) {
+            if (other.id === clip.id) continue;
+            const otherRate = other.rate.den > 0 ? other.rate.num / other.rate.den : 1;
+            other.timelineInTicks += leftDelta;
+            other.sourceInTicks += Math.round(sourceShift * otherRate);
+            other.sourceDurationTicks += Math.round(spanShift * otherRate);
+            if (other.timelineInTicks < 0 || other.sourceInTicks < 0 || other.sourceDurationTicks < MIN_CLIP_TICKS) {
+              throw invalidCommand('关联片段没有足够的源素材完成这次裁剪');
+            }
+            if (!diff.entities.includes(other.id)) diff.entities.push(other.id);
+          }
+        }
+
+        // ripple：裁剪改变片段在时间线上的长度后，同轨后续片段跟着前移/后移，
+        // 不留空隙也不重叠（与 DeleteRange 的波纹语义一致）。
+        // 旧实现声明了 ripple 字段却从不读取，传 true 也毫无效果且无提示。
+        if (command.ripple) {
+          const delta = endShift;
+          if (delta !== 0) {
+            for (const linkedTrack of next.tracks) {
+              for (const other of linkedTrack.clips) {
+                if (linked.includes(other)) continue;
+                if (other.timelineInTicks >= oldEnd) {
+                  other.timelineInTicks = Math.max(0, other.timelineInTicks + delta);
+                  if (!diff.entities.includes(other.id)) diff.entities.push(other.id);
+                }
+              }
+              linkedTrack.clips.sort((a, b) => a.timelineInTicks - b.timelineInTicks);
+            }
+          }
+        }
         diff.tracks.push(track.kind);
       }
       if (diff.tracks.length === 0) throw invalidCommand(`片段 ${command.clipId} 不存在`);
+      assertEditedClips(next, diff.entities);
+      diff.tracks = next.tracks.filter((t) => t.clips.some((c) => diff.entities.includes(c.id))).map((t) => t.kind);
       break;
     }
     case 'DeleteRange': {
+      // 空区间（start === end）是合法的 no-op；负起点或反向区间会破坏时间线，直接拒绝。
+      assertRange('删除区间', command.range);
       diff = deleteRange(next, command.range, command.ripple);
       break;
     }
     case 'MoveClip': {
+      assertFiniteTick('时间线起点', command.timelineInTicks);
       diff = { kind: 'MoveClip', tracks: [], removed: [], added: [], entities: [command.clipId] };
-      for (const track of next.tracks) {
-        const clip = track.clips.find((c) => c.id === command.clipId);
-        if (!clip) continue;
-        clip.timelineInTicks = Math.max(0, command.timelineInTicks);
-        track.clips.sort((a, b) => a.timelineInTicks - b.timelineInTicks);
-        diff.tracks.push(track.kind);
+      const target = findClipById(next, command.clipId);
+      if (!target) throw invalidCommand(`片段 ${command.clipId} 不存在`);
+      const plan = planGroupMove(next, command.clipId, command.timelineInTicks);
+      if (plan && plan.tick !== Math.max(0, Math.round(command.timelineInTicks))) {
+        throw invalidCommand('目标位置与关联轨道片段重叠，或会使关联片段越过时间线起点');
       }
-      if (diff.tracks.length === 0) throw invalidCommand(`片段 ${command.clipId} 不存在`);
+      // 关联组联动：录制的画面/摄像头/麦克风/系统声音共用同一个 linkGroupId，
+      // 只移动其中一个会让音画从此错位（导出按各自片段的位置混音）。
+      // 这里按整组平移，delta 以被拖动的片段为准。
+      const group = groupClips(next, target.clip);
+      const delta = Math.round(command.timelineInTicks) - target.clip.timelineInTicks;
+      // 整组都不能被推到 0 之前：按组内最靠前的片段限制
+      const earliest = Math.min(...group.map((clip) => clip.timelineInTicks));
+      const applied = Math.max(delta, -earliest);
+      if (applied !== 0) {
+        for (const track of next.tracks) {
+          let touched = false;
+          for (const clip of track.clips) {
+            if (!group.includes(clip)) continue;
+            clip.timelineInTicks = Math.max(0, clip.timelineInTicks + applied);
+            touched = true;
+            if (clip.id !== command.clipId) diff.entities.push(clip.id);
+          }
+          if (touched) {
+            track.clips.sort((a, b) => a.timelineInTicks - b.timelineInTicks);
+            diff.tracks.push(track.kind);
+          }
+        }
+      }
+      // 即使 delta 为 0（拖回原位）也要如实报告涉及的轨道，界面据此刷新
+      for (const track of next.tracks) {
+        if (diff.tracks.includes(track.kind)) continue;
+        if (track.clips.some((clip) => group.includes(clip))) diff.tracks.push(track.kind);
+      }
+      break;
+    }
+    case 'SetClipRate': {
+      const target = findClipById(next, command.clipId);
+      if (!target || target.track.kind !== 'primaryVideo') throw invalidCommand('请选择主视频片段调整速度');
+      try {
+        const entities = retimeClip(next, target.clip, command.rate);
+        assertEditedClips(next, entities);
+        diff = { kind: 'SetClipRate', tracks: next.tracks.filter((t) => t.clips.some((c) => entities.includes(c.id))).map((t) => t.kind),
+          removed: [], added: [], entities };
+      } catch (error) {
+        throw invalidCommand(error instanceof Error ? error.message : '无法调整片段速度');
+      }
       break;
     }
     case 'SetEffect': {
+      if (!command.effect || typeof command.effect !== 'object') throw invalidCommand('效果数据缺失');
+      assertRange('效果区间', command.effect.range, true);
       const index = next.effects.findIndex((e) => e.id === command.effect.id);
       // §10.3：人工修改后切换 manual 并锁定，自动重生成不得覆盖。
       // 因此 SetEffect（人工编辑命令）默认 locked=true，只有显式传 lock:false 才不锁。
       const effect: Effect = {
-        ...command.effect,
+        ...clonePayload(command.effect),
         origin: command.effect.origin ?? 'manual',
         locked: command.lock ?? true,
       };
@@ -514,12 +687,12 @@ export function applyCommand(project: Project, command: ProjectCommand): ApplyRe
     case 'SetVariantOverride': {
       const variant = next.variants.find((v) => v.id === command.variantId);
       if (!variant) throw invalidCommand(`画幅 ${command.variantId} 不存在`);
-      variant.layoutOverrides = command.layoutOverrides;
+      variant.layoutOverrides = clonePayload(command.layoutOverrides);
       diff = { kind: 'SetVariantOverride', tracks: [], removed: [], added: [], entities: [variant.id] };
       break;
     }
     case 'SetCanvasStyle': {
-      next.settings.canvas = { ...next.settings.canvas, ...command.canvas };
+      next.settings.canvas = { ...next.settings.canvas, ...clonePayload(command.canvas) };
       diff = { kind: 'SetCanvasStyle', tracks: [], removed: [], added: [], entities: [] };
       break;
     }
@@ -527,14 +700,21 @@ export function applyCommand(project: Project, command: ProjectCommand): ApplyRe
       const track = findTrack(next, command.track);
       if (!track) throw invalidCommand(`轨道 ${command.track} 不存在`);
       if (command.muted !== undefined) track.muted = command.muted;
-      if (command.gain !== undefined) track.gain = Math.max(0, Math.min(4, command.gain));
+      if (command.gain !== undefined) {
+        assertFiniteTick('轨道增益', command.gain);
+        track.gain = Math.max(0, Math.min(4, command.gain));
+      }
       diff = { kind: 'SetTrackAudio', tracks: [track.kind], removed: [], added: [], entities: [track.id] };
       break;
     }
     case 'SetStep': {
+      if (!command.step || typeof command.step !== 'object') throw invalidCommand('步骤数据缺失');
+      assertRange('步骤源区间', command.step.sourceRange, true);
+      assertFiniteTick('步骤截图时间', command.step.imageTick);
       const index = next.steps.findIndex((s) => s.id === command.step.id);
-      if (index >= 0) next.steps[index] = { ...command.step };
-      else next.steps.push({ ...command.step });
+      const step = clonePayload(command.step);
+      if (index >= 0) next.steps[index] = step;
+      else next.steps.push(step);
       next.steps.sort((a, b) => a.sourceRange.start - b.sourceRange.start);
       diff = { kind: 'SetStep', tracks: [], removed: [], added: [command.step.sourceRange], entities: [command.step.id] };
       break;
@@ -546,13 +726,24 @@ export function applyCommand(project: Project, command: ProjectCommand): ApplyRe
     }
     case 'ReorderSteps': {
       const byId = new Map(next.steps.map((s) => [s.id, s]));
-      const ordered = command.orderedIds.map((id) => byId.get(id)).filter((s): s is TutorialStep => !!s);
-      for (const step of next.steps) if (!command.orderedIds.includes(step.id)) ordered.push(step);
+      // 去重：重复 id 只会排列一次，否则 steps 中会出现同 ID 的多份副本。
+      const seen = new Set<string>();
+      const ordered: TutorialStep[] = [];
+      for (const id of command.orderedIds) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const step = byId.get(id);
+        if (step) ordered.push(step);
+      }
+      for (const step of next.steps) if (!seen.has(step.id)) ordered.push(step);
       next.steps = ordered;
-      diff = { kind: 'ReorderSteps', tracks: [], removed: [], added: [], entities: command.orderedIds };
+      diff = { kind: 'ReorderSteps', tracks: [], removed: [], added: [], entities: [...seen] };
       break;
     }
     case 'SetMarker': {
+      if (!command.marker || typeof command.marker !== 'object') throw invalidCommand('标记数据缺失');
+      assertFiniteTick('标记时间', command.marker.mediaTick);
+      if (command.marker.mediaTick < 0) throw invalidCommand(`标记时间不能为负（${command.marker.mediaTick}）`);
       if (command.remove) {
         next.markers = next.markers.filter((m) => m.id !== command.marker.id);
       } else {
@@ -573,6 +764,16 @@ export function applyCommand(project: Project, command: ProjectCommand): ApplyRe
       break;
     }
     case 'SetFrameRate': {
+      // 帧率是有理数，den=0 会让 frameIndexToTicks / ticksToFrameCount 立刻变成 NaN/Infinity。
+      if (
+        !command.fps ||
+        !Number.isFinite(command.fps.num) ||
+        !Number.isFinite(command.fps.den) ||
+        command.fps.num <= 0 ||
+        command.fps.den <= 0
+      ) {
+        throw invalidCommand(`帧率必须是正有理数（收到 ${JSON.stringify(command.fps)}）`);
+      }
       next.settings.fps = { ...command.fps };
       diff = { kind: 'SetFrameRate', tracks: [], removed: [], added: [], entities: [] };
       break;
@@ -593,11 +794,33 @@ export function applyCommand(project: Project, command: ProjectCommand): ApplyRe
 function invalidCommand(detail: string): AppError {
   return new AppError({
     code: 'E_INVALID_COMMAND',
-    message: '编辑命令无法执行，请刷新工程后重试。',
+    message: detail,
     retryable: false,
     preservedData: true,
     detail,
   });
+}
+
+/**
+ * 拒绝非有限 tick。
+ *
+ * 命令参数来自 IPC / 界面输入，NaN/Infinity 一旦写入时间字段会污染整个工程
+ * （timelineDuration、导出计划、缓存键全部变成 NaN），且无法再通过撤销以外的方式恢复。
+ * 因此必须在命令入口拦截，抛 E_INVALID_COMMAND 而不是静默 clamp。
+ */
+function assertFiniteTick(label: string, value: number): void {
+  if (!Number.isFinite(value)) throw invalidCommand(`${label} 必须是有限数字（收到 ${String(value)}）`);
+}
+
+/** 校验时间区间：有限、非负、start <= end（空区间在某些命令中合法）。 */
+function assertRange(label: string, range: TickRange | null | undefined, requireNonEmpty = false): void {
+  if (!range || typeof range !== 'object') throw invalidCommand(`${label} 缺失`);
+  assertFiniteTick(`${label}起点`, range.start);
+  assertFiniteTick(`${label}终点`, range.end);
+  if (range.start < 0) throw invalidCommand(`${label}起点不能为负（${range.start}）`);
+  if (requireNonEmpty ? range.start >= range.end : range.end < range.start) {
+    throw invalidCommand(`${label}必须满足 ${requireNonEmpty ? 'start < end' : 'start <= end'}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -770,6 +993,8 @@ export function describeCommand(command: ProjectCommand): string {
       return command.ripple ? '删除区间（波纹）' : '删除区间';
     case 'MoveClip':
       return '移动片段';
+    case 'SetClipRate':
+      return '调整播放速度';
     case 'SetEffect':
       return command.effect?.kind === 'zoom' ? '调整运镜' : command.effect?.kind === 'privacy' ? '调整遮挡' : '调整效果';
     case 'DeleteEffect':

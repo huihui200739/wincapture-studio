@@ -5,49 +5,49 @@
       "name": "01-home",
       "label": "首页：最近工程 / 新建录制 / 恢复未完成录制 / 教程入口",
       "file": "docs\\screenshots\\01-home.png",
-      "bytes": 379561
+      "bytes": 379587
     },
     {
       "name": "02-record",
       "label": "录制设置：来源缩略图与真实分辨率 / 电平表 / 摄像头 / 质量档位 / 磁盘",
       "file": "docs\\screenshots\\02-record.png",
-      "bytes": 325951
+      "bytes": 325622
     },
     {
       "name": "03-editor",
       "label": "编辑器：预览 canvas + 时间线 + 属性面板",
       "file": "docs\\screenshots\\03-editor.png",
-      "bytes": 256629
+      "bytes": 355619
     },
     {
       "name": "04-editor-canvas",
       "label": "编辑器 · 画布属性：画幅 16:9/1:1/9:16、背景、圆角、阴影、摄像头布局",
       "file": "docs\\screenshots\\04-editor-canvas.png",
-      "bytes": 243342
+      "bytes": 357144
     },
     {
       "name": "05-export",
       "label": "导出面板：产物类型 / 输出路径 / 画幅 / 预计体积 / 进度与结果区",
       "file": "docs\\screenshots\\05-export.png",
-      "bytes": 210764
+      "bytes": 218638
     },
     {
       "name": "06-tutorial",
       "label": "教程页：步骤列表 / 标题说明编辑 / 截图预览 / 合并拆分",
       "file": "docs\\screenshots\\06-tutorial.png",
-      "bytes": 255396
+      "bytes": 280281
     },
     {
       "name": "07-settings",
       "label": "设置页：系统信息 / 采集能力 / 快捷键 / 诊断",
       "file": "docs\\screenshots\\07-settings.png",
-      "bytes": 276620
+      "bytes": 282352
     },
     {
       "name": "08-overlay-bar",
       "label": "录制悬浮控制条：状态文字 + 图标 + 计时 + 暂停 / 标记 / 停止",
       "file": "docs\\screenshots\\08-overlay-bar.png",
-      "bytes": 19836
+      "bytes": 20090
     }
   ],
   "consoleErrors": [],
@@ -73,7 +73,7 @@
         "rows": 4,
         "text": "00:00.00 / 00:30.00"
       },
-      "afterPlay": "00:00.70 / 00:30.00",
+      "afterPlay": "00:00.71 / 00:30.00",
       "advancedTracks": {
         "before": 4
       },
@@ -88,7 +88,7 @@
         "光标",
         "画布"
       ],
-      "privacyPanelText": "遮挡区域1 处未确认遮挡。 未确认不等于已遮挡，导出前必须确认。遮挡 1已遮挡实色 · 00:06.00 → 00:16.00遮挡 2未确认（未遮挡）模糊 · 00:06.00 → 00:16.00样式遮挡样式实色模糊马赛克高敏感信息建议用实色：模糊与马赛克只是视觉样式，不保证不可恢复。区域（源坐标归一化）X26.2%Y28.5%宽20.0%高4.5%时间区间开始6.0 秒结束16.0 秒结束时间设为播放头确认状态该区域已确认遮挡，导出时会按「实色」处理。取消确认（标记为未遮"
+      "privacyPanelText": "遮挡区域1 处未确认遮挡。 未确认不等于已遮挡，导出前必须确认。遮挡 1已遮挡实色 · 00:06.00 → 00:16.00遮挡 2未确认（未遮挡）模糊 · 00:06.00 → 00:16.00样式遮挡样式实色模糊马赛克高敏感信息建议用实色：模糊与马赛克只是视觉样式，不保证不可恢复。区域（源坐标归一化）X26.2%Y28.5%宽20.0%高4.5%时间区间00:06.00 → 00:16.00开始6.0 秒结束16.0 秒结束时间设为播放头最短 0.2 秒，区间会被夹紧到"
     },
     "canvasTab": {
       "variantCards": 3,
@@ -98,7 +98,7 @@
     "export": {
       "kindCards": 3,
       "variantCards": 3,
-      "summaryRows": 9,
+      "summaryRows": 10,
       "outputPath": "C:\\Users\\huihui\\Videos\\WinCapture Studio\\演示工程 · 新建客户流程.mp4"
     },
     "tutorial": {
@@ -125,11 +125,26 @@
     },
     "previewPixels": {
       "ok": true,
-      "distinctColors": 289,
+      "distinctColors": 366,
       "width": 1280,
       "height": 720
+    },
+    "newControls": {
+      "exportSettings": {
+        "resolution": "2160",
+        "fps": "60",
+        "shows4K": true
+      },
+      "presetCount": 5,
+      "presetApplied": true,
+      "presetUndone": true,
+      "clipboard": {
+        "count": 3,
+        "unconfirmed": true,
+        "autoTab": true
+      }
     }
   },
   "notes": [],
-  "consoleTotal": 6
+  "consoleTotal": 0
 }

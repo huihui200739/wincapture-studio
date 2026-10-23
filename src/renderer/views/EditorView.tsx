@@ -13,13 +13,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../lib/store';
-import { useShortcuts, isTextEntryTarget } from '../lib/hooks';
-import { Badge, Button, Icon, IconButton, InlineNote, Segmented, Spinner } from '../components/ui';
+import { useShortcuts } from '../lib/hooks';
+import { Badge, Button, Icon, IconButton, Spinner } from '../components/ui';
 import { PreviewCanvas, useSourceToDisplay } from '../components/PreviewCanvas';
-import { Timeline } from '../components/Timeline';
-import { InspectorPanel } from '../components/InspectorPanel';
-import { formatDuration, TICKS_PER_SECOND, ticksToSeconds, secondsToTicks } from '@domain/timebase';
-import type { PrivacyParameters, PrivacyStyle } from '@domain/project';
+import { Timeline, planClipMove, splittableTick, clipEndTick } from '../components/Timeline';
+import { InspectorPanel, clampPrivacyRect } from '../components/InspectorPanel';
+import { formatDuration, TICKS_PER_SECOND, secondsToTicks, ticksToFrameIndex } from '@domain/timebase';
+import type { Effect, PrivacyParameters, PrivacyStyle } from '@domain/project';
+import { pasteEffect } from '@domain/effectClipboard';
 import { timelineDuration } from '@domain/project';
 import type { SetEffectCommand, DeleteRangeCommand } from '@domain/commands';
 import { cn } from '../lib/format';
@@ -40,7 +41,6 @@ export function EditorView() {
     playing,
     setPlaying,
     togglePlay,
-    duration,
     execute,
     undo,
     redo,
@@ -60,12 +60,69 @@ export function EditorView() {
   const [timelineCollapsed, setTimelineCollapsed] = useState(false);
   const [drag, setDrag] = useState<DragState>({ kind: 'none' });
   const [scene, setScene] = useState<FrameScene | null>(null);
+  const [effectClipboard, setEffectClipboard] = useState<Effect | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [wrapSize, setWrapSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
 
-  const { toDisplayRect, screenBox } = useSourceToDisplay(project ?? { ...emptyProjectFallback }, tick);
+  const { toDisplayRect, toSourceRect, scene: previewScene } = useSourceToDisplay(
+    project ?? emptyProjectFallback,
+    tick,
+  );
 
   const totalDuration = project ? timelineDuration(project) : 0;
+  useEffect(() => setEffectClipboard(null), [project?.id]);
+
+  const copySelectedEffect = () => {
+    const effect = project?.effects.find((item) => item.id === selectedEffectId);
+    if (!effect) return;
+    setEffectClipboard(structuredClone(effect));
+    pushToast({ tone: 'info', title: '效果已复制', message: '在目标时间按 Ctrl+V；选中同类效果后按 Ctrl+Shift+V 只粘贴属性。' });
+  };
+  const pasteCopiedEffect = (attributesOnly = false) => {
+    if (!project || !effectClipboard) return;
+    const target = attributesOnly ? project.effects.find((item) => item.id === selectedEffectId) : undefined;
+    if (attributesOnly && !target) {
+      pushToast({ tone: 'warn', title: '请先选择目标效果', message: '只粘贴属性需要选中一个同类型的效果。' });
+      return;
+    }
+    try {
+      const effect = pasteEffect(effectClipboard, project, tick, `effect-${crypto.randomUUID()}`, target);
+      execute({ kind: 'SetEffect', effect }, attributesOnly ? '粘贴效果属性' : '粘贴效果');
+      selectEffect(effect.id);
+      if (effect.kind === 'privacy') pushToast({ tone: 'warn', title: '遮挡已粘贴，请重新确认', message: '核对新位置的内容后，再确认遮挡。' });
+    } catch (error) {
+      pushToast({ tone: 'warn', title: '无法粘贴效果', message: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  /**
+   * 播放头夹紧：删除/波纹删除/撤销重做都可能让时间线变短，
+   * 而 store 里的 tick 不会自动回退。不夹紧的话播放头会停在内容之外，
+   * 预览显示空画面、时间码超过总时长（用户会以为工程坏了）。
+   */
+  useEffect(() => {
+    if (!project) return;
+    if (tick > totalDuration) setTick(totalDuration);
+  }, [project, setTick, tick, totalDuration]);
+
+  /**
+   * 清理失效选择：撤销一个「新建遮挡/运镜/步骤」或删除效果后，
+   * store 里的 selectedEffectId 仍指向已不存在的实体。若不清掉，
+   * 按 Delete 会执行一条注定失败的命令（弹出 E_INVALID_COMMAND 错误），
+   * 属性面板也一直显示空状态而用户以为还选中着什么。
+   */
+  useEffect(() => {
+    if (!project) return;
+    if (selectedClipId && !project.tracks.some((track) => track.clips.some((clip) => clip.id === selectedClipId))) {
+      selectClip(null);
+    }
+    if (selectedEffectId && !project.effects.some((effect) => effect.id === selectedEffectId)) {
+      selectEffect(null);
+    }
+    if (selectedStepId && !project.steps.some((step) => step.id === selectedStepId)) {
+      selectStep(null);
+    }
+  }, [project, selectClip, selectEffect, selectStep, selectedClipId, selectedEffectId, selectedStepId]);
 
   /**
    * 预览 contain 尺寸（§P0）。
@@ -122,6 +179,9 @@ export function EditorView() {
   // 键盘快捷键
   useShortcuts(
     [
+      { combo: 'ctrl+c', handler: copySelectedEffect },
+      { combo: 'ctrl+v', handler: () => pasteCopiedEffect() },
+      { combo: 'ctrl+shift+v', handler: () => pasteCopiedEffect(true) },
       {
         combo: 'space',
         handler: () => togglePlay(),
@@ -191,6 +251,8 @@ export function EditorView() {
         allowInInput: true,
         handler: () => {
           setPlaying(false);
+          // 拖拽框选途中按 Escape：取消临时框，避免松手时才「突然」创建遮挡
+          setDrag({ kind: 'none' });
           selectClip(null);
           selectEffect(null);
           selectStep(null);
@@ -206,17 +268,36 @@ export function EditorView() {
       pushToast({ tone: 'warn', title: '播放头不在片段内', message: '把播放头移到要分割的位置再按 Ctrl+B。' });
       return;
     }
+    // domain 在片段边界/距端点不足 1ms 时会静默跳过，但仍会压入一条空撤销记录。
+    if (!splittableTick(project, tick)) {
+      pushToast({
+        tone: 'warn',
+        title: '这里无法分割',
+        message: '播放头需要落在某个片段内部（距片段两端至少 1 毫秒）。',
+      });
+      return;
+    }
     execute({ kind: 'SplitClip', timelineTick: tick }, '分割片段');
   }, [execute, project, pushToast, tick, totalDuration]);
 
   const deleteSelection = useCallback(() => {
     if (!project) return;
     if (selectedEffectId) {
+      if (!project.effects.some((effect) => effect.id === selectedEffectId)) {
+        selectEffect(null);
+        pushToast({ tone: 'info', title: '所选效果已不存在', message: '它可能已被删除或撤销，选择已清除。' });
+        return;
+      }
       execute({ kind: 'DeleteEffect', effectId: selectedEffectId }, '删除效果');
       selectEffect(null);
       return;
     }
     if (selectedStepId) {
+      if (!project.steps.some((step) => step.id === selectedStepId)) {
+        selectStep(null);
+        pushToast({ tone: 'info', title: '所选步骤已不存在', message: '它可能已被删除或撤销，选择已清除。' });
+        return;
+      }
       execute({ kind: 'DeleteStep', stepId: selectedStepId }, '删除教程步骤');
       selectStep(null);
       return;
@@ -231,7 +312,7 @@ export function EditorView() {
       execute<DeleteRangeCommand>(
         {
           kind: 'DeleteRange',
-          range: { start: clip.timelineInTicks, end: clip.timelineInTicks + clip.sourceDurationTicks },
+          range: { start: clip.timelineInTicks, end: clipEndTick(clip) },
           ripple: true,
         },
         '删除时间线片段（波纹）',
@@ -240,16 +321,23 @@ export function EditorView() {
       pushToast({ tone: 'info', title: '已删除时间线片段', message: '源素材文件仍然保留。' });
       return;
     }
+    // 选中的片段已经不在了（撤销/删除后选中状态滞后）
+    selectClip(null);
+    pushToast({ tone: 'info', title: '所选片段已不存在', message: '选择已清除，请在时间线上重新点选。' });
   }, [execute, project, pushToast, selectClip, selectEffect, selectStep, selectedClipId, selectedEffectId, selectedStepId]);
 
   // ---- 预览上框选遮挡 ----
+  /** 按下时的屏幕坐标：用来区分「单击」与「拖拽」，避免每次点预览都弹提示 */
+  const stageDragStart = useRef<{ x: number; y: number } | null>(null);
   const onStagePointerDown = (event: React.PointerEvent) => {
     if (!project || event.button !== 0) return;
     const target = event.target as HTMLElement;
     if (target.closest('.stage-privacy-box')) return;
     const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    const x = (event.clientX - rect.left) / rect.width;
-    const y = (event.clientY - rect.top) / rect.height;
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+    const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+    stageDragStart.current = { x: event.clientX, y: event.clientY };
     setDrag({ kind: 'creating', x0: x, y0: y, x1: x, y1: y });
     (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
   };
@@ -257,39 +345,65 @@ export function EditorView() {
   const onStagePointerMove = (event: React.PointerEvent) => {
     if (drag.kind !== 'creating') return;
     const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
     const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
     const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
     setDrag({ ...drag, x1: x, y1: y });
   };
 
-  const onStagePointerUp = () => {
+  const onStagePointerUp = (event?: React.PointerEvent) => {
     if (drag.kind !== 'creating' || !project) return;
+    const dragStart = stageDragStart.current;
+    stageDragStart.current = null;
+    // 单击（没有真正的拖拽）不该被当成「框选范围太小」：编辑时点一下预览很常见，
+    // 每次弹一条 info 会把真正重要的提示挤掉。
+    const moved =
+      !dragStart || !event ? true : Math.hypot(event.clientX - dragStart.x, event.clientY - dragStart.y) >= 3;
     const x0 = Math.min(drag.x0, drag.x1);
     const x1 = Math.max(drag.x0, drag.x1);
     const y0 = Math.min(drag.y0, drag.y1);
     const y1 = Math.max(drag.y0, drag.y1);
     setDrag({ kind: 'none' });
+    if (!moved) return;
     if (x1 - x0 < 0.01 || y1 - y0 < 0.01) {
       pushToast({ tone: 'info', title: '框选范围太小', message: '按住鼠标在预览上拖出一个矩形来创建遮挡。' });
       return;
     }
-    // 显示坐标 → 源坐标（去掉画布内边距与运镜）
+    if (totalDuration <= 0) {
+      pushToast({ tone: 'warn', title: '工程里还没有画面', message: '先录制或导入一段素材，再来创建遮挡区域。' });
+      return;
+    }
+    if (!previewScene) {
+      pushToast({ tone: 'warn', title: '预览尚未就绪', message: '稍等一下再框选，遮挡会按当前画面坐标记录。' });
+      return;
+    }
+    // 显示坐标 → 源坐标：必须走 useSourceToDisplay 的逆变换（含运镜缩放/焦点），
+    // 否则有运镜时创建的遮挡框会与用户框选的区域错位，确认后可能遮不住敏感内容。
     const display = { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
-    const sx = screenBox.width > 0 ? (display.x - screenBox.left) / screenBox.width : 0;
-    const sy = screenBox.height > 0 ? (display.y - screenBox.top) / screenBox.height : 0;
-    const sw = screenBox.width > 0 ? display.width / screenBox.width : 0.2;
-    const sh = screenBox.height > 0 ? display.height / screenBox.height : 0.1;
-    const id = `privacy-${Date.now().toString(36)}`;
+    const raw = toSourceRect(display);
+    // 先与 [0,1] 求交再夹紧：如果先夹紧，拖出画面外的框会被平移而不是被裁掉
+    const ix0 = Math.max(0, raw.x);
+    const iy0 = Math.max(0, raw.y);
+    const ix1 = Math.min(1, raw.x + raw.width);
+    const iy1 = Math.min(1, raw.y + raw.height);
+    if (ix1 - ix0 < 0.01 || iy1 - iy0 < 0.01) {
+      pushToast({ tone: 'info', title: '框选区域不在画面内', message: '请在预览的画面区域内拖拽，画布留白/背景不算画面。' });
+      return;
+    }
+    const rect = clampPrivacyRect({ x: ix0, y: iy0, width: ix1 - ix0, height: iy1 - iy0 });
+    // 时间区间夹紧：播放头在结尾时若直接用 [tick, tick+5s) 会产生零长区间，
+    // 效果永远不生效（确认了也看不到遮挡）。
+    const minSpan = Math.min(secondsToTicks(0.2), totalDuration);
+    const start = Math.max(0, Math.min(tick, totalDuration - minSpan));
+    const end = Math.min(totalDuration, Math.max(start + minSpan, tick + secondsToTicks(5)));
+    const id = `privacy-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
     const effect = {
       id,
       kind: 'privacy' as const,
-      range: { start: Math.max(0, tick), end: Math.min(totalDuration, tick + secondsToTicks(5)) },
+      range: { start, end },
       anchor: 'screen' as const,
       parameters: {
-        x: Math.max(0, Math.min(1 - Math.max(0.01, sw), sx)),
-        y: Math.max(0, Math.min(1 - Math.max(0.01, sh), sy)),
-        width: Math.max(0.01, Math.min(1, sw)),
-        height: Math.max(0.01, Math.min(1, sh)),
+        ...rect,
         anchor: 'screen' as const,
         style: 'solid' as PrivacyStyle,
         confirmed: false,
@@ -405,6 +519,8 @@ export function EditorView() {
 
           {/* 剪辑工具（分割/删除）集中在时间线工具栏，这里只保留播放与遮挡提示（§P1） */}
           <div className="stage-toolbar-group">
+            <IconButton icon="copy" label="复制效果（Ctrl+C）" size="sm" onClick={copySelectedEffect} disabled={!selectedEffectId} />
+            <IconButton icon="paste" label="粘贴效果（Ctrl+V）；Ctrl+Shift+V 只粘贴属性" size="sm" onClick={() => pasteCopiedEffect()} disabled={!effectClipboard} />
             <Badge tone="muted" title="在预览上拖拽即可框选遮挡区域">
               <Icon name="shield" size={11} /> 拖拽框选遮挡
             </Badge>
@@ -421,7 +537,7 @@ export function EditorView() {
             onPointerUp={onStagePointerUp}
             onPointerCancel={() => setDrag({ kind: 'none' })}
           >
-            <PreviewCanvas project={project} tick={tick} onScene={setScene} maxWidth={1280} />
+            <PreviewCanvas project={project} tick={tick} projectPath={projectPath} onScene={setScene} maxWidth={1280} />
             <div className="stage-overlay-layer">
               {/* 已存在的遮挡区域（显示为框，未确认用虚线） */}
               {privacyEffects.map((effect) => {
@@ -495,7 +611,8 @@ export function EditorView() {
             />
           </div>
           <span className="transport-badge">
-            {project.settings.fps.num}/{project.settings.fps.den} fps · 帧 {(tick / frameStep).toFixed(0)}
+            {project.settings.fps.num}/{project.settings.fps.den} fps · 帧{' '}
+            {ticksToFrameIndex(Math.min(tick, totalDuration), project.settings.fps)}
           </span>
           <span className="transport-badge">{scene ? `${scene.outputWidth}×${scene.outputHeight}` : ''}</span>
           <Badge tone={playing ? 'ok' : 'muted'} icon={playing ? 'play' : 'pause'}>
@@ -532,7 +649,34 @@ export function EditorView() {
         onToggleCollapsed={() => setTimelineCollapsed((v) => !v)}
         projectPath={projectPath}
         onMoveClip={(clipId, timelineInTicks) => {
-          execute({ kind: 'MoveClip', clipId, timelineInTicks }, '移动片段');
+          const plan = planClipMove(project, clipId, timelineInTicks);
+          if (!plan) return;
+          if (plan.adjusted) {
+            pushToast({
+              tone: 'warn',
+              title: '目标位置与同轨片段重叠',
+              message:
+                plan.tick === plan.originTick
+                  ? '片段未移动：目标位置会和同轨其它片段叠在一起。'
+                  : '已把片段放到最近的不重叠位置。',
+            });
+          }
+          if (plan.tick === plan.originTick) return;
+          execute({ kind: 'MoveClip', clipId, timelineInTicks: plan.tick }, '移动片段');
+        }}
+        onMoveBlocked={(message) => pushToast({ tone: 'warn', title: '移动受限', message })}
+        onTrimClip={(clipId, patch) => {
+          // 手柄裁剪：只改源入点/源时长/时间线起点，不碰同轨其它片段（非波纹）
+          execute(
+            {
+              kind: 'TrimClip',
+              clipId,
+              sourceInTicks: patch.sourceInTicks,
+              sourceDurationTicks: patch.sourceDurationTicks,
+              timelineInTicks: patch.timelineInTicks,
+            },
+            '裁剪片段',
+          );
         }}
       />
     </div>

@@ -43,7 +43,7 @@ export interface Clip {
   sourceDurationTicks: Ticks;
   /** 在时间线上的目标起点 */
   timelineInTicks: Ticks;
-  /** 播放速率（MVP 固定 1/1） */
+  /** 播放速率（1/1 为原速） */
   rate: Rational;
   /** 关联组：同一次录制产生的轨道片段共享，删除/重排一起作用（§10.2） */
   linkGroupId: string;
@@ -97,6 +97,11 @@ export interface PrivacyParameters {
 }
 
 export interface CursorParameters {
+  style?: 'arrow' | 'dot';
+  /** 0 disables idle hiding; source media ticks. */
+  hideAfterTicks?: Ticks;
+  /** Positive offsets sample later pointer events to correct capture latency. */
+  timeOffsetTicks?: Ticks;
   /** 光标绘制尺寸（输出像素） */
   size: number;
   /** 点击反馈：波纹半径倍数 */
@@ -136,11 +141,18 @@ export type StepSource = 'marker' | 'click' | 'manual';
 
 export interface TutorialStep {
   id: string;
-  /** 步骤对应的源时间区间，经 TimeMap 映射到成片时间（§12.1） */
+  /**
+   * 步骤对应的**源（媒体）时间**区间，经 TimeMap 映射到成片时间（§12.1）。
+   * 存储源时间而不是成片时间：修剪/删除/重排后步骤会自动跟随内容，
+   * 不需要在每个编辑命令里同步平移。渲染与导出前用 stepTimelineRange 映射。
+   */
   sourceRange: TickRange;
   title: string;
   description: string;
-  /** 截图所取的成片时间点（tick） */
+  /**
+   * 截图所取的**源（媒体）时间点**，与 sourceRange 同一时间轴。
+   * 渲染前用 stepTimelineTick 映射为成片时间；已被剪掉时映射返回 null。
+   */
   imageTick: Ticks;
   /** 操作区域，归一化到源画面 */
   actionRect: { x: number; y: number; width: number; height: number } | null;
@@ -272,19 +284,32 @@ export function cloneProject(project: Project): Project {
 }
 
 export function findTrack(project: Project, kind: TrackKind): Track | undefined {
-  return project.tracks.find((t) => t.kind === kind);
+  if (!Array.isArray(project.tracks)) return undefined;
+  return project.tracks.find((t) => t?.kind === kind);
 }
 
 export function findAsset(project: Project, id: string): MediaAsset | undefined {
-  return project.assets.find((a) => a.id === id);
+  if (!Array.isArray(project.assets)) return undefined;
+  return project.assets.find((a) => a?.id === id);
 }
 
 export function findVariant(project: Project, id: string): CanvasVariant | undefined {
-  return project.variants.find((v) => v.id === id);
+  if (!Array.isArray(project.variants)) return undefined;
+  return project.variants.find((v) => v?.id === id);
 }
 
+/** 兜底画幅：工程 variants 为空/损坏时仍能预览与导出，避免读取 `.aspect` 抛异常。 */
+const FALLBACK_VARIANT: CanvasVariant = Object.freeze({
+  id: 'landscape',
+  aspect: [16, 9] as [number, number],
+  layoutOverrides: {},
+}) as CanvasVariant;
+
 export function activeVariant(project: Project): CanvasVariant {
-  return findVariant(project, project.settings.activeVariantId) ?? project.variants[0];
+  const found = findVariant(project, project.settings?.activeVariantId);
+  if (found) return found;
+  const first = Array.isArray(project.variants) ? project.variants[0] : undefined;
+  return first ?? FALLBACK_VARIANT;
 }
 
 export function effectsOfKind<K extends EffectKind>(
@@ -297,13 +322,17 @@ export function effectsOfKind<K extends EffectKind>(
 /** 时间线总时长：所有主视频轨片段的最大结束时间（§10.1） */
 export function timelineDuration(project: Project): Ticks {
   const main = findTrack(project, 'primaryVideo');
-  if (!main) return 0;
+  if (!main || !Array.isArray(main.clips)) return 0;
   let end = 0;
   for (const clip of main.clips) {
-    const clipEnd = clip.timelineInTicks + Math.round((clip.sourceDurationTicks * clip.rate.den) / clip.rate.num);
-    if (clipEnd > end) end = clipEnd;
+    if (!clip || !Number.isFinite(clip.timelineInTicks) || !Number.isFinite(clip.sourceDurationTicks)) continue;
+    const rate = clip.rate;
+    // 速率非法时跳过该片段：宁可时长为 0 也不要返回 Infinity/NaN 污染导出计划与缓存键。
+    if (!rate || !Number.isFinite(rate.num) || !Number.isFinite(rate.den) || rate.num <= 0 || rate.den <= 0) continue;
+    const clipEnd = clip.timelineInTicks + Math.round((clip.sourceDurationTicks * rate.den) / rate.num);
+    if (Number.isFinite(clipEnd) && clipEnd > end) end = clipEnd;
   }
-  return end;
+  return Math.max(0, end);
 }
 
 export function defaultRate(): Rational {

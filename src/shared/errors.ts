@@ -83,7 +83,11 @@ export function isAppErrorShape(value: unknown): value is AppErrorShape {
   return (
     typeof v.code === 'string' &&
     (ERROR_CODES as readonly string[]).includes(v.code) &&
-    typeof v.message === 'string'
+    typeof v.message === 'string' &&
+    // 这两个布尔标志决定界面如何提示（能否重试、数据是否保留），必须一起校验，
+    // 否则一个不完整的外部形状也能被当成 AppErrorShape 透传到界面。
+    typeof v.retryable === 'boolean' &&
+    typeof v.preservedData === 'boolean'
   );
 }
 

@@ -11,9 +11,16 @@
  * 与主进程的接口（由 electron/main.ts 通过 executeJavaScript 调用）：
  *   window.__wcsRecorder.encodeSegment(payload) → { ok, mp4(base64), frames, encoder, durationUs }
  *   window.__wcsRecorder.dispose()
+ *
+ * 协议约束：encodeSegment **永远 resolve**，失败用 { ok:false, error } 表达。
+ * 主进程拿到后会抛 E_ENCODER_UNAVAILABLE 并由采集引擎记录段失败，
+ * 因此这里既不能让异常逃逸（会变成 executeJavaScript 的 reject），
+ * 也不能留下未释放的编码器/画布（隐藏窗口会连续编码几十段）。
  */
 
 import { SegmentEncoder } from '../media/encode';
+import { planFrameSlots } from './uiSync';
+import { TICKS_PER_SECOND } from '@domain/timebase';
 
 interface IncomingFrame {
   mediaTick: number;
@@ -37,6 +44,18 @@ interface SegmentPayload {
   height: number;
   fps: number;
   frames: IncomingFrame[];
+  /**
+   * 音频包（主进程仍会随载荷发来）。
+   *
+   * 为什么这里不再使用它：`startFrame` 是**音频工作进程启动以来的全局采样序号**
+   * （见 electron/native/audio.cs 的 _frameCursor），而本窗口拿到的是 2 秒的段载荷，
+   * 没有「会话零点 → 音频采样零点」的映射。旧实现直接拿 startFrame 当段内偏移：
+   *  - 第 1 段会把**倒计时期间的麦克风声音**混进 MP4（偏移 < 段长），
+   *  - 后续段的偏移全部 ≥ 段长，于是被整段丢弃，MP4 里是无声音轨。
+   * 屏幕段的音频真正来源是主进程按段写出的 media/mic|system/*.wav，
+   * 导出时由时间映射混音；段 MP4 内嵌音轨既没有消费方，又会重复编码/放大体积，
+   * 因此这里显式不内嵌音频（includeAudio:false），等主进程给出段内相对偏移后再启用。
+   */
   audio: { mic: IncomingAudioPacket[]; system: IncomingAudioPacket[] };
 }
 
@@ -74,78 +93,91 @@ async function decodeJpeg(bytes: Uint8Array): Promise<ImageBitmap> {
 }
 
 /**
- * 把两路音频包（系统/麦克风）混成一段交错的 Float32 立体声。
+ * 本段选帧方案：按每帧真实时间戳落到「严格段长 × fps」的目标槽位。
  *
- * 时间对齐：每个包都带 qpc（WASAPI 位置），换算成相对会话起点的样本偏移。
- * 两路采样率都是 48 kHz（原生层已重采样），因此可以直接按样本索引相加。
+ * 纯逻辑在 ./uiSync.ts（planFrameSlots / planFramePicks，有单测）；这里只负责调用。
+ * mediaTick 不可用时自动退回均匀抽样。
  */
-function mixAudio(
-  mic: IncomingAudioPacket[],
-  system: IncomingAudioPacket[],
-  totalFrames: number,
-): { left: Float32Array; right: Float32Array } {
-  const left = new Float32Array(totalFrames);
-  const right = new Float32Array(totalFrames);
-
-  const apply = (packets: IncomingAudioPacket[], gain: number) => {
-    for (const packet of packets) {
-      const offset = packet.startFrame;
-      const count = packet.left.length;
-      for (let i = 0; i < count; i++) {
-        const target = offset + i;
-        if (target < 0 || target >= totalFrames) continue;
-        left[target] += (packet.left[i] ?? 0) * gain;
-        right[target] += (packet.right[i] ?? 0) * gain;
-      }
-    }
-  };
-
-  // 两路各按 0.7 增益叠加，避免同时有声音时削顶
-  apply(system, 0.7);
-  apply(mic, 0.7);
-
-  // 软限幅：超过 ±1 才压缩，正常音量不受影响
-  for (let i = 0; i < totalFrames; i++) {
-    if (left[i] > 1) left[i] = 1;
-    else if (left[i] < -1) left[i] = -1;
-    if (right[i] > 1) right[i] = 1;
-    else if (right[i] < -1) right[i] = -1;
-  }
-  return { left, right };
-}
-
 /** 当前段的编码器实例（跨段复用会被 mediabunny 的连续时间戳假设破坏，故每段新建）。 */
 let activeEncoder: SegmentEncoder | null = null;
+/** 与 activeEncoder 同生命周期：dispose() 时要把画布后备存储置零归还内存。 */
+let activeCtx: OffscreenCanvasRenderingContext2D | null = null;
+
+/** 释放当前编码器与画布后备存储（成功、失败、窗口销毁三条路径共用）。 */
+function releaseActiveEncoder(): void {
+  const encoder = activeEncoder;
+  const ctx = activeCtx;
+  activeEncoder = null;
+  activeCtx = null;
+  try {
+    encoder?.dispose();
+  } catch {
+    // 忽略
+  }
+  try {
+    // canvas 尺寸置零才会立即归还后备存储
+    if (ctx) {
+      ctx.canvas.width = 0;
+      ctx.canvas.height = 0;
+    } else {
+      // init() 在创建画布之后、返回 drawContext 之前抛错时，本地 ctx 还没拿到，
+      // 但编码器内部画布已经分配了 8MB 后备存储，这里通过 canvasElement 补一次归还。
+      const canvas = encoder?.canvasElement;
+      if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    }
+  } catch {
+    // 忽略
+  }
+}
 
 async function encodeSegment(payload: SegmentPayload): Promise<SegmentResponse> {
   const started = performance.now();
+  let encoder: SegmentEncoder | null = null;
+  let ctx: OffscreenCanvasRenderingContext2D | null = null;
+  let decodeFailures = 0;
+  // 只有本调用真正创建了编码器才在 finally 里释放；
+  // 否则「防重入提前返回」会把另一个正在跑的那段编码器拆掉。
+  let ownsEncoder = false;
+
   try {
-    if (payload.frames.length === 0) {
+    // 主进程是串行 await 本方法的；这里再挡一次防重入：两个编码器同时跑会争用
+    // GPU 上下文（旧实现用模块级 activeEncoder，第二个会覆盖第一个的引用，
+    // 前一个就再也不会被 abort/dispose）。
+    if (activeEncoder) {
+      return { ok: false, error: '上一段仍在编码中，已跳过该段' };
+    }
+    if (!payload || !Array.isArray(payload.frames) || payload.frames.length === 0) {
       return { ok: false, error: '该段没有采集到任何帧' };
     }
 
     const fps = payload.fps > 0 ? payload.fps : 30;
-    const sampleRate = 48_000;
     const segmentSeconds = payload.durationTicks / 10_000_000;
-    const totalAudioFrames = Math.max(0, Math.round(segmentSeconds * sampleRate));
 
-    const encoder = new SegmentEncoder({
+    encoder = new SegmentEncoder({
       width: payload.width,
       height: payload.height,
       fps,
       videoBitrate: Math.round(payload.width * payload.height * fps * 0.09),
       audioBitrate: 160_000,
       hardwarePreferred: true,
-      includeAudio: totalAudioFrames > 0,
-      audioSampleRate: sampleRate,
+      // 音频不内嵌到段 MP4：原因见 SegmentPayload.audio 注释。
+      // 音频由主进程按段写 WAV，导出时混音，重复编码只会放大文件、拖慢编码。
+      includeAudio: false,
+      audioSampleRate: 48_000,
       audioChannels: 2,
       // 每段自包含，时间轴从 0 开始；段内时间由帧序决定
       startTimestampUs: 0,
     });
     activeEncoder = encoder;
+    activeCtx = null;
+    ownsEncoder = true;
     await encoder.init();
 
-    const ctx = encoder.drawContext;
+    ctx = encoder.drawContext;
+    activeCtx = ctx;
 
     // 逐帧绘制 JPEG 并编码。
     //
@@ -154,22 +186,16 @@ async function encodeSegment(payload: SegmentPayload): Promise<SegmentResponse> 
     // 如果仍按 i/fps 逐帧打时间戳，视频时间轴会被拉长到 656/30 = 21.87s，
     // 播放起来比真实时间慢 9%，且与音频（按真实时长生成）产生累计漂移。
     //
-    // 正确做法：目标帧数 = 段时长 × fps；采集帧多于目标时按间隔抽样丢弃，
-    // 少于目标时重复最后一帧补齐。这样段内时间轴严格等于段时长。
-    // 采样点选择需要段时长，复用上面已经算好的 segmentSeconds，不再重复计算
+    // 正确做法：目标帧数 = 段时长 × fps，再按每帧的 mediaTick 落到最近槽位。
+    // 掉帧只让对应时刻画面静止，不会把整段压快（旧实现均匀抽样会压缩时间轴，
+    // 导致段内画面与按真实时长生成的音频错位，最多差一个段长）。
     const targetFrames = Math.max(1, Math.round(segmentSeconds * fps));
-    const sourceCount = payload.frames.length;
-    const picks: number[] = [];
-    if (sourceCount >= targetFrames) {
-      // 均匀抽样：从 sourceCount 帧里挑 targetFrames 帧，间距最均匀
-      for (let i = 0; i < targetFrames; i++) {
-        picks.push(Math.min(sourceCount - 1, Math.floor((i * sourceCount) / targetFrames)));
-      }
-    } else {
-      // 帧不够：能取多少取多少，剩余用最后一帧补齐（画面停住而不是时间轴变短）
-      for (let i = 0; i < sourceCount; i++) picks.push(i);
-      while (picks.length < targetFrames) picks.push(sourceCount - 1);
-    }
+    const picks = planFrameSlots(
+      payload.frames,
+      payload.startTick,
+      targetFrames,
+      TICKS_PER_SECOND / fps,
+    );
 
     let written = 0;
     // 时间戳用「整数微秒」逐帧递增，而不是每帧重算 i/fps。
@@ -185,43 +211,32 @@ async function encodeSegment(payload: SegmentPayload): Promise<SegmentResponse> 
     // 实测表现为「录制覆盖率 8%、只出 1 段」。
     // 整段编码结束后 payload 会被整体丢弃，V8 随即回收，无需逐帧释放。
     for (let i = 0; i < picks.length; i++) {
-      const bitmap = await decodeJpeg(base64ToBytes(payload.frames[picks[i]].jpeg));
+      const sourceFrame = payload.frames[picks[i]];
       try {
-        ctx.drawImage(bitmap, 0, 0, payload.width, payload.height);
-      } finally {
-        bitmap.close();
+        const bitmap = await decodeJpeg(base64ToBytes(sourceFrame.jpeg));
+        try {
+          ctx.drawImage(bitmap, 0, 0, payload.width, payload.height);
+        } finally {
+          bitmap.close();
+        }
+      } catch (error) {
+        // 单帧 JPEG 损坏（grabber 截断/内存压力）不应该让整段 2 秒画面全部丢掉：
+        // 跳过这一帧，画布保留上一帧内容，时间轴照常推进。
+        decodeFailures += 1;
+        if (decodeFailures <= 3) {
+          console.warn(`[recorder] 段 #${payload.index} 第 ${picks[i]} 帧解码失败，沿用上一帧：${String(error)}`);
+        }
       }
       await encoder.commitVideoFrame(i * frameStepUs);
       written++;
     }
 
-    // 音频：把整段 PCM 混好，一次追加（AudioBufferSource 顺序拼接语义）
-    if (totalAudioFrames > 0) {
-      const mixed = mixAudio(payload.audio.mic, payload.audio.system, totalAudioFrames);
-      await encoder.addAudio([mixed.left, mixed.right], 0, sampleRate);
-    }
-
     const result = await encoder.finalize();
-    activeEncoder = null;
-
-    // 主动释放本段的编码器资源与画布后备存储。
-    //
-    // 每段都新建 SegmentEncoder（持有硬件 VideoEncoder 上下文、AudioBufferSource、
-    // Output 封装器）和一个 1920×1080 的 OffscreenCanvas（约 8MB 后备存储）。
-    // 不显式释放时这些资源只能等 GC，实测进程树内存随分段数线性增长
-    // （40 秒录制涨到 3058MB，超出 §16.2 的 1.2GB 上限）。
-    encoder.dispose();
-    try {
-      // canvas 尺寸置零才会立即归还后备存储
-      ctx.canvas.width = 0;
-      ctx.canvas.height = 0;
-    } catch {
-      // 忽略
-    }
 
     const elapsed = Math.round(performance.now() - started);
     console.log(
-      `[recorder] 段 #${payload.index} 编码完成 ${written} 帧 / ${totalAudioFrames} 采样 / ${result.data.byteLength} 字节 / ${elapsed}ms / ${result.encoder}`,
+      `[recorder] 段 #${payload.index} 编码完成 ${written} 帧 / ${result.data.byteLength} 字节 / ${elapsed}ms / ${result.encoder}` +
+        (decodeFailures > 0 ? ` / 跳过错帧 ${decodeFailures}` : ''),
     );
 
     return {
@@ -233,24 +248,18 @@ async function encodeSegment(payload: SegmentPayload): Promise<SegmentResponse> 
     };
   } catch (error) {
     const message = error instanceof Error ? `${error.message}` : String(error);
-    console.error(`[recorder] 段 #${payload.index} 编码失败：${message}`);
-    try {
-      activeEncoder?.abort();
-    } catch {
-      // 忽略
-    }
-    activeEncoder = null;
+    console.error(`[recorder] 段 #${payload?.index ?? '?'} 编码失败：${message}`);
     return { ok: false, error: message };
+  } finally {
+    // 成功与失败都必须释放：每段新建 SegmentEncoder 会持有硬件 VideoEncoder（GPU 上下文）
+    // 与 AudioBufferSource，另有 1920×1080 的 OffscreenCanvas（约 8MB 后备存储）。
+    // 旧实现只在成功路径 dispose，失败段的资源只能等 GC；连续失败时内存线性增长。
+    if (ownsEncoder) releaseActiveEncoder();
   }
 }
 
 async function dispose(): Promise<void> {
-  try {
-    activeEncoder?.abort();
-  } catch {
-    // 忽略
-  }
-  activeEncoder = null;
+  releaseActiveEncoder();
 }
 
 declare global {
@@ -259,6 +268,23 @@ declare global {
   }
 }
 
-window.__wcsRecorder = { encodeSegment, dispose };
+/**
+ * 只在 recorder 角色窗口安装运行时。
+ *
+ * main.tsx 会把本模块静态打进每一个窗口（Vite 要求静态 import），
+ * 但只有隐藏的 recorder 窗口会被主进程用 executeJavaScript 调用。
+ * 旧实现无条件写 window.__wcsRecorder，导致主窗口/悬浮窗/导出窗也挂着一个
+ * 永不使用的编码入口；一旦这些窗口被误调 executeJavaScript，就会在用户窗口里
+ * 抢占 GPU 编码上下文。与 cameraRuntime 的角色判断保持一致。
+ */
+function isRecorderRole(): boolean {
+  if (typeof window === 'undefined') return false;
+  const declared = window.wcs?.role;
+  if (declared) return declared === 'recorder';
+  return typeof location !== 'undefined' && /recorder/.test(location.hash + location.search);
+}
 
-console.log('[recorder] 录制编码窗口就绪');
+if (isRecorderRole()) {
+  window.__wcsRecorder = { encodeSegment, dispose };
+  console.log('[recorder] 录制编码窗口就绪');
+}

@@ -55,13 +55,13 @@ async function waitForRender(win, timeoutMs = 20000) {
 async function settle(win, ms = 700) {
   await wait(ms);
   await win.webContents.executeJavaScript(
-    'new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))',
+    'Promise.race([new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))), new Promise((r) => setTimeout(r, 1200))])',
   ).catch(() => {});
   await wait(160);
 }
 
 async function capture(win, name, label) {
-  const image = await win.webContents.capturePage();
+  const image = await win.webContents.capturePage(undefined, { stayAwake: true });
   if (image.isEmpty()) throw new Error(`截图 ${name} 为空`);
   const png = image.toPNG();
   const file = path.join(OUT, `${name}.png`);
@@ -186,6 +186,59 @@ async function shortcutGuard(win) {
   })()`);
 }
 
+async function verifyNewControls(win) {
+  await goView(win, 'export', '.export-layout');
+  await win.webContents.executeJavaScript(`(() => {
+    for (const [id, value] of [['export-resolution', '2160'], ['export-fps', '60'], ['export-quality', 'high']]) {
+      const el = document.getElementById(id);
+      if (!el) throw new Error('缺少导出选择器 ' + id);
+      el.value = value; el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  })()`);
+  await settle(win, 200);
+  const exportSettings = await win.webContents.executeJavaScript(`(() => ({
+    resolution: document.getElementById('export-resolution').value,
+    fps: document.getElementById('export-fps').value,
+    shows4K: document.querySelector('.export-layout').textContent.includes('3840'),
+  }))()`);
+  if (exportSettings.resolution !== '2160' || exportSettings.fps !== '60' || !exportSettings.shows4K) throw new Error('导出规格没有应用');
+
+  await goView(win, 'editor', '.editor');
+  await win.webContents.executeJavaScript(`document.getElementById('inspector-tab-canvas').click()`);
+  await settle(win, 150);
+  const presetCount = await win.webContents.executeJavaScript(`(() => {
+    const items = [...document.querySelectorAll('.canvas-preset')];
+    items.find((e) => e.textContent.includes('落日')).click(); return items.length;
+  })()`);
+  await settle(win, 200);
+  const presetApplied = await win.webContents.executeJavaScript(`document.querySelector('.canvas-preset.is-selected')?.textContent.includes('落日')`);
+  if (presetCount !== 5 || !presetApplied) throw new Error('场景预设没有应用');
+  await win.webContents.executeJavaScript(`document.dispatchEvent(new KeyboardEvent('keydown', {key:'z', ctrlKey:true, bubbles:true}))`);
+  await settle(win, 150);
+  const presetUndone = await win.webContents.executeJavaScript(`!document.querySelector('.canvas-preset.is-selected')?.textContent.includes('落日')`);
+  if (!presetUndone) throw new Error('场景预设无法撤销');
+
+  await win.webContents.executeJavaScript(`(() => {
+    if (!document.querySelector('.tl-effect.is-privacy')) document.querySelector('.advanced-tracks-toggle')?.click();
+  })()`);
+  await settle(win, 150);
+  await win.webContents.executeJavaScript(`(() => {
+    document.querySelector('.tl-effect.is-privacy').click();
+  })()`);
+  await settle(win, 150);
+  await win.webContents.executeJavaScript(`document.dispatchEvent(new KeyboardEvent('keydown', {key:'c', ctrlKey:true, bubbles:true}))`);
+  await settle(win, 100);
+  const before = await win.webContents.executeJavaScript(`document.querySelectorAll('.tl-effect.is-privacy').length`);
+  await win.webContents.executeJavaScript(`document.dispatchEvent(new KeyboardEvent('keydown', {key:'v', ctrlKey:true, bubbles:true}))`);
+  await settle(win, 200);
+  const clipboard = await win.webContents.executeJavaScript(`({ count:document.querySelectorAll('.tl-effect.is-privacy').length,
+    unconfirmed:!!document.querySelector('.tl-effect.is-privacy.is-selected.is-unconfirmed'),
+    autoTab:document.getElementById('inspector-tab-privacy').getAttribute('aria-selected') === 'true' })`);
+  if (clipboard.count !== before + 1 || !clipboard.unconfirmed || !clipboard.autoTab) throw new Error('效果粘贴或属性面板联动失败');
+  await win.webContents.executeJavaScript(`document.dispatchEvent(new KeyboardEvent('keydown', {key:'z', ctrlKey:true, bubbles:true}))`);
+  return { exportSettings, presetCount, presetApplied, presetUndone, clipboard };
+}
+
 app.whenReady().then(async () => {
   const summary = { ok: true, shots: [], consoleErrors: [], checks: {}, notes: [] };
   try {
@@ -203,6 +256,7 @@ app.whenReady().then(async () => {
         nodeIntegration: false,
         sandbox: false,
         offscreen: false,
+        backgroundThrottling: false,
       },
     });
 
@@ -317,7 +371,7 @@ app.whenReady().then(async () => {
       show: true,
       backgroundColor: '#0e1218',
       title: 'WinCapture Studio · 录制控制条',
-      webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: false },
+      webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: false, backgroundThrottling: false },
     });
     overlayWin.webContents.on('console-message', (event, level, message) => {
       const levelValue = typeof event === 'object' && event ? event.level : level;
@@ -364,6 +418,7 @@ app.whenReady().then(async () => {
     summary.checks.previewPixels = nonBlank;
 
     if (!nonBlank.ok) throw new Error(`编辑器预览疑似空白：${JSON.stringify(nonBlank)}`);
+    summary.checks.newControls = await verifyNewControls(win);
 
     summary.shots = shots;
     summary.consoleErrors = consoleErrors;

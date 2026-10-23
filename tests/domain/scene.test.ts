@@ -148,6 +148,23 @@ describe('fitRect', () => {
 });
 
 describe('evaluateScene: 基本求值', () => {
+  it.each([[1920, 1080, 'landscape'], [1080, 1920, 'portrait'], [1920, 1920, 'square']] as const)(
+    '源画面在 %s×%s 画布上保持真实像素比例', (width, height, variantId) => {
+      const p = projectWithContent();
+      const scene = evaluateScene(p, 0, { outputWidth: width, outputHeight: height, variantId });
+      const rect = screenRectPx(scene);
+      expect(rect.width / rect.height).toBeCloseTo(16 / 9, 6);
+      expect(rect.x).toBeGreaterThanOrEqual(0);
+      expect(rect.y).toBeGreaterThanOrEqual(0);
+      expect(rect.x + rect.width).toBeLessThanOrEqual(width);
+      expect(rect.y + rect.height).toBeLessThanOrEqual(height);
+    });
+
+  it('摄像头片段外不显示冻结的画中画', () => {
+    const p = projectWithContent();
+    p.tracks.find((t) => t.kind === 'camera')!.clips[0].timelineInTicks = 5 * S;
+    expect(evaluateScene(p, S, { outputWidth: 1920, outputHeight: 1080 }).camera.visible).toBe(false);
+  });
   it('命中片段时 hasSourceFrame 为 true 且给出来源 tick', () => {
     const project = projectWithContent();
     const scene = evaluateScene(project, 2 * S, { outputWidth: 1920, outputHeight: 1080 });
@@ -235,6 +252,28 @@ describe('evaluateScene: 遮挡（§11.2 / §12.2）', () => {
     const project = projectWithContent();
     project.effects.push(privacyEffect('pv-1', 0, 5 * S), privacyEffect('pv-2', S, 6 * S));
     expect(evaluateScene(project, 2 * S, { outputWidth: 1920, outputHeight: 1080 }).screenPrivacy).toHaveLength(2);
+  });
+
+  it('只写了 parameters.anchor、缺顶层 anchor 的遮挡依然生效（隐私不能静默失效）', () => {
+    const project = projectWithContent();
+    const effect = privacyEffect('pv-legacy', 0, 5 * S);
+    // 模拟旧版本/手写工程：Effect.anchor 是可选字段，真实数据里可能没有
+    delete (effect as { anchor?: unknown }).anchor;
+    project.effects.push(effect);
+    const scene = evaluateScene(project, 2 * S, { outputWidth: 1920, outputHeight: 1080 });
+    expect(scene.screenPrivacy).toHaveLength(1);
+    expect(scene.screenPrivacy[0].effectId).toBe('pv-legacy');
+  });
+
+  it('anchor 为 window/keyframe 时同样落到源坐标遮挡', () => {
+    for (const anchor of ['window', 'keyframe'] as const) {
+      const project = projectWithContent();
+      const effect = privacyEffect(`pv-${anchor}`, 0, 5 * S);
+      (effect.parameters as { anchor: string }).anchor = anchor;
+      delete (effect as { anchor?: unknown }).anchor;
+      project.effects.push(effect);
+      expect(evaluateScene(project, 2 * S, { outputWidth: 1920, outputHeight: 1080 }).screenPrivacy).toHaveLength(1);
+    }
   });
 });
 
@@ -450,5 +489,53 @@ describe('辅助查询', () => {
     expect(params.scale).toBeGreaterThan(1);
     expect(params.focusX).toBe(0.5);
     expect(params.easeInTicks).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 回归测试：光标效果区间、padding 一致性、空画幅兜底
+// ---------------------------------------------------------------------------
+
+describe('回归：光标效果受时间区间约束', () => {
+  const pointer = { x: 0.2, y: 0.2, visible: true };
+
+  it('区间内应用烧录光标设置，区间外回落到默认后期光标', () => {
+    const project = projectWithContent();
+    project.effects.push({
+      id: 'cursor-1',
+      kind: 'cursor',
+      range: { start: 0, end: S },
+      parameters: { size: 30, clickRipple: 1, visible: true, burnedIn: true },
+      origin: 'manual',
+      locked: true,
+    });
+    const inside = evaluateScene(project, 0, { outputWidth: 1920, outputHeight: 1080, pointer });
+    expect(inside.cursor.visible).toBe(false); // 烧录模式：不再叠加
+    expect(inside.cursor.size).toBe(30);
+
+    const outside = evaluateScene(project, 5 * S, { outputWidth: 1920, outputHeight: 1080, pointer });
+    expect(outside.cursor.visible).toBe(true); // 区间外不应继续被 burnedIn 抑制
+    expect(outside.cursor.size).toBe(26); // 默认尺寸
+  });
+});
+
+describe('回归：scene.padding 与 screenRect 使用同一夹紧值', () => {
+  it('越界 padding 被夹紧后再写入场景', () => {
+    const project = projectWithContent();
+    project.settings.canvas.padding = 0.6;
+    const scene = evaluateScene(project, 0, { outputWidth: 1920, outputHeight: 1080 });
+    expect(scene.padding).toBe(0.4);
+    expect(scene.screenRect.x).toBeCloseTo(0.4, 9);
+    expect(scene.screenRect.width).toBeCloseTo(0.2, 9);
+  });
+});
+
+describe('回归：空画幅时预览求值不抛异常', () => {
+  it('variants 为空时回退到 16:9 兜底画幅', () => {
+    const project = projectWithContent();
+    project.variants = [];
+    const scene = evaluateScene(project, 0, { outputWidth: 1920, outputHeight: 1080 });
+    expect(scene.aspect).toEqual([16, 9]);
+    expect(scene.outputWidth).toBe(1920);
   });
 });

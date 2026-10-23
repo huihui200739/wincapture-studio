@@ -10,8 +10,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ExportProgress, ExportProfile } from '@shared/ipc';
 import type { ExportBundleResult } from '@shared/api';
+import type { ErrorCode } from '@shared/errors';
 import { useApp } from '../lib/store';
-import { Badge, Button, EmptyState, Field, Icon, InlineNote, Panel, ProgressBar, Segmented, Spinner, TextInput } from '../components/ui';
+import { Badge, Button, EmptyState, Field, Icon, InlineNote, Panel, ProgressBar, Spinner, TextInput } from '../components/ui';
 import {
   bytesPerSecond,
   cn,
@@ -25,6 +26,14 @@ import {
 import { wcs } from '../lib/wcs';
 import { timelineDuration } from '@domain/project';
 import { TICKS_PER_SECOND } from '@domain/timebase';
+import { createExportProfile, type ExportResolution, type ExportFrameRate, type ExportQuality } from '../lib/exportSettings';
+import {
+  classifyExportBundle,
+  deriveDefaultOutputPath,
+  normalizeOutputPath,
+  validateOutputPath,
+  type ExportBundleLike,
+} from '../uiSync';
 
 type Kind = 'video' | 'tutorial' | 'both';
 type Status = 'idle' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -51,13 +60,37 @@ export function ExportView() {
 
   const [kind, setKind] = useState<Kind>('video');
   const [variantId, setVariantId] = useState('landscape');
+  const [resolution, setResolution] = useState<ExportResolution>('1080');
+  const [outputFps, setOutputFps] = useState<ExportFrameRate>('project');
+  const [quality, setQuality] = useState<ExportQuality>('balanced');
   const [outputPath, setOutputPath] = useState('');
+  /**
+   * 用户手动改过输出路径的「工程 ID」。
+   * 只记布尔值不够：换工程后仍是 true，默认路径不再重新推导，
+   * 于是工程 B 的导出会直接写到工程 A 的 xxx.mp4 上，静默覆盖上一份产物。
+   */
+  const [pathTouchedFor, setPathTouchedFor] = useState<string | null>(null);
+  const projectId = project?.id ?? null;
+  useEffect(() => {
+    if (project) setVariantId(project.settings.activeVariantId);
+  }, [projectId]);
+  const pathTouched = pathTouchedFor !== null && pathTouchedFor === projectId;
   const [status, setStatus] = useState<Status>('idle');
   const [progress, setProgress] = useState<ExportProgress | null>(null);
   const [result, setResult] = useState<ExportBundleResult | null>(null);
+  /** 成功但有非致命问题（教程包失败、完整性校验未过等），必须显示出来 */
+  const [warnings, setWarnings] = useState<string[]>([]);
   const [error, setError] = useState<PresentedError | null>(null);
   const [picking, setPicking] = useState(false);
+  /** 已发出取消请求、还没收到终态：按钮显示「正在取消」而不是立刻宣称已取消 */
+  const [cancelling, setCancelling] = useState(false);
   const jobRef = useRef<{ cancelled: boolean } | null>(null);
+  /** 同步挡重复启动：两个按钮在同一 tick 连点会都通过 status 判断 */
+  const runningRef = useRef(false);
+  /** 当前任务的 jobId：过滤上一任务迟到的进度事件 */
+  const jobIdRef = useRef<string | null>(null);
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   const duration = useMemo(() => (project ? timelineDuration(project) : 0), [project]);
   const unconfirmedPrivacy = useMemo(
@@ -68,42 +101,44 @@ export function ExportView() {
     [project],
   );
 
-  // 默认输出路径
+  const pathCheck = useMemo(() => validateOutputPath(outputPath), [outputPath]);
+
+  /**
+   * 默认输出路径：跟着「视频目录 + 当前工程名」走。
+   * 旧实现只在 outputPath 为空时算一次，换了工程后仍然沿用一个工程的路径，
+   * 二次导出会静默覆盖上一份产物；带非法字符的工程名也可能拼出无效路径。
+   */
   useEffect(() => {
-    if (outputPath) return;
-    const base = systemInfo?.videosPath ?? 'C:\\Users\\huihui\\Videos\\WinCapture Studio';
-    const name = project?.name?.replace(/[\\/:*?"<>|]/g, '-') ?? 'WinCapture 录制';
-    setOutputPath(`${base}\\${name}.mp4`);
-  }, [outputPath, project?.name, systemInfo?.videosPath]);
+    if (pathTouched) return;
+    const derived = deriveDefaultOutputPath(systemInfo?.videosPath, project?.name);
+    if (derived) setOutputPath(derived);
+  }, [pathTouched, project?.name, systemInfo?.videosPath]);
 
   // 进度订阅
   useEffect(() => {
     const off = wcs().onExportProgress((next) => {
+      // 旧任务的迟到事件不能污染新任务进度
+      if (jobIdRef.current !== null && next.jobId !== jobIdRef.current) return;
+      if (statusRef.current !== 'running') return;
+      if (jobIdRef.current === null) jobIdRef.current = next.jobId;
       setProgress(next);
-      if (next.phase === 'cancelled') setStatus('cancelled');
-      if (next.phase === 'failed') setStatus('failed');
+      if (next.phase === 'cancelled') {
+        setStatus('cancelled');
+        setCancelling(false);
+      }
+      if (next.phase === 'failed') {
+        setStatus('failed');
+        setCancelling(false);
+      }
     });
     return off;
   }, []);
 
   const profile = useMemo<ExportProfile | null>(() => {
     if (!project) return null;
-    const variant = project.variants.find((v) => v.id === variantId) ?? project.variants[0];
-    const [aw, ah] = variant.aspect;
-    const longEdge = 1920;
-    const rawW = aw >= ah ? longEdge : Math.round((longEdge * aw) / ah);
-    const rawH = aw >= ah ? Math.round((longEdge * ah) / aw) : longEdge;
-    return {
-      variantId: variant.id,
-      width: rawW % 2 === 0 ? rawW : rawW + 1,
-      height: rawH % 2 === 0 ? rawH : rawH + 1,
-      fps: { ...project.settings.fps },
-      videoBitrate: 12_000_000,
-      audioBitrate: 192_000,
-      audioOnly: false,
-      includeTutorial: kind === 'tutorial' || kind === 'both',
-    };
-  }, [kind, project, variantId]);
+    return createExportProfile(project, { variantId, resolution, fps: outputFps, quality,
+      includeTutorial: kind === 'tutorial' || kind === 'both' });
+  }, [kind, project, variantId, resolution, outputFps, quality]);
 
   const estimatedBytes = useMemo(() => {
     if (!profile || duration <= 0) return 0;
@@ -114,8 +149,15 @@ export function ExportView() {
   const pickPath = async () => {
     setPicking(true);
     try {
-      const picked = unwrap(await wcs().pickSavePath(`${project?.name ?? 'WinCapture 录制'}.mp4`));
-      if (picked) setOutputPath(picked);
+      const picked = unwrap(
+        await wcs().pickSavePath(`${project?.name ?? 'WinCapture 录制'}.mp4`, [
+          { name: 'MP4 视频', extensions: ['mp4'] },
+        ]),
+      );
+      if (picked) {
+        setOutputPath(normalizeOutputPath(picked));
+        setPathTouchedFor(projectId);
+      }
     } catch (err) {
       pushError(err, '选择输出路径失败');
     } finally {
@@ -123,16 +165,30 @@ export function ExportView() {
     }
   };
 
+  /** 把导出结果归类后的失败转成界面统一的错误展示。 */
+  const presentedFromOutcome = (outcome: Extract<ReturnType<typeof classifyExportBundle>, { kind: 'failed' }>): PresentedError =>
+    describeError({
+      code: outcome.code as ErrorCode,
+      message: outcome.message,
+      retryable: outcome.retryable,
+      preservedData: outcome.preservedData,
+    });
+
   const startExport = useCallback(async () => {
-    if (!project || !profile) return;
-    if (!outputPath.trim()) {
-      pushToast({ tone: 'warn', title: '请先选择输出路径' });
+    if (!project || !profile || runningRef.current) return;
+    const validation = validateOutputPath(outputPath);
+    if (!validation.ok) {
+      pushToast({ tone: 'warn', title: '输出路径不可用', message: validation.reason ?? '请检查输出路径。' });
       return;
     }
+    runningRef.current = true;
     setStatus('running');
     setProgress(null);
     setResult(null);
+    setWarnings([]);
     setError(null);
+    setCancelling(false);
+    jobIdRef.current = null;
     const job = { cancelled: false };
     jobRef.current = job;
     try {
@@ -140,21 +196,43 @@ export function ExportView() {
         await wcs().startExport({
           project,
           profile,
-          outputPath: outputPath.trim(),
+          outputPath: validation.normalized,
           includeTutorial: kind === 'tutorial' || kind === 'both',
         }),
       );
+      // 用户已点取消：即便隐藏窗口最终跑完并写出了文件，也不能显示成「导出完成」
       if (job.cancelled) {
         setStatus('cancelled');
         return;
       }
+      const outcome = classifyExportBundle(bundle as unknown as ExportBundleLike);
+      if (outcome.kind === 'cancelled') {
+        setStatus('cancelled');
+        return;
+      }
+      if (outcome.kind === 'failed') {
+        // 关键修复：导出窗口把异常当正常返回值带回（IPC 外层 ok:true），
+        // 旧实现直接 setStatus('done')，编码失败/取消都会显示「导出完成」。
+        const presented = presentedFromOutcome(outcome);
+        setError(presented);
+        setStatus('failed');
+        pushToast({ tone: 'danger', title: presented.title, message: presented.message, detail: presented.detail });
+        return;
+      }
       setResult(bundle);
+      setWarnings(outcome.warnings);
       setStatus('done');
+      const video = bundle.video;
       pushToast({
-        tone: 'ok',
-        title: '导出完成',
-        message: bundle.video ? `${formatBytes(bundle.video.bytes)} · ${bundle.video.frames} 帧 · 完整性校验${bundle.video.verified ? '通过' : '未通过'}` : '教程包已生成',
+        tone: outcome.warnings.length > 0 ? 'warn' : 'ok',
+        title: outcome.warnings.length > 0 ? '导出完成（有告警）' : '导出完成',
+        message: video
+          ? `${formatBytes(video.bytes)} · ${video.frames} 帧 · 完整性校验${video.verified ? '通过' : '未通过'}`
+          : '教程包已生成',
       });
+      if (outcome.warnings.length > 0) {
+        pushToast({ tone: 'warn', title: '需要注意', message: outcome.warnings.join('；') });
+      }
     } catch (err) {
       if (job.cancelled) {
         setStatus('cancelled');
@@ -166,26 +244,62 @@ export function ExportView() {
       pushToast({ tone: 'danger', title: presented.title, message: presented.message, detail: presented.detail });
     } finally {
       jobRef.current = null;
+      runningRef.current = false;
+      setCancelling(false);
     }
   }, [kind, outputPath, profile, project, pushToast]);
 
+  /**
+   * 取消导出。
+   *
+   * 旧实现点了取消就立刻把界面切成「已取消」并宣称临时文件已清理，
+   * 但取消信号可能到达得太晚（导出窗口还没注册 AbortController），
+   * 实际导出仍在跑、甚至写完了文件。现在只标记「正在取消」，
+   * 等 startExport 的 Promise 结算后由结果决定最终状态。
+   */
   const cancelExport = async () => {
+    if (!runningRef.current || cancelling) return;
+    setCancelling(true);
     if (jobRef.current) jobRef.current.cancelled = true;
     try {
-      await wcs().cancelExport();
-      setStatus('cancelled');
-      pushToast({ tone: 'info', title: '已请求取消导出', message: '临时文件会被清理，工程与素材保持原样。' });
+      unwrap(await wcs().cancelExport());
+      pushToast({ tone: 'info', title: '已请求取消导出', message: '正在等待导出进程停止，临时文件会被清理。' });
     } catch (err) {
       pushError(err, '取消导出失败');
+      setCancelling(false);
     }
   };
 
   const revealOutput = async (path: string) => {
     try {
-      await wcs().showInFolder(path);
+      unwrap(await wcs().showInFolder(path));
     } catch (err) {
       pushError(err, '打开文件夹失败');
     }
+  };
+
+  const playOutput = async (path: string) => {
+    try {
+      unwrap(await wcs().openPath(path));
+    } catch (err) {
+      pushError(err, '播放视频失败');
+    }
+  };
+
+  const openTutorial = async (path: string) => {
+    try {
+      unwrap(await wcs().openPath(path));
+    } catch (err) {
+      pushError(err, '打开教程失败');
+    }
+  };
+
+  /** 回到可重新导出的初始状态（清掉上一轮的结果/进度/告警，避免二次导出残留）。 */
+  const resetToIdle = () => {
+    setStatus('idle');
+    setProgress(null);
+    setError(null);
+    setWarnings([]);
   };
 
   if (!project) {
@@ -227,12 +341,18 @@ export function ExportView() {
         </div>
         <div className="view-actions">
           {running ? (
-            <Button variant="danger" icon="close" onClick={() => void cancelExport()}>
-              取消导出
+            <Button variant="danger" icon="close" onClick={() => void cancelExport()} loading={cancelling} disabled={cancelling}>
+              {cancelling ? '正在取消…' : '取消导出'}
             </Button>
           ) : (
-            <Button variant="primary" icon="export" onClick={() => void startExport()}>
-              {status === 'failed' ? '重试导出' : '开始导出'}
+            <Button
+              variant="primary"
+              icon="export"
+              onClick={() => void startExport()}
+              disabled={!pathCheck.ok}
+              title={pathCheck.ok ? undefined : pathCheck.reason}
+            >
+              {status === 'failed' ? '重试导出' : status === 'done' ? '再导出一份' : '开始导出'}
             </Button>
           )}
         </div>
@@ -292,14 +412,30 @@ export function ExportView() {
           </Panel>
 
           <Panel title="输出设置" icon="settings">
-            <Field label="输出路径" htmlFor="export-path" hint="导出前会检查目录可写与磁盘余量">
+            <Field
+              label="输出路径"
+              htmlFor="export-path"
+              hint={
+                pathCheck.ok
+                  ? '导出前会检查目录可写与磁盘余量。'
+                  : pathCheck.reason ?? '导出前会检查目录可写与磁盘余量。'
+              }
+            >
               <div className="path-row">
                 <TextInput
                   id="export-path"
                   value={outputPath}
-                  onChange={(event) => setOutputPath(event.target.value)}
+                  onChange={(event) => {
+                    setOutputPath(event.target.value);
+                    setPathTouchedFor(projectId);
+                  }}
+                  onBlur={() => {
+                    // 用户手输路径时补全 .mp4，避免主进程写出没有扩展名的文件
+                    if (outputPath.trim()) setOutputPath(normalizeOutputPath(outputPath));
+                  }}
                   placeholder="选择 .mp4 输出路径"
                   disabled={running}
+                  aria-invalid={!pathCheck.ok}
                 />
                 <Button size="sm" icon="folder" loading={picking} onClick={() => void pickPath()} disabled={running}>
                   浏览
@@ -326,11 +462,28 @@ export function ExportView() {
             </Field>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 16px' }}>
-              <Field label="分辨率">
-                <TextInput value={profile ? `${profile.width} × ${profile.height}` : '—'} readOnly aria-label="输出分辨率" />
+              <Field label="分辨率" htmlFor="export-resolution" hint={profile ? `${profile.width} × ${profile.height} 像素；放大输出不会增加源素材细节。` : undefined}>
+                <select id="export-resolution" className="wcs-select" value={resolution} disabled={running}
+                  aria-label="输出分辨率" onChange={(e) => setResolution(e.target.value as ExportResolution)}>
+                  <option value="source">原始素材尺寸</option>
+                  <option value="720">720p · 轻量分享</option>
+                  <option value="1080">1080p · 全高清</option>
+                  <option value="1440">1440p · 2K</option>
+                  <option value="2160">2160p · 4K</option>
+                </select>
               </Field>
-              <Field label="帧率">
-                <TextInput value={profile ? `${profile.fps.num}/${profile.fps.den} fps` : '—'} readOnly aria-label="输出帧率" />
+              <Field label="帧率" htmlFor="export-fps">
+                <select id="export-fps" className="wcs-select" value={outputFps} disabled={running}
+                  aria-label="输出帧率" onChange={(e) => setOutputFps(e.target.value as ExportFrameRate)}>
+                  <option value="project">跟随工程 · {project.settings.fps.num / project.settings.fps.den} FPS</option>
+                  <option value="30">30 FPS</option><option value="60">60 FPS</option>
+                </select>
+              </Field>
+              <Field label="画质" htmlFor="export-quality">
+                <select id="export-quality" className="wcs-select" value={quality} disabled={running}
+                  aria-label="输出画质" onChange={(e) => setQuality(e.target.value as ExportQuality)}>
+                  <option value="compact">小体积</option><option value="balanced">均衡（推荐）</option><option value="high">高画质</option>
+                </select>
               </Field>
               <Field label="视频码率">
                 <TextInput value={profile ? formatBitrate(profile.videoBitrate) : '—'} readOnly aria-label="视频码率" />
@@ -354,9 +507,17 @@ export function ExportView() {
                 <div className="progress-head">
                   <div className="progress-phase">
                     {status === 'running' ? <Spinner size={13} /> : <Icon name="close" size={14} />}
-                    {status === 'cancelled' ? '导出已取消' : progress ? PHASE_TEXT[progress.phase] : '准备中'}
+                    {status === 'cancelled'
+                      ? '导出已取消'
+                      : cancelling
+                        ? '正在取消…'
+                        : progress
+                          ? PHASE_TEXT[progress.phase]
+                          : '准备中'}
                   </div>
-                  <span className="progress-msg">{progress?.message ?? '正在准备工程快照'}</span>
+                  <span className="progress-msg">
+                    {status === 'cancelled' ? '导出已停止，未完成的临时文件已被清理。' : progress?.message ?? '正在准备工程快照'}
+                  </span>
                 </div>
                 <ProgressBar
                   value={progress?.progress ?? 0}
@@ -371,14 +532,21 @@ export function ExportView() {
                 </div>
                 {status === 'running' && (
                   <div>
-                    <Button size="sm" variant="danger" icon="close" onClick={() => void cancelExport()}>
-                      取消导出
+                    <Button
+                      size="sm"
+                      variant="danger"
+                      icon="close"
+                      onClick={() => void cancelExport()}
+                      loading={cancelling}
+                      disabled={cancelling}
+                    >
+                      {cancelling ? '正在取消…' : '取消导出'}
                     </Button>
                   </div>
                 )}
                 {status === 'cancelled' && (
                   <InlineNote tone="warn">
-                    已取消。临时文件已清理，工程与素材保持原样，可以修改后重新导出。
+                    已取消。工程与素材保持原样；导出过程中产生的临时文件会在导出进程退出时清理。
                   </InlineNote>
                 )}
               </div>
@@ -395,10 +563,10 @@ export function ExportView() {
                   {error.detail && <div className="toast-detail" style={{ marginTop: 5 }}>{error.detail}</div>}
                 </InlineNote>
                 <div style={{ display: 'flex', gap: 7 }}>
-                  <Button size="sm" variant="primary" icon="refresh" onClick={() => void startExport()}>
+                  <Button size="sm" variant="primary" icon="refresh" onClick={() => void startExport()} disabled={!pathCheck.ok}>
                     重试导出
                   </Button>
-                  <Button size="sm" variant="ghost" onClick={() => setStatus('idle')}>
+                  <Button size="sm" variant="ghost" onClick={resetToIdle}>
                     返回
                   </Button>
                 </div>
@@ -408,12 +576,19 @@ export function ExportView() {
             {status === 'done' && result && (
               <div className="result-card">
                 <div className="result-head">
-                  <Icon name="check" size={15} />
-                  导出完成
+                  <Icon name={warnings.length > 0 ? 'warning' : 'check'} size={15} />
+                  {warnings.length > 0 ? '导出完成（有告警）' : '导出完成'}
                 </div>
+                {warnings.length > 0 && (
+                  <InlineNote tone="warn">
+                    {warnings.map((warning, index) => (
+                      <div key={`${index}-${warning}`}>{warning}</div>
+                    ))}
+                  </InlineNote>
+                )}
                 {result.video && (
                   <div className="result-facts">
-                    <span>视频：{result.video.outputPath}</span>
+                    <span>视频：{result.video.outputPath ?? '（未返回路径）'}</span>
                     <span>
                       {formatBytes(result.video.bytes)} · {result.video.frames} 帧 · {formatClock(result.video.durationTicks)} ·{' '}
                       {result.video.encoder}
@@ -430,25 +605,25 @@ export function ExportView() {
                   </div>
                 )}
                 <div className="result-facts">
-                  <span>工程快照哈希：{result.snapshotHash}</span>
+                  <span>工程快照哈希：{result.snapshotHash || '（未返回）'}</span>
                 </div>
                 <div className="result-actions">
                   {result.video?.outputPath && (
-                    <Button size="sm" icon="folder" onClick={() => void revealOutput(result.video!.outputPath!)}>
+                    <Button size="sm" icon="folder" onClick={() => void revealOutput(result.video!.outputPath as string)}>
                       打开所在文件夹
                     </Button>
                   )}
                   {result.video?.outputPath && (
-                    <Button size="sm" variant="ghost" icon="play" onClick={() => void wcs().openPath(result.video!.outputPath!)}>
+                    <Button size="sm" variant="ghost" icon="play" onClick={() => void playOutput(result.video!.outputPath as string)}>
                       播放视频
                     </Button>
                   )}
                   {result.tutorial?.indexPath && (
-                    <Button size="sm" variant="ghost" icon="book" onClick={() => void wcs().openPath(result.tutorial!.indexPath)}>
+                    <Button size="sm" variant="ghost" icon="book" onClick={() => void openTutorial(result.tutorial!.indexPath)}>
                       打开教程
                     </Button>
                   )}
-                  <Button size="sm" variant="ghost" icon="refresh" onClick={() => setStatus('idle')}>
+                  <Button size="sm" variant="ghost" icon="refresh" onClick={resetToIdle}>
                     再导出一份
                   </Button>
                 </div>
@@ -487,8 +662,18 @@ export function ExportView() {
                 <span className="kv-value">{project.steps.length}</span>
               </div>
               <div className="kv-row">
+                <span className="kv-key">输出路径</span>
+                <span className="kv-value">
+                  {pathCheck.ok ? (
+                    <Badge tone="ok" icon="check">可用于导出</Badge>
+                  ) : (
+                    <Badge tone="warn" icon="warning">{pathCheck.reason ?? '待填写'}</Badge>
+                  )}
+                </span>
+              </div>
+              <div className="kv-row">
                 <span className="kv-key">磁盘可写</span>
-                <span className="kv-value">{systemInfo ? '已检测' : '未知'}</span>
+                <span className="kv-value">{systemInfo ? '导出时由主进程检查' : '读取中…'}</span>
               </div>
             </div>
             <div style={{ marginTop: 10 }}>

@@ -106,9 +106,12 @@ export function readProject(raw: unknown, options: MigrationOptions = {}): Migra
 
   if (fromVersion > target) {
     if (!allowReadOnlyFuture) throw new SchemaFutureError(fromVersion, target);
-    // 只读：原样返回（规整为非空结构以便界面渲染），并给出提示
+    // 只读：保留未来版本新增的字段（不丢数据），同时把已知字段规整为当前结构，
+    // 保证界面渲染时 assets/tracks/effects/steps/variants/markers/settings 一定存在。
+    // normalizeProject 在 version !== 当前版本时会把 schemaVersion 写回原版本号。
+    const normalized = normalizeProject(source, fromVersion);
     return {
-      project: { ...(source as Project) },
+      project: { ...(source as Project), ...normalized },
       migrated: false,
       fromVersion,
       toVersion: fromVersion,
@@ -271,7 +274,10 @@ function normalizeProject(source: Record<string, unknown>, version: number): Pro
     timebase: { ticksPerSecond: TICKS_PER_SECOND },
     name: base.name,
     createdAt: base.createdAt,
-    updatedAt: typeof source.updatedAt === 'number' ? source.updatedAt : base.createdAt,
+    updatedAt:
+      typeof source.updatedAt === 'number' && Number.isFinite(source.updatedAt)
+        ? source.updatedAt
+        : base.createdAt,
     assets: Array.isArray(source.assets) ? (source.assets as MediaAsset[]).map(normalizeAsset) : [],
     tracks,
     effects: Array.isArray(source.effects) ? (source.effects as Effect[]).map(normalizeEffect) : [],

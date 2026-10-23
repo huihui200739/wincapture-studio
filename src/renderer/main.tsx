@@ -16,6 +16,7 @@ import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { OverlayWindow } from './views/OverlayWindow';
 import { AppProvider } from './lib/store';
+import { ErrorBoundary } from './components/ui';
 // 隐藏窗口的运行时必须在构建期静态引入，否则 Vite 不会把它打进产物，
 // 运行时动态 import 会 404（实测 "Failed to fetch dynamically imported module"）。
 // 三个模块只在对应角色下才会被调用，静态引入不会影响主窗口行为。
@@ -50,8 +51,27 @@ window.addEventListener('error', (event) => {
   console.error('[renderer] uncaught error:', event.message, event.filename, event.lineno);
 });
 window.addEventListener('unhandledrejection', (event) => {
-  console.error('[renderer] unhandled rejection:', String(event.reason));
+  const reason = event.reason;
+  if (reason instanceof Error) {
+    console.error('[renderer] unhandled rejection:', reason.message, reason.stack);
+  } else {
+    console.error('[renderer] unhandled rejection:', String(reason));
+  }
 });
+
+/** 启动期兜底：连 #root 都没有时不要静默白屏，直接给出可读的 DOM 提示。 */
+function renderBootFailure(container: HTMLElement | null, message: string): void {
+  if (!container) {
+    document.body.textContent = message;
+    return;
+  }
+  container.innerHTML = '';
+  const box = document.createElement('div');
+  box.setAttribute('role', 'alert');
+  box.style.cssText = 'padding:32px;font:14px/1.7 system-ui,"Microsoft YaHei UI",sans-serif;color:#e6edf6;background:#0e1218;height:100vh;box-sizing:border-box;';
+  box.textContent = message;
+  container.appendChild(box);
+}
 
 const role = resolveRole();
 
@@ -65,19 +85,40 @@ if (role === 'recorder' || role === 'exporter' || role === 'camera') {
 } else {
   const container = document.getElementById('root');
   if (!container) {
+    renderBootFailure(null, '缺少 #root 挂载点，界面无法启动。请重新安装应用。');
     throw new Error('缺少 #root 挂载点');
   }
 
-  createRoot(container).render(
-    <StrictMode>
-      <AppProvider>
-        {role === 'overlay' ? <OverlayWindow /> : <App />}
-      </AppProvider>
-    </StrictMode>,
-  );
+  try {
+    createRoot(container).render(
+      <StrictMode>
+        <ErrorBoundary scope="应用">
+          {/*
+            overlay 窗口不挂 AppProvider：它只需要 capture 状态，
+            走 AppProvider 会额外触发「最近工程/系统信息/打开示例工程」等主窗口初始化逻辑
+            （真实模式下甚至会弹出打开工程对话框）。
+          */}
+          {role === 'overlay' ? <OverlayWindow /> : (
+            <AppProvider>
+              <App />
+            </AppProvider>
+          )}
+        </ErrorBoundary>
+      </StrictMode>,
+    );
+  } catch (error) {
+    console.error('[renderer] 渲染启动失败', error);
+    renderBootFailure(container, `界面启动失败：${error instanceof Error ? error.message : String(error)}`);
+  }
 
-  // 供验证脚本判断渲染是否完成（不含业务逻辑）
-  requestAnimationFrame(() => {
+  // 供验证脚本判断渲染是否完成（不含业务逻辑）。
+  //
+  // 不能只依赖 requestAnimationFrame：窗口不可见/被遮挡（自动化环境、锁屏、
+  // 最小化启动）时 rAF 会被节流甚至暂停，标记永远不置位，验证脚本就把
+  // 「界面已渲染」误判成「20 秒内未完成首次渲染」。再加一个定时兜底。
+  const markReady = () => {
     document.documentElement.dataset.ready = '1';
-  });
+  };
+  requestAnimationFrame(markReady);
+  window.setTimeout(markReady, 300);
 }
