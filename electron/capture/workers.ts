@@ -340,6 +340,11 @@ export class GrabberWorker {
     await this.waitStdoutDrained(800);
     this.child = null;
     this.decoder.reset();
+    // 采集端自报告计数（frames/failures/poolMisses/pipeDrops）：
+    // poolMisses 高说明编码或反压拖慢了采集；pipeDrops 高说明父进程消费不及时。
+    // 这是判断「丢帧发生在采集端还是消费端」的唯一入口。
+    const done = this.parser.raw.split('\n').map((l) => l.trim()).filter((l) => /^DONE\b|^PIPE_DROP/.test(l));
+    if (done.length > 0) console.log('[grabber]', done.join(' | '));
   }
 }
 

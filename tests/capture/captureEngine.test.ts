@@ -40,7 +40,7 @@ interface EngineInternals {
   systemPackets: AudioPacket[];
   pendingSegments: SegmentView[];
   pointerEvents: { tick: number; kind: string; x: number; y: number; button?: number }[];
-  grabber: { frequency: bigint; stop: () => Promise<void>; captureBounds?: { x: number; y: number; width: number; height: number } } | null;
+  grabber: { frequency: bigint; stop: () => Promise<void>; captureBounds?: { x: number; y: number; width: number; height: number }; backend?: string; stderr?: string } | null;
   normalizedPointer(x: number, y: number): { x: number; y: number };
   audio: null;
   stopping: boolean;
@@ -62,6 +62,19 @@ interface EngineInternals {
     system: AudioPacket[],
     durationTicks: number,
   ): Promise<void>;
+  // 帧流看门狗与采集进程保护
+  runFrameWatchdogCheck(): void;
+  handleGrabberExit(reason: { code: number | null; signal: string | null; stderr: string }): void;
+  handleAudioExit(reason: { code: number | null; signal: string | null; stderr: string }): void;
+  failSession(code: string, message: string, detail?: string): void;
+  recordingEnteredAt: number;
+  lastFrameAt: number | null;
+  grabberIsCompat: boolean;
+  compatGrabberOptions: unknown;
+  grabberRestarts: number;
+  audioOptions: unknown;
+  audioRestarts: number;
+  grabberRestartTask: Promise<void> | null;
 }
 
 const tempDirs: string[] = [];
@@ -420,4 +433,269 @@ it('filters covered windows and maps clicks with the live target window geometry
   expect(internals.pointerEvents).toHaveLength(1);
   expect(internals.pointerEvents[0].x).toBeCloseTo(0.5);
   expect(internals.pointerEvents[0].y).toBeCloseTo(0.5);
+});
+
+describe('CaptureEngine: 帧流看门狗', () => {
+  it('启动后一直无画面 → 可恢复失败（旧实现会录出零帧工程）', () => {
+    const { engine, internals } = makeEngine();
+    internals.session = makeSession('C:\\test');
+    internals.state = 'Recording';
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.recordingEnteredAt = Date.now() - 7000;
+    internals.lastFrameAt = null;
+    internals.runFrameWatchdogCheck();
+    expect(internals.state).toBe('RecoverableFailure');
+    expect(engine.getState()).toBe('RecoverableFailure');
+  });
+
+  it('启动后 6 秒内有画面到达前不误报', () => {
+    const { internals } = makeEngine();
+    internals.session = makeSession('C:\\test');
+    internals.state = 'Recording';
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.recordingEnteredAt = Date.now() - 5000;
+    internals.lastFrameAt = null;
+    internals.runFrameWatchdogCheck();
+    expect(internals.state).toBe('Recording');
+  });
+
+  it('兼容采集录制中 5 秒无帧 → 来源故障', () => {
+    const { internals } = makeEngine();
+    internals.session = makeSession('C:\\test');
+    internals.state = 'Recording';
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.recordingEnteredAt = Date.now() - 60_000;
+    internals.lastFrameAt = Date.now() - 6000; // 超过兼容阈值 5s
+    internals.runFrameWatchdogCheck();
+    expect(internals.state).toBe('RecoverableFailure');
+  });
+
+  it('现代采集静止桌面短暂停帧不误报（rVFC 只在新帧时触发），13 秒才判故障', () => {
+    const { internals } = makeEngine();
+    internals.session = makeSession('C:\\test');
+    internals.state = 'Recording';
+    internals.grabber = { frequency: FREQ, stop: async () => {}, backend: 'Chromium/WGC' };
+    internals.recordingEnteredAt = Date.now() - 60_000;
+    internals.lastFrameAt = Date.now() - 6000; // 超过兼容阈值，但在现代阈值内
+    internals.runFrameWatchdogCheck();
+    expect(internals.state).toBe('Recording');
+    internals.lastFrameAt = Date.now() - 13_000;
+    internals.runFrameWatchdogCheck();
+    expect(internals.state).toBe('RecoverableFailure');
+  });
+
+  it('暂停期间不做停流判定（源可能在暂停中被重启/恢复）', () => {
+    const { internals } = makeEngine();
+    internals.session = makeSession('C:\\test');
+    internals.state = 'Paused';
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.recordingEnteredAt = Date.now() - 60_000;
+    internals.lastFrameAt = Date.now() - 600_000;
+    internals.runFrameWatchdogCheck();
+    expect(internals.state).toBe('Paused');
+  });
+
+  it('收到的帧会刷新停流基准', () => {
+    const { internals } = prepareRecording('C:\\test');
+    const before = internals.lastFrameAt;
+    feedFrames(internals, 0, FRAME);
+    expect(internals.lastFrameAt).not.toBe(before);
+  });
+});
+
+describe('CaptureEngine: 采集进程异常退出保护', () => {
+  interface FakeSourceOptions {
+    startError?: Error;
+  }
+  function makeFakeGrabberSource(engine: CaptureEngine, options: FakeSourceOptions = {}) {
+    const calls = { started: 0, stopped: 0 };
+    const holder: { frame: ((frame: VideoFramePacket) => void) | null } = { frame: null };
+    (engine as unknown as { spawnCompatGrabber: unknown }).spawnCompatGrabber = () => ({
+      frequency: FREQ,
+      captureBounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      start: async () => {
+        calls.started += 1;
+        if (options.startError) throw options.startError;
+      },
+      stop: async () => { calls.stopped += 1; },
+      onFrame: (listener: (frame: VideoFramePacket) => void) => { holder.frame = listener; return () => {}; },
+      onExit: () => () => {},
+    });
+    return {
+      calls,
+      emitFrame: (tick: number) => holder.frame?.(videoFrame(tick)),
+    };
+  }
+
+  it('录制中兼容采集退出 → 同参数重启一次并继续收帧', async () => {
+    const projectPath = await makeProjectDir();
+    const { engine, internals } = makeEngine();
+    internals.session = makeSession(projectPath);
+    internals.state = 'Recording';
+    internals.stopping = false;
+    internals.clock.setZero(0);
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.grabberIsCompat = true;
+    internals.compatGrabberOptions = { width: 1920, height: 1080, offsetX: 0, offsetY: 0, quality: 88, fps: 30 };
+    const fake = makeFakeGrabberSource(engine);
+
+    internals.handleGrabberExit({ code: 1, signal: null, stderr: 'boom' });
+    await internals.grabberRestartTask;
+
+    expect(fake.calls.started).toBe(1);
+    expect(internals.grabberRestarts).toBe(1);
+    expect(internals.state).toBe('Recording');
+    expect(internals.session?.degradation).toContain('自动重启');
+    fake.emitFrame(FRAME);
+    expect(internals.frames).toHaveLength(1);
+  });
+
+  it('重启失败 → 可恢复失败并携带重启错误', async () => {
+    const projectPath = await makeProjectDir();
+    const { engine, internals } = makeEngine();
+    internals.session = makeSession(projectPath);
+    internals.state = 'Recording';
+    internals.stopping = false;
+    internals.clock.setZero(0);
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.grabberIsCompat = true;
+    internals.compatGrabberOptions = { width: 1920, height: 1080, offsetX: 0, offsetY: 0, quality: 88, fps: 30 };
+    makeFakeGrabberSource(engine, { startError: new Error('GDI 不可用') });
+
+    internals.handleGrabberExit({ code: 1, signal: null, stderr: 'boom' });
+    await internals.grabberRestartTask;
+
+    expect(internals.state).toBe('RecoverableFailure');
+  });
+
+  it('重启机会用尽后直接失败，不再尝试重启', async () => {
+    const projectPath = await makeProjectDir();
+    const { engine, internals } = makeEngine();
+    internals.session = makeSession(projectPath);
+    internals.state = 'Recording';
+    internals.stopping = false;
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.grabberIsCompat = true;
+    internals.compatGrabberOptions = { width: 1920, height: 1080, offsetX: 0, offsetY: 0, quality: 88, fps: 30 };
+    internals.grabberRestarts = 1;
+    const fake = makeFakeGrabberSource(engine);
+
+    internals.handleGrabberExit({ code: 1, signal: null, stderr: 'boom again' });
+    await Promise.resolve();
+
+    expect(fake.calls.started).toBe(0);
+    expect(internals.state).toBe('RecoverableFailure');
+  });
+
+  it('现代采集退出不重启（无法原地重新授权）', async () => {
+    const projectPath = await makeProjectDir();
+    const { engine, internals } = makeEngine();
+    internals.session = makeSession(projectPath);
+    internals.state = 'Recording';
+    internals.stopping = false;
+    internals.grabber = { frequency: FREQ, stop: async () => {}, backend: 'Chromium/WGC' };
+    internals.grabberIsCompat = false;
+    const fake = makeFakeGrabberSource(engine);
+
+    internals.handleGrabberExit({ code: null, signal: null, stderr: '现代采集窗口已关闭' });
+    await Promise.resolve();
+
+    expect(fake.calls.started).toBe(0);
+    expect(internals.state).toBe('RecoverableFailure');
+  });
+
+  it('停止过程中退出既不重启也不重复失败', () => {
+    const { engine, internals } = makeEngine();
+    internals.session = makeSession('C:\\test');
+    internals.state = 'Recording';
+    internals.stopping = true;
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.grabberIsCompat = true;
+    const fake = makeFakeGrabberSource(engine);
+
+    internals.handleGrabberExit({ code: 1, signal: null, stderr: 'boom' });
+    expect(fake.calls.started).toBe(0);
+    expect(internals.state).toBe('Recording');
+  });
+
+  it('音频进程退出 → 自动重启一次并继续收包', async () => {
+    const projectPath = await makeProjectDir();
+    const { engine, internals } = makeEngine();
+    internals.session = makeSession(projectPath);
+    internals.state = 'Recording';
+    internals.stopping = false;
+    internals.clock.setZero(0);
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.audioOptions = { enableSystem: true, enableMic: true };
+    internals.audioRestarts = 0;
+
+    let started = 0;
+    const holder: { audio: ((packet: AudioPacket) => void) | null } = { audio: null };
+    (engine as unknown as { spawnAudioWorker: unknown }).spawnAudioWorker = () => ({
+      frequency: FREQ,
+      start: async () => { started += 1; },
+      stop: async () => {},
+      onAudio: (listener: (packet: AudioPacket) => void) => { holder.audio = listener; return () => {}; },
+      onError: () => () => {},
+      onExit: () => () => {},
+    });
+
+    internals.handleAudioExit({ code: 1, signal: null, stderr: '' });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(started).toBe(1);
+    expect(internals.audioRestarts).toBe(1);
+    expect(internals.session?.degradation).toContain('音频采集进程异常退出，已自动重启');
+    holder.audio?.(audioPacket(FRAME, 96));
+    expect(internals.micPackets).toHaveLength(1);
+  });
+
+  it('音频重启失败只降级，不终止录制', async () => {
+    const projectPath = await makeProjectDir();
+    const { engine, internals } = makeEngine();
+    internals.session = makeSession(projectPath);
+    internals.state = 'Recording';
+    internals.stopping = false;
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+    internals.audioOptions = { enableSystem: true, enableMic: true };
+    internals.audioRestarts = 0;
+    (engine as unknown as { spawnAudioWorker: unknown }).spawnAudioWorker = () => ({
+      frequency: FREQ,
+      start: async () => { throw new Error('设备被占用'); },
+      stop: async () => {},
+      onAudio: () => () => {},
+      onError: () => () => {},
+      onExit: () => () => {},
+    });
+
+    internals.handleAudioExit({ code: 1, signal: null, stderr: '' });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(internals.state).toBe('Recording');
+    expect(internals.session?.degradation).toContain('重启失败');
+  });
+});
+
+describe('CaptureEngine: 会话失败时排空已采集画面', () => {
+  it('failSession 把缓冲中的残余帧收尾成段并送编码（尾部损失从 ~3s 收敛到 0）', async () => {
+    const projectPath = await makeProjectDir();
+    const requests: number[] = [];
+    const { internals } = prepareRecording(projectPath, {
+      hooks: {
+        requestSegment: async (info) => {
+          requests.push(info.index);
+          return { mp4: null, frames: 0, encoder: 'test', durationUs: 0 };
+        },
+      },
+    });
+    feedFrames(internals, 0, secondsToTicks(0.5)); // 帧还在缓冲中，未到 1.6s 分段边界
+
+    internals.failSession('E_SOURCE_CLOSED', '屏幕画面停止更新', 'test');
+    expect(internals.state).toBe('RecoverableFailure');
+
+    // drain 是 fire-and-forget：等微任务队列把编码请求发出去
+    await new Promise((r) => setTimeout(r, 30));
+    expect(requests).toHaveLength(1);
+    expect(internals.pendingSegments).toHaveLength(0);
+  });
 });

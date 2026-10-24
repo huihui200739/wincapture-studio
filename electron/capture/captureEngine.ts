@@ -30,7 +30,7 @@ import type { PointerEventLike, PointerLog, RecoveryJournalEntry, SegmentRecord 
 import type { RecordingMarker } from '../../src/domain/project';
 import { secondsToTicks } from '../../src/domain/timebase';
 import { SessionClock } from '../../src/domain/sessionClock';
-import { AudioWorker, GrabberWorker, type AudioPacket, type VideoFramePacket, type WorkerPaths } from './workers';
+import { AudioWorker, GrabberWorker, type AudioOptions, type AudioPacket, type GrabberOptions, type VideoFramePacket, type WorkerPaths } from './workers';
 import { QpcClock } from './qpcClock';
 import { PointerWorker, type NativePointerEvent } from './pointerWorker';
 import { captureFailureMessage } from './captureDiagnostics';
@@ -65,6 +65,28 @@ const DISK_MIN_FREE_BYTES = 200 * 1024 * 1024;
  * （§16.2 总工作集 ≤1.2GB 优先于「一段不丢」）。
  */
 const MAX_PENDING_SEGMENTS = 2;
+
+/**
+ * 启动后多久没收到任何画面判定为「无画面」。
+ *
+ * 覆盖的场景：采集进程 READY 但 BitBlt 持续失败、WGC 画面从未到来等。
+ * 这些情况下进程都活着、状态机一直 Recording，旧实现会让用户录完一段
+ * 「零帧工程」才发现问题。兼容采集 READY 后正常 <1.5 秒出帧，6 秒足够宽裕。
+ */
+const FIRST_FRAME_TIMEOUT_MS = 6000;
+/**
+ * 录制中画面停流判定：兼容采集（GDI）按节拍持续出帧，画面彻底停了就是来源故障。
+ * 不能太短：主进程被长任务卡住时看门狗回调同样被推迟，恢复后才能执行检查，
+ * 实测最大卡顿在 2~3 秒量级，5 秒不会误报。
+ */
+const COMPAT_STALL_TIMEOUT_MS = 5000;
+/**
+ * 现代采集（Chromium/getDisplayMedia）在完全静止的桌面上可能合法地不产出新帧
+ * （requestVideoFrameCallback 只在新帧到达时触发），阈值必须放宽，避免把静止桌面当成故障。
+ */
+const MODERN_STALL_TIMEOUT_MS = 12_000;
+/** 每次会话内，grabber/audio 进程异常退出时的自动重启次数上限。 */
+const MAX_WORKER_RESTARTS = 1;
 
 export interface RecordSession {
   sessionId: string;
@@ -170,6 +192,19 @@ export class CaptureEngine {
   private qpcClock = new QpcClock();
   private grabber: VideoCaptureSource | null = null;
   private audio: AudioWorker | null = null;
+  /**
+   * 兼容采集进程的启动参数：进程异常退出时用同一参数重启（同区域/同窗口/同输出尺寸）。
+   * 现代采集（Chromium/WGC）涉及权限授予流程，无法原地重启，退出即走失败路径。
+   */
+  private compatGrabberOptions: GrabberOptions | null = null;
+  /** 当前 grabber 是否为兼容采集进程（决定退出时能否自动重启、停流阈值用哪一档）。 */
+  private grabberIsCompat = false;
+  private grabberRestarts = 0;
+  /** 音频进程的启动参数（异常退出时重启用）。 */
+  private audioOptions: AudioOptions | null = null;
+  private audioRestarts = 0;
+  /** 进行中的 grabber 重启任务（供测试等待、避免并发重启）。 */
+  private grabberRestartTask: Promise<void> | null = null;
 
   private frames: { mediaTick: number; jpeg: Buffer; qpc: bigint }[] = [];
   private micPackets: AudioPacket[] = [];
@@ -185,6 +220,12 @@ export class CaptureEngine {
   private segmentTimer: NodeJS.Timeout | null = null;
   private diskTimer: NodeJS.Timeout | null = null;
   private pointerTimer: NodeJS.Timeout | null = null;
+  /** 帧流看门狗：启动无画面 / 录制中画面停流时结束会话（见 FIRST_FRAME_TIMEOUT_MS）。 */
+  private frameWatchdogTimer: NodeJS.Timeout | null = null;
+  /** 进入 Recording 的墙钟时刻（首帧超时基准）。 */
+  private recordingEnteredAt = 0;
+  /** 最近一次从采集源收到帧的墙钟时刻；null 表示还没有收到过任何帧。 */
+  private lastFrameAt: number | null = null;
   /** 分段栅格：决定段起点/结束边界，并在暂停 flush 后重新对齐（见 segmentPlanner.ts） */
   private grid = new SegmentGrid(Number(SEGMENT_TARGET_TICKS));
   /** 已按固定节拍切好、等待编码的分段队列（保证段时长与编码耗时解耦） */
@@ -408,7 +449,7 @@ export class CaptureEngine {
     }
 
     // 启动屏幕采集
-    let grabber: VideoCaptureSource = new GrabberWorker(this.workerPaths.grabberExe, {
+    const compatOptions: GrabberOptions = {
       scaling: config.scaling,
       outputWidth: width, outputHeight: height,
       windowHandle: windowSource ? /^window:(\d+)$/.exec(config.sourceId)?.[1] : undefined,
@@ -418,7 +459,10 @@ export class CaptureEngine {
       offsetY: region.y,
       quality: 88,
       fps,
-    });
+    };
+    let grabber: VideoCaptureSource = this.spawnCompatGrabber(compatOptions);
+    this.compatGrabberOptions = compatOptions;
+    this.grabberIsCompat = true;
     this.grabber = grabber;
 
     try {
@@ -426,7 +470,7 @@ export class CaptureEngine {
       if (this.hooks.modernCapture && config.backend !== 'compatibility') {
         try {
           modern = await this.hooks.modernCapture(config, { ...region, outputWidth: width, outputHeight: height }, fps); await modern.start();
-          grabber = modern; this.grabber = grabber; degradationParts.push('现代采集：Chromium/WGC');
+          grabber = modern; this.grabber = grabber; this.grabberIsCompat = false; degradationParts.push('现代采集：Chromium/WGC');
         } catch (error) {
           await modern?.stop().catch(() => {});
           if (config.backend === 'wgc') throw error;
@@ -454,12 +498,7 @@ export class CaptureEngine {
     this.qpcClock.setFrequency(grabber.frequency);
 
     grabber.onFrame((frame) => this.handleVideoFrame(frame));
-    grabber.onExit((reason) => {
-      // 暂停/倒计时阶段的崩溃同样致命：恢复后不会再有画面，必须进入可恢复失败
-      if (!this.stopping && (this.state === 'Recording' || this.state === 'Paused' || this.state === 'Pausing' || this.state === 'Resuming' || this.state === 'Countdown')) {
-        this.failSession('E_SOURCE_CLOSED', '屏幕采集进程意外退出。', reason.stderr);
-      }
-    });
+    grabber.onExit((reason) => this.handleGrabberExit(reason));
 
     // 启动音频采集
     this.pointerWorker = new PointerWorker(path.join(path.dirname(this.workerPaths.grabberExe), 'pointer.exe'));
@@ -476,11 +515,13 @@ export class CaptureEngine {
       this.hooks.onAppEvent('pointer-degraded', { reason: String(error) });
     }
     if (config.microphoneEnabled || config.systemAudioEnabled) {
-      const audio = new AudioWorker(this.workerPaths.audioExe, {
+      const audioOptions: AudioOptions = {
         enableSystem: config.systemAudioEnabled,
         enableMic: config.microphoneEnabled,
         micDeviceId: config.microphoneDeviceId,
-      });
+      };
+      this.audioOptions = audioOptions;
+      const audio = this.spawnAudioWorker(audioOptions);
       this.audio = audio;
       audio.onAudio((packet) => this.handleAudioPacket(packet));
       audio.onError((error) => {
@@ -491,14 +532,7 @@ export class CaptureEngine {
         this.emitStatus(true);
         void this.appendJournal('heartbeat', { audioError: error });
       });
-      audio.onExit((reason) => {
-        if (!this.stopping && this.state === 'Recording') {
-          degradationParts.push('音频采集进程退出');
-          session.degradation = degradationParts.join('；');
-          this.emitStatus(true);
-          void reason;
-        }
-      });
+      audio.onExit((reason) => this.handleAudioExit(reason));
       try {
         await audio.start();
       } catch (error) {
@@ -523,6 +557,9 @@ export class CaptureEngine {
 
     this.transition('Recording');
     session.startedAt = Date.now();
+    this.recordingEnteredAt = Date.now();
+    this.lastFrameAt = null;
+    this.startFrameWatchdog();
     this.scheduleSegment();
     this.startDiskMonitor();
     this.startPointerSampling();
@@ -623,6 +660,10 @@ export class CaptureEngine {
     const accepting =
       this.state === 'Recording' || (this.state === 'Stopping' && this.stopping);
     if (!accepting) return;
+
+    // 看门狗基准：只要源还在产出帧就刷新（含停止排空阶段，虽然那时看门狗已停）。
+    // 放在暂停/停止过滤之前：暂停期间帧被丢弃是预期的，但「源还活着」这个事实必须记录。
+    this.lastFrameAt = Date.now();
 
     const freq = this.grabber?.frequency ?? 10_000_000n;
     // 记录锚点，让主进程的 perfNow 能换算到采集进程的 QPC 时间轴
@@ -775,6 +816,173 @@ export class CaptureEngine {
     }
     // 电平事件节流由 emitStatus 内部处理
     this.emitStatus();
+  }
+
+  // -------------------------------------------------------------------------
+  // 帧流看门狗与采集进程保护
+  // -------------------------------------------------------------------------
+
+  private startFrameWatchdog(): void {
+    if (this.frameWatchdogTimer) clearInterval(this.frameWatchdogTimer);
+    this.frameWatchdogTimer = setInterval(() => this.runFrameWatchdogCheck(), 1000);
+  }
+
+  /**
+   * 每秒检查一次画面流：启动后从未出帧、或录制中画面停流，都按来源故障结束会话。
+   *
+   * 为什么必须做：采集进程「活着但不出帧」（BitBlt 持续失败、WGC 画面从未到来）
+   * 不触发任何 exit 事件，旧实现会让用户录完整段时间后得到一个零帧工程。
+   * 看门狗与帧处理共用主进程事件循环，主进程卡顿会同时推迟两者，因此不会因
+   * 自身卡顿误报（实测最大卡顿 2~3 秒 < COMPAT_STALL_TIMEOUT_MS）。
+   */
+  private runFrameWatchdogCheck(): void {
+    if (this.state !== 'Recording' || !this.session) return;
+    const now = Date.now();
+    if (this.lastFrameAt === null) {
+      if (now - this.recordingEnteredAt >= FIRST_FRAME_TIMEOUT_MS) {
+        this.failSession(
+          'E_SOURCE_CLOSED',
+          '启动后一直未收到屏幕画面，录制已停止。',
+          `backend=${this.currentBackend()}; stderr=${this.grabberStderrTail()}`,
+        );
+      }
+      return;
+    }
+    const limit = this.currentBackendIsModern() ? MODERN_STALL_TIMEOUT_MS : COMPAT_STALL_TIMEOUT_MS;
+    if (now - this.lastFrameAt >= limit) {
+      this.failSession(
+        'E_SOURCE_CLOSED',
+        '屏幕画面停止更新，来源可能已失效，录制已停止。',
+        `backend=${this.currentBackend()}; 静默 ${Math.round((now - this.lastFrameAt) / 1000)}s`,
+      );
+    }
+  }
+
+  private currentBackend(): string {
+    if (this.currentBackendIsModern()) return String((this.grabber as { backend?: string }).backend);
+    return this.grabberIsCompat ? 'compatibility/GDI' : 'unknown';
+  }
+
+  private currentBackendIsModern(): boolean {
+    const backend = (this.grabber as { backend?: string } | null)?.backend;
+    return typeof backend === 'string' && backend.length > 0;
+  }
+
+  private grabberStderrTail(): string {
+    const stderr = (this.grabber as { stderr?: string } | null)?.stderr;
+    return typeof stderr === 'string' ? stderr.slice(-400) : '(无)';
+  }
+
+  /**
+   * 兼容采集进程的异常退出保护：会话内自动重启一次，重启失败才结束会话。
+   *
+   * grabber 是独立进程，GDI 失败、内存压力等都可能让它闪退；旧实现直接
+   * RecoverableFailure，录到一半的素材只能走恢复流程。原地重启后媒体时间
+   * 仍由 QPC 连续换算（SessionClock 不受影响），重启间隙的画面由导出端的
+   * 帧槽补齐，损失收敛到一个段窗口内。现代采集涉及 Chromium 权限授予，
+   * 无法原地重启，保持原有的失败路径。
+   */
+  private handleGrabberExit(reason: { code: number | null; signal: string | null; stderr: string }): void {
+    if (this.stopping) return;
+    // 暂停/倒计时阶段的崩溃同样致命：恢复后不会再有画面，必须进入可恢复失败
+    if (!['Recording', 'Paused', 'Pausing', 'Resuming', 'Countdown'].includes(this.state)) return;
+    const restartable =
+      this.grabberIsCompat &&
+      this.compatGrabberOptions !== null &&
+      this.grabberRestarts < MAX_WORKER_RESTARTS &&
+      (this.state === 'Recording' || this.state === 'Paused');
+    if (!restartable) {
+      this.failSession('E_SOURCE_CLOSED', '屏幕采集进程意外退出。', reason.stderr);
+      return;
+    }
+    this.grabberRestartTask = this.restartGrabber(reason);
+  }
+
+  private async restartGrabber(reason: { code: number | null; signal: string | null; stderr: string }): Promise<void> {
+    const options = this.compatGrabberOptions;
+    if (!options) return;
+    this.grabberRestarts += 1;
+    const replacement = this.spawnCompatGrabber(options);
+    try {
+      await replacement.start();
+    } catch (error) {
+      await replacement.stop().catch(() => {});
+      if (!this.stopping && ['Recording', 'Paused'].includes(this.state)) {
+        this.failSession('E_SOURCE_CLOSED', '屏幕采集进程意外退出，自动重启失败。', `${reason.stderr}\nrestart: ${String(error)}`);
+      }
+      return;
+    }
+    // 重启期间用户可能已停止/取消：不能留下一个持续抓屏的孤儿进程
+    if (this.stopping || !['Recording', 'Paused'].includes(this.state)) {
+      await replacement.stop().catch(() => {});
+      return;
+    }
+    replacement.onFrame((frame) => this.handleVideoFrame(frame));
+    replacement.onExit((exitReason) => this.handleGrabberExit(exitReason));
+    this.grabber = replacement;
+    this.qpcClock.setFrequency(replacement.frequency);
+    this.lastFrameAt = Date.now();
+    const session = this.session;
+    if (session) {
+      const note = '屏幕采集进程异常退出，已自动重启继续录制';
+      if (!session.degradation?.includes(note)) session.degradation = [session.degradation, note].filter(Boolean).join('；');
+    }
+    this.emitStatus(true);
+    void this.appendJournal('heartbeat', { grabberRestart: this.grabberRestarts, exitCode: reason.code });
+    this.hooks.onAppEvent('grabber-restarted', { attempt: this.grabberRestarts });
+  }
+
+  /** 音频进程异常退出：同样给一次重启机会；彻底失败只降级，不终止录制（§9.5）。 */
+  private handleAudioExit(reason: { code: number | null; signal: string | null; stderr: string }): void {
+    if (this.stopping) return;
+    const session = this.session;
+    if (!session || !['Recording', 'Paused'].includes(this.state)) return;
+    if (this.audioOptions && this.audioRestarts < MAX_WORKER_RESTARTS) {
+      this.audioRestarts += 1;
+      void this.restartAudio(reason);
+      return;
+    }
+    // 旧实现只在 Recording 提示：暂停期间退出会被静默吞掉，恢复后无声却无任何说明
+    session.degradation = [session.degradation, '音频采集进程退出'].filter(Boolean).join('；');
+    this.emitStatus(true);
+  }
+
+  private async restartAudio(reason: { code: number | null; signal: string | null; stderr: string }): Promise<void> {
+    const options = this.audioOptions;
+    const session = this.session;
+    if (!options || !session) return;
+    const replacement = this.spawnAudioWorker(options);
+    try {
+      replacement.onAudio((packet) => this.handleAudioPacket(packet));
+      replacement.onExit((exitReason) => this.handleAudioExit(exitReason));
+      await replacement.start();
+    } catch (error) {
+      await replacement.stop().catch(() => {});
+      if (!this.stopping && ['Recording', 'Paused'].includes(this.state)) {
+        session.degradation = [session.degradation, `音频采集进程退出且重启失败：${String(error).slice(0, 120)}`].filter(Boolean).join('；');
+        this.emitStatus(true);
+      }
+      return;
+    }
+    if (this.stopping || !['Recording', 'Paused'].includes(this.state)) {
+      await replacement.stop().catch(() => {});
+      return;
+    }
+    this.audio = replacement;
+    const note = '音频采集进程异常退出，已自动重启';
+    if (!session.degradation?.includes(note)) session.degradation = [session.degradation, note].filter(Boolean).join('；');
+    this.emitStatus(true);
+    void this.appendJournal('heartbeat', { audioRestart: this.audioRestarts, exitCode: reason.code });
+  }
+
+  /** @internal 测试注入点：替换兼容采集进程的构造。 */
+  protected spawnCompatGrabber(options: GrabberOptions): GrabberWorker {
+    return new GrabberWorker(this.workerPaths.grabberExe, options);
+  }
+
+  /** @internal 测试注入点：替换音频采集进程的构造。 */
+  protected spawnAudioWorker(options: AudioOptions): AudioWorker {
+    return new AudioWorker(this.workerPaths.audioExe, options);
   }
 
   // -------------------------------------------------------------------------
@@ -1145,6 +1353,9 @@ export class CaptureEngine {
     this.clock.resume(this.nowQpc());
     await this.syncCameraClock('recording', this.nowQpc());
     await this.appendJournal('resume', { at: this.nowQpc() });
+    // 暂停期间 lastFrameAt 早已过期，直接恢复看门狗会立刻误判停流；
+    // 给一个「恢复时刻」起的宽限窗口，源若真死了会在阈值内再次触发。
+    this.lastFrameAt = Date.now();
     this.transition('Recording');
     this.scheduleSegment();
     this.emitStatus(true);
@@ -1179,6 +1390,9 @@ export class CaptureEngine {
     // 旧实现只在 Recording/Paused 时 transition('Stopping')，若停在 Pausing/Resuming
     // 就会在收尾阶段抛「不允许的状态转移」，此时 worker 已停、定时器已清，引擎直接卡死。
     await this.waitForTransientState();
+    // 可能有进行中的采集进程重启：先等它落定——重启成功时 this.grabber 已换成
+    // 新进程，下面的 stop() 才能把它一起收掉，否则 stop 返回后会冒出孤儿进程。
+    await this.grabberRestartTask?.catch(() => {});
 
     const state = this.state;
     if (state === 'Idle') {
@@ -1290,6 +1504,8 @@ export class CaptureEngine {
     if (!finished.includes(this.state)) return;
     this.stopping = true;
     this.stopTimers();
+    // 等待进行中的采集进程重启落定，避免新进程在复位后才出现
+    await this.grabberRestartTask?.catch(() => {});
     // 失败可能发生在编码过程中：等当前 drain 收尾，避免新旧会话共用 pendingSegments/drain 标志
     if (this.draining) await this.drainSignal.catch(() => {});
     await this.grabber?.stop().catch(() => {});
@@ -1324,6 +1540,10 @@ export class CaptureEngine {
       clearInterval(this.pointerTimer);
       this.pointerTimer = null;
     }
+    if (this.frameWatchdogTimer) {
+      clearInterval(this.frameWatchdogTimer);
+      this.frameWatchdogTimer = null;
+    }
   }
 
   async cancel(): Promise<void> {
@@ -1341,6 +1561,7 @@ export class CaptureEngine {
     }
     this.stopping = true;
     this.stopTimers();
+    await this.grabberRestartTask?.catch(() => {});
     await this.grabber?.stop().catch(() => {});
     await this.audio?.stop().catch(() => {});
     this.grabber = null;
@@ -1374,6 +1595,15 @@ export class CaptureEngine {
         this.state = 'RecoverableFailure';
       }
     }
+    // 源已经死了，但引擎里可能还压着已切段、未编码的画面（最多 2 个待编码段）：
+    // 旧实现直接丢弃，尾部损失扩大到约 3 秒。这里把残余帧收尾成短段并排空
+    // 编码队列，已收到的画面尽量落盘（渲染编码窗口此时仍然可用）。
+    try {
+      this.flushRemainingFrames();
+    } catch {
+      // 收尾失败不能掩盖原始故障
+    }
+    void this.drainSegmentQueue().catch(() => {});
     this.hooks.onAppEvent('capture-error', {
       error: { code, message, retryable: true, preservedData: true, detail },
     });
@@ -1585,6 +1815,15 @@ export class CaptureEngine {
     this.cameraChain = Promise.resolve();
     this.cameraJobsPending = 0;
     this.lastStatusAt = 0;
+    this.frameWatchdogTimer = null;
+    this.recordingEnteredAt = 0;
+    this.lastFrameAt = null;
+    this.compatGrabberOptions = null;
+    this.grabberIsCompat = false;
+    this.grabberRestarts = 0;
+    this.audioOptions = null;
+    this.audioRestarts = 0;
+    this.grabberRestartTask = null;
   }
 
   // -------------------------------------------------------------------------
