@@ -7,7 +7,7 @@
  * - 工程版本冲突时先刷新状态再重试，不能覆盖后到的更新。
  */
 
-import type { Project, Effect, TutorialStep, CanvasVariant, TrackKind, Clip } from './project';
+import type { Project, Effect, TutorialStep, CanvasVariant, TrackKind, Clip, ZoomParameters } from './project';
 import { cloneProject, findTrack, timelineDuration } from './project';
 import type { Ticks, TickRange } from './timebase';
 import { rangeLength } from './timebase';
@@ -15,6 +15,7 @@ import { TimeMap } from './timeMap';
 import { AppError } from '../shared/errors';
 import { planGroupMove, linkedClips } from './clipEditing';
 import { retimeClip } from './retime';
+import { regenerateAutoZoom } from './zoom';
 
 export type CommandKind =
   | 'SplitClip'
@@ -23,6 +24,7 @@ export type CommandKind =
   | 'MoveClip'
   | 'SetClipRate'
   | 'SetEffect'
+  | 'RegenerateAutoZoom'
   | 'DeleteEffect'
   | 'SetVariantOverride'
   | 'SetCanvasStyle'
@@ -90,6 +92,11 @@ export interface DeleteEffectCommand extends CommandBase {
   effectId: string;
 }
 
+export interface RegenerateAutoZoomCommand extends CommandBase {
+  kind: 'RegenerateAutoZoom';
+  planned: Effect[];
+}
+
 export interface SetVariantOverrideCommand extends CommandBase {
   kind: 'SetVariantOverride';
   variantId: string;
@@ -146,6 +153,7 @@ export type ProjectCommand =
   | MoveClipCommand
   | SetClipRateCommand
   | SetEffectCommand
+  | RegenerateAutoZoomCommand
   | DeleteEffectCommand
   | SetVariantOverrideCommand
   | SetCanvasStyleCommand
@@ -384,7 +392,13 @@ function deleteRange(project: Project, range: TickRange, ripple: boolean): Comma
     } else {
       // zoom / cursor：只保留最长主段，避免叠加
       const main = pickLongest(shifted);
-      nextEffects.push({ ...effect, range: main });
+      const piece = { ...effect, range: main };
+      if (effect.kind === 'zoom') {
+        const params = effect.parameters as ZoomParameters;
+        piece.parameters = { ...params, focusPath: params.focusPath?.filter(p => p.tick < range.start || p.tick >= range.end)
+          .map(p => ({ ...p, tick: ripple && p.tick >= range.end ? p.tick - length : p.tick })) };
+      }
+      nextEffects.push(piece);
       diff.added.push(main);
     }
   }
@@ -423,7 +437,12 @@ function shiftRange(r: TickRange, delta: Ticks): TickRange {
 }
 
 function shiftEffect(effect: Effect, delta: Ticks): Effect {
-  return { ...effect, range: shiftRange(effect.range, delta) };
+  const next = { ...effect, range: shiftRange(effect.range, delta) };
+  if (effect.kind === 'zoom') {
+    const params = effect.parameters as ZoomParameters;
+    next.parameters = { ...params, focusPath: params.focusPath?.map(p => ({ ...p, tick: Math.max(0, p.tick + delta) })) };
+  }
+  return next;
 }
 
 function pickLongest(ranges: readonly TickRange[]): TickRange {
@@ -650,6 +669,17 @@ export function applyCommand(project: Project, command: ProjectCommand): ApplyRe
       } catch (error) {
         throw invalidCommand(error instanceof Error ? error.message : '无法调整片段速度');
       }
+      break;
+    }
+    case 'RegenerateAutoZoom': {
+      for (const effect of command.planned) {
+        if (effect.kind !== 'zoom' || effect.origin !== 'automatic' || effect.locked) throw invalidCommand('自动运镜数据无效');
+        assertRange('自动运镜区间', effect.range, true);
+      }
+      const removed = next.effects.filter(e => e.kind === 'zoom' && e.origin === 'automatic' && !e.locked);
+      next.effects = regenerateAutoZoom(next.effects, command.planned);
+      diff = { kind: command.kind, tracks: [], removed: removed.map(e => e.range),
+        added: command.planned.map(e => e.range), entities: next.effects.filter(e => e.kind === 'zoom').map(e => e.id) };
       break;
     }
     case 'SetEffect': {
@@ -997,6 +1027,8 @@ export function describeCommand(command: ProjectCommand): string {
       return '调整播放速度';
     case 'SetEffect':
       return command.effect?.kind === 'zoom' ? '调整运镜' : command.effect?.kind === 'privacy' ? '调整遮挡' : '调整效果';
+    case 'RegenerateAutoZoom':
+      return '根据鼠标生成运镜';
     case 'DeleteEffect':
       return '删除效果';
     case 'SetVariantOverride':

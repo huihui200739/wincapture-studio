@@ -14,6 +14,8 @@ it('reads split native click packets, ignores malformed lines, and cleans up on 
   child.stdout.write('{"ready":true,"frequency":"100'); child.stdout.write('00000"}\ninvalid\n{"qpc":"12000000","kind":"down","x":-10,"y":200,"button":2}\n');
   await start; expect(worker.frequency).toBe(10_000_000n);
   expect(events).toEqual([{ qpc: 12_000_000n, kind: 'down', x: -10, y: 200, button: 2 }]);
+  child.stdout.write('{"qpc":"12100000","kind":"move","x":40,"y":220,"button":0}\n');
+  expect(events.at(-1)).toEqual({ qpc: 12_100_000n, kind: 'move', x: 40, y: 220, button: 0 });
   await worker.stop(); expect(unexpectedExits).toBe(0);
 });
 

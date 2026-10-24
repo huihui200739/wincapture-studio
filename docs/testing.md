@@ -18,6 +18,8 @@
 
 先运行 npm run check 和 npm run build。本批 928 项单测、55 条 IPC 契约；测试数量不代表所有硬件均已验收。
 
+鼠标运镜接入批次新增 tests/domain/autoZoom.test.ts，目前共 934 项单测：覆盖真实日志到工程效果、裁剪/倍速映射、静止点压缩、镜头跟随、重生成撤销及焦点路径移动。正式鼠标进程使用内容哈希缓存的本地可执行文件；verify:pointer-desktop 共用 pointer-runtime.cjs，要求真实移动和 down/up 与目标 DOM 点击同时成立。
+
 `tests/media/timeStretch.test.ts` 覆盖变速的时长与音高（基频、过零率）、跨块连续性与缓冲上界；`tests/media/exporter.test.ts` 末尾的「变速导出走保持音调的时间拉伸」用正弦素材做端到端验证。`tests/media/compositor.test.ts` 覆盖模糊/马赛克的取样-降采样-放大链路与取样失败回退。
 
 | 命令 | 检查 |
@@ -35,7 +37,7 @@
 
 结果统一在 dist/verify/，截图在其 screenshots/ 子目录。探针数据在 .tmp/ 或 .verify-*，与 .appdata/projects 用户工程分开。
 
-旧探针工程、媒体样本、浏览器缓存和安装包可以按用途清理；安装包与解压包可重新构建，`node_modules` 和当前本地 Electron 运行时仍是运行依赖。2026-10-24 清理时删除了旧测试产物，保留的简要 JSON 验证记录归档到 dist/reports/2026-10-24/；真实录制工程保留。`.tmp/`、`.verify-*/`、`dist/`、`release/` 均不提交 Git。
+旧探针工程、媒体样本、浏览器缓存和安装包可以按用途清理；安装包与解压包可重新构建，`node_modules` 和当前本地 Electron 运行时仍是运行依赖。2026-10-24 再次清理了临时测试数据、测试导出和截图、旧验证归档、31 个性能测试视频、两份明确命名的探针工程以及临时 pointer-probe 运行目录，移入本机回收站。普通录制工程、源码、依赖与当前构建均保留。此前 dist/verify/ 和 dist/reports/ 的报告已清理，按上述命令可重新生成；本批验收结论见 docs/status.md。`.tmp/`、`.verify-*/`、`dist/`、`release/` 均不提交 Git。
 
 本机系统 TEMP 可能拒绝 esbuild 写入，包装脚本改用工作区临时目录。验收 Electron 清除 ELECTRON_RUN_AS_NODE 并传 --no-sandbox。打包缓存 .tmp/eb-cache 属于构建依赖；安装包尚无签名或更新服务。
 

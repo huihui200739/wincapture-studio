@@ -243,7 +243,7 @@ export function evaluateScene(project: Project, tick: Ticks, options: SceneOptio
         (pointer?.idleTicks ?? 0) < cursorParams.hideAfterTicks),
     x: pointer?.x ?? 0.5,
     y: pointer?.y ?? 0.5,
-    size: cursorParams?.size ?? 26,
+    size: cursorParams?.size ?? 22,
     clickProgress: pointer?.clickProgress ?? 0,
     clickX: pointer?.clickX ?? pointer?.x ?? 0.5,
     clickY: pointer?.clickY ?? pointer?.y ?? 0.5,

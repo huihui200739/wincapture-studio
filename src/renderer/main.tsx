@@ -75,6 +75,7 @@ function renderBootFailure(container: HTMLElement | null, message: string): void
 }
 
 const role = resolveRole();
+document.documentElement.dataset.role = role;
 
 /**
  * 隐藏窗口的角色：运行时已由静态 import 安装完毕（window.__wcsRecorder /

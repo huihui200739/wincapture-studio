@@ -656,6 +656,11 @@ export function validateProject(project: Project, options: ValidationOptions = {
     }
     if (effect.kind === 'zoom') {
       const motion = effect.parameters as import('./project').ZoomParameters;
+      if (motion.focusPath !== undefined && (!Array.isArray(motion.focusPath) || motion.focusPath.some((point, index, points) =>
+        !point || !Number.isFinite(point.tick) || point.tick < 0 || !Number.isFinite(point.x) || !Number.isFinite(point.y) ||
+        point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1 || (index > 0 && point.tick < points[index - 1].tick)))) {
+        push({ code: 'effect-parameters-invalid', severity: 'error', message: '运镜焦点路径无效。', entity: 'effect', entityId: effect.id, field: 'parameters.focusPath' });
+      }
       for (const [field, min, max] of [['rotateX', -45, 45], ['rotateY', -45, 45], ['rotateZ', -45, 45], ['perspective', 1, 5]] as const) {
         const value = motion[field];
         if (value !== undefined && (!Number.isFinite(value) || value < min || value > max)) {

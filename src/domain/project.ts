@@ -83,6 +83,8 @@ export interface ZoomParameters {
   easeOutTicks: Ticks;
   /** 可选：语义焦点来源（§12.3），用于界面展示依据 */
   focusSource?: 'pointer' | 'control' | 'manual';
+  /** 自动运镜的平滑鼠标焦点路径，使用时间线 tick。 */
+  focusPath?: { tick: Ticks; x: number; y: number }[];
 }
 
 export type PrivacyAnchor = 'screen' | 'window' | 'keyframe';

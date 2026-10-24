@@ -11,6 +11,10 @@ export function pasteEffect(source: Effect, project: Project, tick: number, id: 
     ...structuredClone(source), id, range: { start, end: Math.min(duration, start + Math.max(1, source.range.end - source.range.start)) },
   };
   result.parameters = structuredClone(source.parameters);
+  if (result.kind === 'zoom') {
+    const p = result.parameters as import('./project').ZoomParameters;
+    p.focusPath = p.focusPath?.map(point => ({ ...point, tick: Math.max(0, point.tick + result.range.start - source.range.start) }));
+  }
   if (result.kind === 'privacy') {
     result.parameters = { ...(result.parameters as PrivacyParameters), confirmed: false };
     result.anchor = (result.parameters as PrivacyParameters).anchor;

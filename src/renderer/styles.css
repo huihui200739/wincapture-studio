@@ -74,6 +74,10 @@ body {
   overflow: hidden;
 }
 
+html[data-role="overlay"], html[data-role="overlay"] body, html[data-role="overlay"] #root {
+  background: transparent;
+}
+
 h1, h2, h3, h4, p {
   margin: 0;
 }

@@ -342,11 +342,12 @@ export interface RecoverableSession {
 }
 
 export interface OverlayUpdate {
-  state: CaptureState;
-  mediaTick: number;
-  markerCount: number;
-  levels: { mic: number; system: number };
-  paused: boolean;
+  state?: CaptureState;
+  mediaTick?: number;
+  markerCount?: number;
+  levels?: { mic: number; system: number };
+  paused?: boolean;
+  memoOpen?: boolean;
 }
 
 /** 请求/响应封装，统一错误结构（§14.3）。 */

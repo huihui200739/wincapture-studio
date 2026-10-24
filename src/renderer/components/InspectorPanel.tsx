@@ -29,6 +29,9 @@ import { Badge, Button, Field, Icon, IconButton, InlineNote, Segmented, Slider, 
 import { cn, clamp } from '../lib/format';
 import { planClipMove, splittableTick, clipEndTick } from './Timeline';
 import { CANVAS_PRESETS } from '@domain/presets';
+import { planProjectAutoZoom } from '@domain/zoom';
+import { wcs } from '../lib/wcs';
+import { unwrap } from '../lib/format';
 
 type Tab = 'clip' | 'zoom' | 'privacy' | 'cursor' | 'canvas';
 
@@ -613,11 +616,33 @@ function ZoomTab({
   pushToast: ReturnType<typeof useApp>['pushToast'];
 }) {
   const zooms = project.effects.filter((e) => e.kind === 'zoom');
+  const { projectPath, pushError } = useApp();
+  const [generating, setGenerating] = useState(false);
+  const generate = async () => {
+    if (!projectPath || generating) return;
+    setGenerating(true);
+    try {
+      const log = unwrap(await wcs().readPointerLog(projectPath));
+      if (!log) {
+        pushToast({ tone: 'warn', title: '该工程没有鼠标记录', message: '可以手动新建运镜；新录制会自动保存鼠标记录。' });
+        return;
+      }
+      const planned = planProjectAutoZoom(project, log);
+      if (!planned.length) {
+        pushToast({ tone: 'info', title: '没有可生成运镜的鼠标操作', message: '需要点击或停留片段，也可以手动新建运镜。' });
+        return;
+      }
+      execute({ kind: 'RegenerateAutoZoom', planned }, '根据鼠标生成运镜');
+      pushToast({ tone: 'ok', title: `已生成 ${planned.length} 个鼠标运镜`, message: '手动和锁定的运镜会保留，可撤销本次生成。' });
+    } catch (error) { pushError(error, '自动运镜生成失败'); }
+    finally { setGenerating(false); }
+  };
   const current = zooms.find((e) => e.id === selectedEffectId) ?? zooms.find((e) => tick >= e.range.start && tick < e.range.end) ?? null;
 
   const update = (patch: Partial<ZoomParameters>, lock?: boolean) => {
     if (!current) return;
     const params = { ...(current.parameters as ZoomParameters), ...patch };
+    if ('focusX' in patch || 'focusY' in patch || patch.focusSource === 'manual') delete params.focusPath;
     const next: Effect = { ...current, parameters: params, locked: lock ?? current.locked, origin: 'manual' };
     execute<SetEffectCommand>({ kind: 'SetEffect', effect: next, lock: next.locked }, '调整运镜');
   };
@@ -659,6 +684,9 @@ function ZoomTab({
           </h3>
           <IconButton icon="plus" label="在播放头新建运镜" size="sm" onClick={addZoom} />
         </div>
+        <Button size="sm" icon="zoomIn" disabled={!projectPath || generating} onClick={() => void generate()}>
+          {generating ? '正在生成…' : '根据鼠标生成运镜'}
+        </Button>
         {zooms.length === 0 ? (
           <div className="wcs-empty" style={{ padding: '14px 8px' }}>
             <p>还没有运镜。可以新建一个，或让自动运镜在录制后生成。</p>
@@ -1184,7 +1212,7 @@ function CursorTab({
       // 覆盖整条主轨时长，光标效果贯穿整个工程
       range: { start: 0, end: Math.max(1, timelineDuration(project)) },
       parameters: {
-        size: 26,
+        size: 22,
         clickRipple: 1,
         visible: true,
         burnedIn: false,

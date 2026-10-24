@@ -6,6 +6,7 @@ import type { VideoCaptureSource } from './captureEngine';
 export class DesktopVideoSource implements VideoCaptureSource {
   readonly backend = 'Chromium/WGC';
   frequency = 10_000_000n;
+  cursorEmbedded = true;
   private win: BrowserWindow | null = null;
   private frames = new Set<(frame: VideoFramePacket) => void>();
   private exits = new Set<(reason: { code: number | null; signal: string | null; stderr: string }) => void>();
@@ -37,11 +38,12 @@ export class DesktopVideoSource implements VideoCaptureSource {
   }
   accept(packet: unknown): void {
     if (this.stopping || this.failed || !packet || typeof packet !== 'object') return;
-    const data = packet as { jpeg?: Uint8Array; wallTimeMs?: number; ended?: boolean; error?: string };
+    const data = packet as { jpeg?: Uint8Array; wallTimeMs?: number; ended?: boolean; error?: string; cursorEmbedded?: boolean };
     if (data.ended || data.error) { this.fail(data.error ?? '来源窗口已关闭或屏幕采集已结束'); return; }
     if (!(data.jpeg instanceof Uint8Array) || data.jpeg.byteLength < 4 || data.jpeg.byteLength > 16 * 1024 * 1024 ||
       data.jpeg[0] !== 0xff || data.jpeg[1] !== 0xd8 || !Number.isFinite(data.wallTimeMs)) return;
     const qpc = BigInt(Math.round(this.qpc + (data.wallTimeMs! - this.epochMs) * Number(this.frequency) / 1000));
+    this.cursorEmbedded = data.cursorEmbedded !== false;
     this.resolveFrame?.(); this.resolveFrame = null;
     for (const listener of this.frames) listener({ qpc, jpeg: Buffer.from(data.jpeg), receivedAt: Date.now() });
   }

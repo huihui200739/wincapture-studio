@@ -537,7 +537,7 @@ export function EditorView() {
         <div className="stage-canvas-wrap" ref={wrapRef}>
           <div
             className="stage-canvas-inner"
-            style={{ width: stageFit.width, height: stageFit.height, cursor: drag.kind === 'creating' ? 'crosshair' : 'default' }}
+            style={{ width: stageFit.width, height: stageFit.height, cursor: drag.kind === 'creating' ? 'crosshair' : playing ? 'none' : 'default' }}
             onPointerDown={onStagePointerDown}
             onPointerMove={onStagePointerMove}
             onPointerUp={onStagePointerUp}

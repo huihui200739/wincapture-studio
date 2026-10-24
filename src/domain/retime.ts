@@ -49,6 +49,10 @@ export function retimeClip(project: Project, target: Clip, rate: Clip['rate']): 
     // Privacy coverage follows both media boundaries. Animation durations stay on the output clock.
     const b = effect.kind === 'privacy' ? map(old.end) : a + old.end - old.start;
     effect.range = { start: a, end: Math.min(duration, Math.max(a + 1, b)) };
+    if (effect.kind === 'zoom') {
+      const p = effect.parameters as import('./project').ZoomParameters;
+      p.focusPath = p.focusPath?.map(point => ({ ...point, tick: map(point.tick) }));
+    }
   }
   if (project.effects.some((e) => e.kind === 'privacy')) project.privacyVersion += 1;
   return changed;

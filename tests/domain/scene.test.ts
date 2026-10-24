@@ -515,7 +515,7 @@ describe('回归：光标效果受时间区间约束', () => {
 
     const outside = evaluateScene(project, 5 * S, { outputWidth: 1920, outputHeight: 1080, pointer });
     expect(outside.cursor.visible).toBe(true); // 区间外不应继续被 burnedIn 抑制
-    expect(outside.cursor.size).toBe(26); // 默认尺寸
+    expect(outside.cursor.size).toBe(22); // 默认尺寸
   });
 });
 

@@ -38,7 +38,8 @@ import { IPC, type CaptureConfig, type CaptureStatus, type ExportProfile, type E
 import { QUALITY_PROFILES } from '../src/shared/ipc';
 import { AppError } from '../src/shared/errors';
 import type { Project } from '../src/domain/project';
-import type { PointerLog } from '../src/domain/types';
+import { planProjectAutoZoom } from '../src/domain/zoom';
+import { readPointerLog } from './pointerLog';
 import { ProjectStore, createProject, hashFile, isPathInside, newProjectId } from './projectStore';
 import { CaptureEngine, type RecordSession } from './capture/captureEngine';
 import { DesktopVideoSource } from './capture/desktopCapture';
@@ -566,7 +567,7 @@ function createOverlayWindow(): BrowserWindow {
   overlayReady = false;
   const display = screen.getPrimaryDisplay();
   const width = 460;
-  const height = 132;
+  const height = 64;
   const win = new BrowserWindow({
     width,
     height,
@@ -579,8 +580,8 @@ function createOverlayWindow(): BrowserWindow {
     maximizable: false,
     skipTaskbar: true,
     alwaysOnTop: true,
-    transparent: false,
-    backgroundColor: '#14161b',
+    transparent: true,
+    backgroundColor: '#00000000',
     show: false,
     ...(appIconPath() ? { icon: appIconPath() as string } : {}),
     webPreferences: {
@@ -601,7 +602,10 @@ function createOverlayWindow(): BrowserWindow {
       message: '当前系统不支持窗口内容保护，悬浮控制条可能会出现在录制画面中。',
     });
   }
-  win.once('ready-to-show', () => win.showInactive());
+  win.once('ready-to-show', () => {
+    if (overlayWindow !== win || !ACTIVE_CAPTURE_STATES.has(engine.getState())) { win.destroy(); return; }
+    win.showInactive();
+  });
   win.on('closed', () => {
     overlayReady = false;
     if (overlayWindow === win) overlayWindow = null;
@@ -870,6 +874,7 @@ function buildEngine(): CaptureEngine {
         lastStatus = status;
         send(IPC.captureStatus, status);
         sendToOverlay(IPC.captureStatus, status);
+        if (!ACTIVE_CAPTURE_STATES.has(status.state)) closeOverlayWindow();
       },
       requestSegment: async (info) => {
         // 交给录制窗口编码：把帧通过一次 IPC 传递（帧数受 2 秒分段限制，量可控）
@@ -1158,6 +1163,14 @@ async function finalizeSessionProject(session: RecordSession): Promise<void> {
   // 标记
   project.markers = engine.getMarkers().map((m) => ({ ...m }));
 
+  const pointerLog = await readPointerLog(session.projectPath);
+  if (pointerLog) project.effects.push(...planProjectAutoZoom(project, pointerLog));
+  if (engine.hasEmbeddedCursor()) project.effects.push({
+    id: 'cursor-captured', kind: 'cursor', origin: 'automatic', locked: false,
+    range: { start: 0, end: durationTicks },
+    parameters: { size: 22, clickRipple: 1, visible: true, burnedIn: true },
+  });
+
   project.revision = 1;
   project.updatedAt = Date.now();
   await store.save(session.projectPath, project);
@@ -1177,7 +1190,8 @@ function closeOverlayWindow(): void {
   overlayWindow = null;
   if (!win || win.isDestroyed()) return;
   try {
-    win.close();
+    win.hide();
+    win.destroy();
   } catch (error) {
     console.warn('[overlay] 关闭失败', error);
     try {
@@ -1866,23 +1880,7 @@ function registerIpc(): void {
 
   handleFor(IPC.projectReadPointerLog, ['main', 'exporter'], async (projectPath: unknown) => {
     const root = await assertAllowedProjectPath(projectPath);
-    const target = ProjectStore.resolveInside(root, path.join('events', 'pointer.jsonl'));
-    if (!fs.existsSync(target)) return null;
-    const text = await fsp.readFile(target, 'utf8');
-    const lines = text.split('\n').filter((l) => l.trim());
-    const events: unknown[] = [];
-    let meta: PointerLog | null = null;
-    for (const line of lines) {
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed.__kind === 'meta') meta = parsed.__meta as PointerLog;
-        else events.push(parsed);
-      } catch {
-        // 跳过损坏行
-      }
-    }
-    if (!meta) return null;
-    return { ...meta, events };
+    return readPointerLog(root);
   });
 
   handleFor(IPC.projectExportPack, ['main'], async (projectPath: unknown) => {
@@ -2166,7 +2164,7 @@ function registerIpc(): void {
     return null;
   });
   handleFor(IPC.windowOpenOverlay, ['main'], async () => {
-    createOverlayWindow();
+    if (ACTIVE_CAPTURE_STATES.has(engine.getState())) createOverlayWindow();
     return null;
   });
   handleFor(IPC.windowCloseOverlay, ['main'], async () => {
@@ -2180,11 +2178,16 @@ function registerIpc(): void {
       throw new AppError({ code: 'E_INVALID_COMMAND', message: '悬浮窗状态无效。', retryable: false, preservedData: true });
     }
     const update = payload as Partial<{
+      memoOpen: boolean;
       state: CaptureStatus['state'];
       mediaTick: number;
       markerCount: number;
       levels: { mic: number; system: number };
     }>;
+    if (typeof update.memoOpen === 'boolean' && overlayWindow && !overlayWindow.isDestroyed()) {
+      const [width] = overlayWindow.getSize();
+      overlayWindow.setSize(width, update.memoOpen ? 196 : 64);
+    }
     const base: CaptureStatus | null = lastStatus ?? (typeof engine === 'undefined' ? null : engine.status());
     if (!base) return null;
     const merged: CaptureStatus = {

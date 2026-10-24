@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-export interface NativePointerEvent { qpc: bigint; kind: 'down' | 'up'; x: number; y: number; button: number; hwnd?: string; bounds?: { x: number; y: number; width: number; height: number } }
+import { pointerExecutable } from './pointerRuntime';
+export interface NativePointerEvent { qpc: bigint; kind: 'move' | 'down' | 'up'; x: number; y: number; button: number; hwnd?: string; bounds?: { x: number; y: number; width: number; height: number } }
 export class PointerWorker {
   get pid(): number | null { return this.child?.exitCode === null ? this.child.pid ?? null : null; }
   private child: ChildProcess | null = null;
@@ -13,7 +14,7 @@ export class PointerWorker {
   onExit(listener: () => void): () => void { this.exits.add(listener); return () => this.exits.delete(listener); }
   async start(): Promise<void> {
     this.stopping = false; this.pending = '';
-    const child = this.spawnImpl(this.exe, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = this.spawnImpl(pointerExecutable(this.exe), [], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     this.child = child;
     for (const stream of [child.stdin, child.stdout, child.stderr]) stream?.on('error', () => {});
     await new Promise<void>((resolve, reject) => {
@@ -30,7 +31,7 @@ export class PointerWorker {
           try {
             const event = JSON.parse(line);
             if (event.ready && /^\d+$/.test(event.frequency) && BigInt(event.frequency) > 0n) { this.frequency = BigInt(event.frequency); finish(); }
-            else if ((event.kind === 'down' || event.kind === 'up') && /^\d+$/.test(event.qpc) && Number.isFinite(event.x) && Number.isFinite(event.y)) {
+            else if ((event.kind === 'move' || event.kind === 'down' || event.kind === 'up') && /^\d+$/.test(event.qpc) && Number.isFinite(event.x) && Number.isFinite(event.y)) {
               for (const listener of this.listeners) listener({ ...event, qpc: BigInt(event.qpc) });
             }
           } catch { /* A malformed line must not affect subsequent events. */ }

@@ -117,7 +117,7 @@ app.whenReady().then(async () => {
     // 真实尺寸（electron/main.ts 的 createOverlayWindow 是 460×132）。
     // 说明性宽尺寸在这个无 GPU 的验证环境里会触发 Electron 的 UnknownVizError（合成器未就绪），
     // 与布局无关，因此只验证真实尺寸——那才是用户实际看到的窗口。
-    for (const [name, width, height] of [['real460', 460, 132]]) {
+    for (const [name, width, height] of [['real460', 460, 64]]) {
       const { measurement: m, shot } = await measureIn(width, height);
       summary.cases[name] = m;
       if (!m.ok) fail(`${name}: ${m.reason}`);

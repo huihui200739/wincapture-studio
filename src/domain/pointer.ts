@@ -34,10 +34,16 @@ export function createPointerLookup(input: readonly PointerEventLike[]): Pointer
     const index = lo - 1;
     if (index < 0) return null;
     const event = events[index];
+    const next = events[index + 1];
+    // 只插值相邻且时间接近的移动点，不跨停留、点击或离开来源的边界。
+    const interpolate = next?.kind === 'move' && event.kind === 'move' && next.tick > event.tick &&
+      next.tick - event.tick <= TICKS_PER_SECOND / 10 &&
+      [event, next].every(p => p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1);
+    const k = interpolate ? (tick - event.tick) / (next.tick - event.tick) : 0;
     const down = events[lastClick[index]];
     const age = down ? tick - down.tick : Infinity;
     return {
-      x: event.x, y: event.y,
+      x: event.x + (next ? (next.x - event.x) * k : 0), y: event.y + (next ? (next.y - event.y) * k : 0),
       visible: event.x >= 0 && event.x <= 1 && event.y >= 0 && event.y <= 1,
       idleTicks: Math.max(0, tick - events[lastActivity[index]].tick),
       clickProgress: age >= 0 && age < rippleTicks ? age / rippleTicks : 0,

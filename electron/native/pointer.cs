@@ -30,22 +30,27 @@ internal static class PointerCapture {
     private static readonly AutoResetEvent available = new AutoResetEvent(false);
     private static int queued;
     private static bool quitting;
+    private static long lastMoveQpc;
     private static IntPtr OnMouse(int code, IntPtr message, IntPtr data) {
         if (code >= 0) {
             int m = message.ToInt32();
             bool down = m == 0x201 || m == 0x204 || m == 0x207 || m == 0x20B;
             bool up = m == 0x202 || m == 0x205 || m == 0x208 || m == 0x20C;
-            if (down || up) {
+            bool move = m == 0x200;
+            if (down || up || move) {
                 try {
                     MOUSE mouse = (MOUSE)Marshal.PtrToStructure(data, typeof(MOUSE));
                     long qpc; QueryPerformanceCounter(out qpc);
+                    long frequency; QueryPerformanceFrequency(out frequency);
+                    if (move && qpc - lastMoveQpc < frequency / 120) return CallNextHookEx(hook, code, message, data);
+                    if (move) lastMoveQpc = qpc;
                     int button = m == 0x204 || m == 0x205 ? 2 : m == 0x207 || m == 0x208 ? 1 : m == 0x20B || m == 0x20C ? 3 : 0;
                     IntPtr target = GetAncestor(WindowFromPoint(mouse.point), 2); RECT bounds;
                     string geometry = "";
-                    if (GetWindowRect(target, out bounds)) geometry = ",\"hwnd\":\"" + target.ToInt64() + "\",\"bounds\":{\"x\":" + bounds.left + ",\"y\":" + bounds.top + ",\"width\":" + (bounds.right-bounds.left) + ",\"height\":" + (bounds.bottom-bounds.top) + "}";
+                    if (!move && GetWindowRect(target, out bounds)) geometry = ",\"hwnd\":\"" + target.ToInt64() + "\",\"bounds\":{\"x\":" + bounds.left + ",\"y\":" + bounds.top + ",\"width\":" + (bounds.right-bounds.left) + ",\"height\":" + (bounds.bottom-bounds.top) + "}";
                     // Never block the low-level hook on a full stdout pipe.
                     if (Interlocked.Increment(ref queued) <= 2048) {
-                        events.Enqueue("{\"qpc\":\"" + qpc + "\",\"kind\":\"" + (down ? "down" : "up") +
+                        events.Enqueue("{\"qpc\":\"" + qpc + "\",\"kind\":\"" + (move ? "move" : down ? "down" : "up") +
                             "\",\"x\":" + mouse.point.x + ",\"y\":" + mouse.point.y + ",\"button\":" + button + geometry + "}");
                         available.Set();
                     } else Interlocked.Decrement(ref queued);

@@ -26,6 +26,7 @@ await build({
   entryPoints: {
     main: path.join(root, 'electron/main.ts'),
     preload: path.join(root, 'electron/preload.ts'),
+    'pointer-runtime': path.join(root, 'electron/capture/pointerRuntime.ts'),
   },
   outdir: path.join(root, 'dist/main'),
   outExtension: { '.js': '.cjs' },

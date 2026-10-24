@@ -13,6 +13,10 @@ async function start(options: { width: number; height: number; fps: number; regi
   await stop();
   if (!video) throw new Error('视频元素不可用');
   desktopStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: options.fps, max: options.fps } }, audio: false });
+  const track = desktopStream.getVideoTracks()[0];
+  // Chromium 的部分后端会把系统光标烧入视频。尽力关闭，并报告实际结果以防双光标。
+  try { await track.applyConstraints({ cursor: 'never' } as MediaTrackConstraints); } catch { /* 使用实际设置降级。 */ }
+  const cursorEmbedded = (track.getSettings() as MediaTrackSettings & { cursor?: string }).cursor !== 'never';
   video.srcObject = desktopStream; video.muted = true; await video.play(); stopped = false;
   const canvas = new OffscreenCanvas(options.width, options.height), context = canvas.getContext('2d')!;
   let busy = false, last = -Infinity;
@@ -35,7 +39,7 @@ async function start(options: { width: number; height: number; fps: number; regi
         context.drawImage(video, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
       }
       const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.88 });
-      if (!stopped) window.wcs.desktop?.frame({ jpeg: new Uint8Array(await blob.arrayBuffer()), wallTimeMs });
+      if (!stopped) window.wcs.desktop?.frame({ jpeg: new Uint8Array(await blob.arrayBuffer()), wallTimeMs, cursorEmbedded });
     } catch (error) { window.wcs.desktop?.frame({ error: String(error) }); }
     finally { busy = false; }
   };

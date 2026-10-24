@@ -339,6 +339,9 @@ export function OverlayWindow() {
   const memoRef = useRef<HTMLTextAreaElement | null>(null);
   const memoTextRef = useRef(memoText);
   memoTextRef.current = memoText;
+  useEffect(() => {
+    void window.wcs?.overlay?.update({ memoOpen });
+  }, [memoOpen]);
 
   const setMemoTextPersist = (text: string) => {
     setMemoText(text);
@@ -457,7 +460,7 @@ export function OverlayWindow() {
         height: '100vh',
         position: 'relative',
         display: 'flex',
-        alignItems: 'center',
+        alignItems: memoOpen ? 'flex-end' : 'center',
         justifyContent: 'center',
         background: 'transparent',
         padding: 8,

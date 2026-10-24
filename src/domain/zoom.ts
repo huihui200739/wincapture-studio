@@ -9,7 +9,9 @@
  *   重新生成时只替换未锁定片段。
  */
 
-import type { Effect, ZoomParameters } from './project';
+import type { Effect, Project, ZoomParameters } from './project';
+import type { PointerLog } from './types';
+import { TimeMap } from './timeMap';
 import type { TickRange, Ticks } from './timebase';
 import { clampTicks, rangeLength, secondsToTicks } from './timebase';
 
@@ -346,6 +348,63 @@ export function regenerateAutoZoom(existing: readonly Effect[], planned: readonl
   return [...others, ...manual, ...kept].sort((a, b) => a.range.start - b.range.start);
 }
 
+/** 录制收尾与编辑器重生成共用；逐片段映射，避免镜头跨过删除区间或空隙。 */
+export function planProjectAutoZoom(project: Project, log: PointerLog): Effect[] {
+  const planned: Effect[] = [];
+  const valid = (p: PointerSample) => Number.isFinite(p.tick) && Number.isFinite(p.x) &&
+    Number.isFinite(p.y) && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
+  const events = log.events.filter(valid).slice().sort((a, b) => a.tick - b.tick);
+  const clicks = (log.clicks.length ? log.clicks : events.filter(e => e.kind === 'down')).filter(valid);
+  for (const segment of new TimeMap(project).mainSegments()) {
+    const asset = project.assets.find(a => a.id === segment.clip.assetId);
+    if (asset?.kind !== 'screen') continue;
+    const inSource = (p: PointerSample) => p.tick >= segment.source.start && p.tick < segment.source.end;
+    const map = (p: PointerSample): PointerSample => ({ ...p,
+      tick: segment.timeline.start + Math.round((p.tick - segment.source.start) * segment.clip.rate.den / segment.clip.rate.num) });
+    const pointers = events.filter(inSource).map(map);
+    // 静止点被录制日志压缩：补上片段两端才能识别最后一次移动之后的停留。
+    let before: (typeof events)[number] | undefined;
+    for (const event of events) { if (event.tick > segment.source.start) break; before = event; }
+    if (before && pointers[0]?.tick !== segment.timeline.start) pointers.unshift({ ...before, tick: segment.timeline.start });
+    const last = pointers.at(-1);
+    if (last && last.tick < segment.timeline.end - 1) pointers.push({ ...last, tick: segment.timeline.end - 1 });
+    const effects = planAutoZoom(clicks.filter(inSource).map(map), pointers, {
+      minScale: 1.5, sourceWidth: asset.width || log.sourceWidth, sourceHeight: asset.height || log.sourceHeight,
+    });
+    for (const effect of effects) {
+      effect.id = `zoom-auto-${planned.length + 1}`;
+      effect.range = { start: Math.max(segment.timeline.start, effect.range.start),
+        end: Math.min(segment.timeline.end, effect.range.end) };
+      if (effect.range.end - effect.range.start < secondsToTicks(0.25)) continue;
+      const p = effect.parameters as ZoomParameters;
+      // 持续移动时让焦点平滑跟随，光标本身仍按原始时间播放。
+      let x = p.focusX, y = p.focusY, previous = effect.range.start;
+      p.focusPath = [{ tick: previous, x, y }];
+      for (const point of pointers) {
+        if (point.tick <= previous || point.tick >= effect.range.end) continue;
+        if (point.tick - previous < secondsToTicks(1 / 30)) continue;
+        const k = 1 - Math.exp(-(point.tick - previous) / secondsToTicks(0.18));
+        const target = clampFocus(point.x, point.y, p.scale);
+        x += (target.x - x) * k; y += (target.y - y) * k;
+        p.focusPath.push({ tick: point.tick, x, y });
+        previous = point.tick;
+      }
+      planned.push(effect);
+    }
+  }
+  return planned;
+}
+
+function focusAt(p: ZoomParameters, tick: Ticks): { x: number; y: number } {
+  const points = p.focusPath;
+  if (!points?.length) return { x: p.focusX, y: p.focusY };
+  let lo = 0, hi = points.length;
+  while (lo < hi) { const mid = (lo + hi) >>> 1; if (points[mid].tick <= tick) lo = mid + 1; else hi = mid; }
+  const a = points[Math.max(0, lo - 1)], b = points[Math.min(points.length - 1, lo)];
+  const k = b.tick > a.tick ? Math.max(0, Math.min(1, (tick - a.tick) / (b.tick - a.tick))) : 0;
+  return { x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k };
+}
+
 /** 求某一时间点的运镜状态，预览与导出共用同一曲线求值器（§10.3）。 */
 export function evaluateZoom(
   effects: readonly Effect[],
@@ -370,10 +429,11 @@ export function evaluateZoom(
     // - 不能依赖 effects 数组顺序（SetEffect 追加/删除会改变顺序），否则预览与导出、
     //   不同编辑顺序会得到不同结果。数值相同时按 id 稳定抉择。
     if (scale > best.scale + 1e-9 || (Math.abs(scale - best.scale) <= 1e-9 && (bestId === null || effect.id < bestId))) {
+      const focus = focusAt(p, tick);
       best = {
         scale,
-        focusX: 0.5 + (p.focusX - 0.5) * k,
-        focusY: 0.5 + (p.focusY - 0.5) * k,
+        focusX: 0.5 + (focus.x - 0.5) * k,
+        focusY: 0.5 + (focus.y - 0.5) * k,
       };
       bestId = effect.id;
     }

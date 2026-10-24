@@ -137,7 +137,7 @@ export interface RecorderHooks {
   ) => Promise<{ path: string; bytes: number; frames: number } | null>;
 }
 
-export type VideoCaptureSource = Pick<GrabberWorker, 'frequency' | 'captureBounds' | 'start' | 'stop' | 'onFrame' | 'onExit'> & { backend?: string };
+export type VideoCaptureSource = Pick<GrabberWorker, 'frequency' | 'captureBounds' | 'start' | 'stop' | 'onFrame' | 'onExit'> & { backend?: string; cursorEmbedded?: boolean };
 
 export interface SegmentRequest {
   index: number;
@@ -221,6 +221,9 @@ export class CaptureEngine {
   private pointerEvents: PointerEventLike[] = [];
   private pointerClicks: { tick: number; x: number; y: number }[] = [];
   private lastPointer: { x: number; y: number; tick: number } | null = null;
+  private nativePointerAvailable = false;
+  private cursorEmbedded = false;
+  hasEmbeddedCursor(): boolean { return this.cursorEmbedded; }
 
   private segmentTimer: NodeJS.Timeout | null = null;
   private diskTimer: NodeJS.Timeout | null = null;
@@ -501,6 +504,7 @@ export class CaptureEngine {
     // 先把 QPC 频率同步给主进程时钟：音频包可能早于首帧到达，
     // 若等到首帧才 setFrequency，早期音频会被按错误的频率换算。
     this.qpcClock.setFrequency(grabber.frequency);
+    this.cursorEmbedded = grabber.cursorEmbedded ?? false;
 
     grabber.onFrame((frame) => this.handleVideoFrame(frame));
     grabber.onExit((reason) => this.handleGrabberExit(reason));
@@ -509,12 +513,13 @@ export class CaptureEngine {
     this.pointerWorker = new PointerWorker(path.join(path.dirname(this.workerPaths.grabberExe), 'pointer.exe'));
     this.pointerWorker.onEvent(event => this.recordPointerEvent(event, this.pointerWorker?.frequency ?? 10_000_000n));
     this.pointerWorker.onExit(() => {
+      this.nativePointerAvailable = false;
       if (!this.stopping && this.session && ['Recording', 'Paused'].includes(this.state)) {
         this.session.degradation = [this.session.degradation, '真实鼠标点击采集已停止'].filter(Boolean).join('；');
         this.emitStatus(true);
       }
     });
-    try { await this.pointerWorker.start(); }
+    try { await this.pointerWorker.start(); this.nativePointerAvailable = true; }
     catch (error) {
       degradationParts.push('真实鼠标点击采集不可用');
       this.hooks.onAppEvent('pointer-degraded', { reason: String(error) });
@@ -1654,6 +1659,8 @@ export class CaptureEngine {
     if (this.pointerTimer) clearInterval(this.pointerTimer);
     this.pointerTimer = setInterval(() => {
       if (this.state !== 'Recording') return;
+      // 原生事件在鼠标发生移动的瞬间打 QPC 时间戳；主进程轮询只作为降级。
+      if (this.nativePointerAvailable && this.lastPointer) return;
       const point = this.deps.getCursorPoint();
       const session = this.session;
       if (!session) return;
@@ -1689,15 +1696,16 @@ export class CaptureEngine {
   recordPointerEvent(event: NativePointerEvent, frequency: bigint): void {
     if (!this.session || !this.clock.hasZero || this.state !== 'Recording' || frequency <= 0n) return;
     const window = this.session.config.sourceKind === 'window';
-    if (window && event.hwnd && this.session.config.sourceId !== `window:${event.hwnd}`) return;
+    if (event.kind !== 'move' && window && event.hwnd && this.session.config.sourceId !== `window:${event.hwnd}`) return;
     const qpc = Math.round(Number(event.qpc) * 10_000_000 / Number(frequency));
     if (qpc < this.clock.zero! || this.clock.isDuringPause(qpc)) return;
     const tick = this.clock.mediaTickAt(qpc);
     if (tick === null || tick < 0) return;
-    const point = this.normalizedPointer(event.x, event.y, window ? event.bounds : undefined);
-    if (point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) return;
+    const point = this.normalizedPointer(event.x, event.y, window && event.kind !== 'move' ? event.bounds : undefined);
+    if (event.kind !== 'move' && (point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1)) return;
     this.pointerEvents.push({ tick, kind: event.kind, ...point, button: event.button, px: event.x, py: event.y, geometryVersion: 1, captureState: 'ok' });
     if (event.kind === 'down') this.pointerClicks.push({ tick, ...point });
+    this.lastPointer = { ...point, tick };
   }
 
   private normalizedPointer(x: number, y: number, overrideBounds?: { x: number; y: number; width: number; height: number }): { x: number; y: number } {
@@ -1810,6 +1818,8 @@ export class CaptureEngine {
     this.pointerEvents = [];
     this.pointerClicks = [];
     this.lastPointer = null;
+    this.nativePointerAvailable = false;
+    this.cursorEmbedded = false;
     this.bytesWritten = 0;
     this.levels = { mic: 0, system: 0 };
     this.stopResult = null;

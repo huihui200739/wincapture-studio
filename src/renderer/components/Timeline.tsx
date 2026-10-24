@@ -7,7 +7,7 @@
  * - 删除时间线片段 ≠ 删除源素材：这里只做前者，文案也明确区分。
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Clip, PrivacyParameters, Project, TrackKind, ZoomParameters } from '@domain/project';
 import { findTrack, timelineDuration } from '@domain/project';
 import { stepTimelineRange } from '@domain/tutorial';
@@ -252,7 +252,9 @@ export function Timeline({
   onToggleCollapsed,
   projectPath,
 }: TimelineProps) {
-  const [showAdvanced, setShowAdvanced] = useState(false);
+  const hasZoom = project.effects.some(e => e.kind === 'zoom');
+  const [showAdvanced, setShowAdvanced] = useState(hasZoom);
+  useEffect(() => { if (hasZoom) setShowAdvanced(true); }, [project.id, hasZoom]);
   const thumbnailMedia = usePreviewMedia(projectPath ?? null);
   const [snapGuide, setSnapGuide] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
