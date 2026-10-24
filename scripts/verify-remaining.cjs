@@ -13,7 +13,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function browserProbe() {
   const { mb, createEmptyProject, VideoFrameSource, exportProject, createExportProfile, evaluateScene, sourceToOutput, unprojectScreenPoint,
-    drawScene, drawProjectedScreen, projectGpuSurface, TimelineAudioMixer, buildExportPlan, AudioPreviewScheduler } = Features;
+    drawScene, drawScreenPrivacy, drawProjectedScreen, projectGpuSurface, TimelineAudioMixer, buildExportPlan, AudioPreviewScheduler } = Features;
   const assert = (ok, message) => { if (!ok) throw new Error(message); };
   const S = 10_000_000, sr = 48_000;
   // Real PCM WAV input; both the preview mixer and M4A exporter decode these bytes.
@@ -47,7 +47,7 @@ async function browserProbe() {
   const peak = channel => Math.max(...buffer.getChannelData(channel).map(Math.abs));
   assert(peak(0) > 0.245 && peak(0) < 0.255 && peak(1) > 0.12 && peak(1) < 0.13, '试听增益/声道不正确');
   const crossings = buffer.getChannelData(0).reduce((count, value, i, a) => count + (i > 0 && value >= 0 && a[i - 1] < 0 ? 1 : 0), 0);
-  assert(Math.abs(crossings - 88) <= 1, '2 倍速试听未映射到源音频');
+  assert(Math.abs(crossings - 44) <= 1, '2 倍速试听没有保持原音调');
   mic.muted = true;
   const mutedMixer = new TimelineAudioMixer(buildExportPlan(p, { audioOnly: true }), sources,
     { audioBufferFactory: offline, addAudio: async () => {} }, () => {});
@@ -153,9 +153,35 @@ async function browserProbe() {
     }
   } finally { OffscreenCanvas.prototype.getContext = originalGetContext; }
   assert(softwareAnomalies === 0, '软件回退出现网格接缝/透明叠加：' + softwareAnomalies);
+  const privacyFilters = [];
+  for (const [width, height] of [[640, 360], [3840, 2160]]) {
+    const canvas = new OffscreenCanvas(width, height), ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const input = ctx.createImageData(width, height);
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4, color = (Math.floor(x / 2) + Math.floor(y / 2)) % 2 ? 240 : 16;
+      input.data[i] = input.data[i + 1] = input.data[i + 2] = color; input.data[i + 3] = 255;
+    }
+    const rect = { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
+    for (const style of ['blur', 'mosaic']) {
+      ctx.putImageData(input, 0, 0); const started = performance.now();
+      drawScreenPrivacy(ctx, [{rect, style, effectId: style}], {x:0,y:0,width:1,height:1}, {x:0,y:0,width,height});
+      const pixels = ctx.getImageData(0, 0, width, height).data, ms = performance.now() - started;
+      let outsideChanges = 0, mean = 0, squares = 0, samples = 0;
+      for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 4;
+        if (x < width/4 || x >= width*3/4 || y < height/4 || y >= height*3/4) { if (pixels[i] !== input.data[i]) outsideChanges++; }
+        else if (x > width*0.3 && x < width*0.7 && y > height*0.3 && y < height*0.7) { mean += pixels[i]; squares += pixels[i]*pixels[i]; samples++; }
+      }
+      const average = mean / samples, deviation = Math.sqrt(squares/samples - average**2);
+      assert(outsideChanges === 0 && deviation < 35 && average > 100 && average < 160,
+        'Privacy filter did not suppress detail, replaced it with a solid cover, or changed outside pixels: '+JSON.stringify({style,outsideChanges,deviation,average}));
+      privacyFilters.push({width,height,style,outsideChanges,mean:Number(average.toFixed(2)),deviation:Number(deviation.toFixed(2)),drawAndReadbackMs:Math.round(ms)});
+    }
+    canvas.width = 0; canvas.height = 0;
+  }
   decoder.close();
   return { m4a: { bytes: result.bytes, frames: result.frames, duration: result.durationTicks / S, checks: result.verifiedDetail.checks,
-    nonSilentDecode: true, cancellationCleanup: true, noVideoEncoder: true }, audioPreview: { gain: peak(0), channels: 2, doubledToneCrossings: crossings,
+    nonSilentDecode: true, cancellationCleanup: true, noVideoEncoder: true }, privacyFilters, audioPreview: { gain: peak(0), channels: 2, preservedPitchCrossings: crossings,
     mute: true, realtimeContext: true }, motion3D: { changedPixels: changed, frames: video.frames, verified: video.verified,
       previewExportMeanError: difference, privacy: true, whiteMeshSeams: seams, alphaMeshOverlaps: alphaOverlaps, gpuAvailable, softwareAnomalies },
     artifacts: { 'remaining-tone.m4a': Array.from(outputBytes), 'remaining-3d.mp4': Array.from(files.get('3d.mp4')), 'remaining-3d.png': Array.from(motionPng) } };
@@ -208,7 +234,7 @@ app.whenReady().then(async () => {
       export { createEmptyProject } from './src/domain/project';
       export { evaluateScene, sourceToOutput } from './src/domain/scene';
       export { unprojectScreenPoint } from './src/domain/projection';
-      export { drawScene } from './src/media/compositor';
+      export { drawScene, drawScreenPrivacy } from './src/media/compositor';
       export { drawProjectedScreen } from './src/media/projectedScreen';
       export { projectGpuSurface } from './src/media/perspectiveGpu';
       export { createExportProfile } from './src/renderer/lib/exportSettings';

@@ -33,6 +33,7 @@ import { SessionClock } from '../../src/domain/sessionClock';
 import { AudioWorker, GrabberWorker, type AudioPacket, type VideoFramePacket, type WorkerPaths } from './workers';
 import { QpcClock } from './qpcClock';
 import { PointerWorker, type NativePointerEvent } from './pointerWorker';
+import { captureFailureMessage } from './captureDiagnostics';
 import type { CameraMediaClock } from '../../src/media/cameraBuffer';
 import { SegmentGrid, type SegmentSlice } from './segmentPlanner';
 import { audioBufferFrames, audioOffsetFrames, writePcmInto, type PlacedPcmPacket } from './audioAlign';
@@ -158,6 +159,10 @@ interface PendingSegment {
 
 /** 采集引擎：一个进程内只允许一个活动会话。 */
 export class CaptureEngine {
+  getNativeProcessIds(): number[] {
+    return [this.grabber instanceof GrabberWorker ? this.grabber.pid : null, this.audio?.pid, this.pointerWorker?.pid]
+      .filter((id): id is number => typeof id === 'number' && id > 0);
+  }
   private pointerWorker: PointerWorker | null = null;
   private state: CaptureState = 'Idle';
   private session: RecordSession | null = null;
@@ -404,6 +409,7 @@ export class CaptureEngine {
 
     // 启动屏幕采集
     let grabber: VideoCaptureSource = new GrabberWorker(this.workerPaths.grabberExe, {
+      scaling: config.scaling,
       outputWidth: width, outputHeight: height,
       windowHandle: windowSource ? /^window:(\d+)$/.exec(config.sourceId)?.[1] : undefined,
       width: region.width,
@@ -437,7 +443,7 @@ export class CaptureEngine {
       this.grabber = null;
       throw new AppError({
         code: 'E_CAPTURE_UNSUPPORTED',
-        message: '无法启动屏幕采集。请检查显示器是否被其他程序独占。',
+        message: captureFailureMessage(config.backend === 'wgc' ? 'modern' : 'compatibility', error),
         retryable: true,
         preservedData: true,
         detail: String(error),
@@ -1059,6 +1065,9 @@ export class CaptureEngine {
       try {
         await commit(session.projectPath, index, durationTicks, session.effective.fps, startTick);
       } catch (error) {
+        const reason = '摄像头部分分段未能保存，请查看录制诊断；屏幕录制继续。';
+        if (!session.degradation?.includes(reason)) session.degradation = [session.degradation, reason].filter(Boolean).join('；');
+        this.emitStatus(true);
         this.hooks.onAppEvent('camera-error', { index, message: String(error) });
       } finally {
         this.cameraJobsPending -= 1;

@@ -8,7 +8,7 @@
 | electron/native/ | grabber：GDI/PrintWindow；audio：WASAPI；pointer：鼠标钩子；统一 QPC |
 | electron/capture/ | 状态机、媒体时钟、分段调度、现代采集和摄像头协调 |
 | src/domain/ | 工程、命令、时间映射、关联剪辑、磁吸、场景与投影 |
-| src/media/ | 解码、帧缓存、编码、混音、合成和导出 |
+| src/media/ | 解码、帧缓存、编码、混音、合成、时间拉伸和导出 |
 | src/renderer/ | 界面、时间线及独立 recorder/camera/desktop/exporter 运行时 |
 | tests/、scripts/verify-* | 单测、原生联调、真实编解码、界面与交付检查 |
 
@@ -16,17 +16,21 @@
 
 ## 自动验证
 
-先运行 npm run check 和 npm run build。本批 880 项单测、55 条 IPC 契约；测试数量不代表所有硬件均已验收。
+先运行 npm run check 和 npm run build。本批 911 项单测、55 条 IPC 契约；测试数量不代表所有硬件均已验收。
+
+`tests/media/timeStretch.test.ts` 覆盖变速的时长与音高（基频、过零率）、跨块连续性与缓冲上界；`tests/media/exporter.test.ts` 末尾的「变速导出走保持音调的时间拉伸」用正弦素材做端到端验证。`tests/media/compositor.test.ts` 覆盖模糊/马赛克的取样-降采样-放大链路与取样失败回退。
 
 | 命令 | 检查 |
 | --- | --- |
-| npm run verify:input-camera | 编译点击测试程序；钩子启停、点击送达；可控视频流暂停、切片和像素解码。系统拒绝输入时单列 unavailable，不算送达通过。 |
+| npm run verify:input-camera | 钩子启停、点击送达；2560×1440 可控流限制保留帧尺寸，暂停/切片/像素解码、过期帧拒绝。输入被拒绝时单列 unavailable。 |
+| npm run verify:pointer-desktop | 打开专用窗口，90 秒内由交互桌面鼠标点击蓝色区域；核对目标窗口 DOM 点击和钩子 down/up、物理坐标、QPC。无点击或只有 DOM 事件均不通过。 |
+| npm run verify:capture-perf | 带帧编号的动态图源，读取真实 JPEG 中的编号及尺寸，测原生 1080p30/60 回调节奏和工作集；ok 表示功能检查，targetMet 单独报告速率目标。WCS_BASELINE_GRABBER 可指定历史原生程序作同机对照。 |
 | npm run verify:camera | 物理设备枚举、打开、快照、2 秒采样/编码/解封装。无设备或权限失败会返回失败。 |
 | npm run verify:record | 正式主进程真实采集、暂停恢复、落盘和逐段封装校验。 |
 | npm run verify:parity | 真实素材解码、三画幅、指针、多消费者缩略图、4K60 倍速导出。 |
-| npm run verify:remaining | M4A 与取消清理、音频调度、GPU/软件 3D、实际 PrintWindow 移动缩放关闭。 |
+| npm run verify:remaining | 保持音调的真实 WAV/M4A 编解码、音频调度、640/4K 滤镜像素检查、GPU/软件 3D、实际 PrintWindow 移动缩放关闭。 |
 | npm run verify:all | 各页截图、画布适配、1366×768、200% 缩放、悬浮条和图标。 |
-| npm run verify:performance | 默认 20 秒录制和导出，报告实际采集 FPS、音画时长、Electron 工作集；WCS_PERF_SECONDS 可调整。 |
+| npm run verify:performance | 默认 20 秒录制和导出，分开报告采集帧缺失与输出时间槽缺失，统计 Electron 加原生进程工作集。WCS_PERF_SECONDS 支持 3–3600 秒，WCS_PERF_SCALING=performance 选帧率优先；不达目标会返回失败。 |
 | npm run release | 完整构建、NSIS、三个原生进程、归档完整性、解压版真实启动与正式 preload。 |
 
 结果统一在 dist/verify/，截图在其 screenshots/ 子目录。探针数据在 .tmp/ 或 .verify-*，与 .appdata/projects 用户工程分开。

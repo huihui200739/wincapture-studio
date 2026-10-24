@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 export interface NativePointerEvent { qpc: bigint; kind: 'down' | 'up'; x: number; y: number; button: number; hwnd?: string; bounds?: { x: number; y: number; width: number; height: number } }
 export class PointerWorker {
+  get pid(): number | null { return this.child?.exitCode === null ? this.child.pid ?? null : null; }
   private child: ChildProcess | null = null;
   private pending = '';
   private listeners = new Set<(event: NativePointerEvent) => void>();

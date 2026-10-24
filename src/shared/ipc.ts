@@ -99,6 +99,8 @@ export const QUALITY_PROFILES: QualityProfile[] = [
 
 export interface CaptureConfig {
   backend?: 'auto' | 'wgc' | 'compatibility';
+  /** 兼容采集缩放：清晰度或帧率优先，原尺寸采集不受影响。 */
+  scaling?: 'quality' | 'performance';
   sourceId: string;
   sourceKind: 'screen' | 'window';
   qualityId: string;

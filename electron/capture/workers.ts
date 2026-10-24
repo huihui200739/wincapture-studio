@@ -30,6 +30,7 @@ export type { AudioErrorPacket, AudioPacket, VideoFramePacket } from './wireProt
 export { MAX_AUDIO_PACKET_BYTES, MAX_VIDEO_FRAME_BYTES } from './wireProtocol';
 
 export interface GrabberOptions {
+  scaling?: 'quality' | 'performance';
   outputWidth?: number;
   outputHeight?: number;
   windowHandle?: string;
@@ -131,6 +132,7 @@ class StderrParser {
 
 /** GDI 采集进程封装。 */
 export class GrabberWorker {
+  get pid(): number | null { return this.child?.exitCode === null ? this.child.pid ?? null : null; }
   private child: ChildProcess | null = null;
   private decoder = new FrameStreamDecoder();
   private parser: StderrParser;
@@ -187,6 +189,7 @@ export class GrabberWorker {
       this.exePath,
       [String(width), String(height), String(offsetX), String(offsetY), String(quality), String(fps),
         ...(this.options.windowHandle ? [`--window=${this.options.windowHandle}`] : []),
+        ...(this.options.scaling === 'performance' ? ['--fast-scale'] : []),
         ...(this.options.outputWidth && this.options.outputHeight ? [`--output=${this.options.outputWidth}x${this.options.outputHeight}`] : [])],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true },
     );
@@ -342,6 +345,7 @@ export class GrabberWorker {
 
 /** WASAPI 双路音频采集进程封装。 */
 export class AudioWorker {
+  get pid(): number | null { return this.child?.exitCode === null ? this.child.pid ?? null : null; }
   private child: ChildProcess | null = null;
   private decoder = new AudioStreamDecoder();
   private parser: StderrParser;

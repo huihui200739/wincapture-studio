@@ -29,6 +29,14 @@ function memoryStorage(seed?: Record<string, string>): SettingsStorage & { data:
 }
 
 describe('normalizeCaptureDefaults', () => {
+  it('persists capture backend and scaling without accepting invalid modes', () => {
+    const storage = memoryStorage();
+    const captureDefaults = { ...DEFAULT_CAPTURE_DEFAULTS, backend: 'compatibility' as const, scaling: 'performance' as const };
+    saveSettings({ captureDefaults }, storage);
+    const config = captureConfigFromDefaults(loadSettings(storage).captureDefaults);
+    expect(config.backend).toBe('compatibility'); expect(config.scaling).toBe('performance');
+    expect(normalizeCaptureDefaults({ backend: 'unsafe', scaling: 'unsafe' })).toMatchObject({ backend: 'auto', scaling: 'quality' });
+  });
   it('非对象输入回退默认值', () => {
     expect(normalizeCaptureDefaults(undefined)).toEqual(DEFAULT_CAPTURE_DEFAULTS);
     expect(normalizeCaptureDefaults('oops')).toEqual(DEFAULT_CAPTURE_DEFAULTS);

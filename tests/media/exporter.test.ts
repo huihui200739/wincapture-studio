@@ -88,7 +88,7 @@ vi.mock('../../src/media/compositor', () => ({
 }));
 
 // 注意：必须在 vi.mock 之后导入被测模块
-const { exportProject, estimateOutputBytes, sha256Hex, snapshotProject, resampleAudioChannels } =
+const { exportProject, estimateOutputBytes, sha256Hex, snapshotProject, resampleAudioChannels, TimelineAudioMixer } =
   await import('../../src/media/exporter');
 
 const S = TICKS_PER_SECOND;
@@ -491,5 +491,181 @@ describe('exportProject 音频降级告警', () => {
     expect(result.ok).toBe(true);
     expect(result.warnings.length).toBeGreaterThan(0);
     expect(result.warnings.join('\n')).toMatch(/mic-1/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 变速：保持音调的时间拉伸（WSOLA）接入混音器
+// ---------------------------------------------------------------------------
+
+/** 440Hz 正弦素材，长度 2 秒，用于检查变速后的音高与时长。 */
+function sineMediaHarness(changing = false): { media: any; sine: Float32Array } {
+  const sr = 48_000;
+  const sine = new Float32Array(2 * sr);
+  for (let i = 0; i < sine.length; i++) sine[i] = Math.sin((2 * Math.PI * (changing && i >= sr ? 880 : 440) * i) / sr) * 0.5;
+  const provider = {
+    getFrameAt: async () => ({ width: 1920, height: 1080 }) as unknown as CanvasImageSource,
+    getAudioAt: async (range: { start: number; end: number }, opts: any = {}) => {
+      const startSample = Math.max(0, Math.round((range.start * sr) / S));
+      const endSample = Math.min(sine.length, Math.max(startSample, Math.round((range.end * sr) / S)));
+      const count = endSample - startSample;
+      if (count <= 0) return null;
+      const channels = Math.max(1, opts.channels ?? 2);
+      const list: Float32Array[] = [];
+      for (let ch = 0; ch < channels; ch++) list.push(sine.subarray(startSample, endSample));
+      return {
+        channels: list,
+        sampleRate: sr,
+        startTick: Math.round((startSample * S) / sr),
+        frameCount: count,
+        hasData: true,
+      };
+    },
+    close: () => {},
+  };
+  return { sine, media: { segmentsFor: async () => [], providerFor: async () => provider } };
+}
+
+/** 统计相邻同向过零点间隔的中位数，估算基频。 */
+function pitchOf(data: Float32Array, sr = 48_000): number {
+  const rising: number[] = [];
+  for (let i = 1; i < data.length; i++) if (data[i - 1] < 0 && data[i] >= 0) rising.push(i);
+  if (rising.length < 4) return 0;
+  const gaps: number[] = [];
+  for (let i = 1; i < rising.length; i++) gaps.push(rising[i] - rising[i - 1]);
+  gaps.sort((a, b) => a - b);
+  const median = gaps[Math.floor(gaps.length / 2)];
+  return median > 0 ? sr / median : 0;
+}
+
+function retimedProject(rate: { num: number; den: number }): Project {
+  const project = baseProject();
+  // 全部片段源时长统一为 2s，时间线时长 = 2s / rate
+  project.assets = project.assets.map((a) => ({ ...a, durationTicks: 2 * S }));
+  for (const track of project.tracks) {
+    track.clips = track.clips.map((clip) => ({ ...clip, sourceDurationTicks: 2 * S, rate }));
+  }
+  return project;
+}
+
+function verifierFor(durationSeconds: number) {
+  return createFakeVerifier({
+    durationSeconds,
+    packetCount: Math.round(durationSeconds * 30),
+  });
+}
+
+describe('变速导出走保持音调的时间拉伸', () => {
+  it('试听跳转与回退从对应源时间开始，重新定位拉伸器', async () => {
+    const project = retimedProject({ num: 2, den: 1 }), {media} = sineMediaHarness(true);
+    const provider = await media.providerFor();
+    const sources = new Map(project.assets.map(asset => [asset.id, provider]));
+    const factory = {createBuffer: (channels: number, length: number, sampleRate: number) => {
+      const data = Array.from({length: channels}, () => new Float32Array(length));
+      return {sampleRate, length, numberOfChannels: channels, getChannelData: (channel: number) => data[channel], copyToChannel: (source: Float32Array, channel: number) => data[channel].set(source)};
+    }};
+    const mixer = new TimelineAudioMixer(buildExportPlan(project, {audioOnly: true}), sources, {audioBufferFactory: factory as any, addAudio: async () => {}}, () => {});
+    const first = await mixer.renderChunk(0, 4800), forward = await mixer.renderChunk(33600, 4800), backward = await mixer.renderChunk(4800, 4800);
+    expect(pitchOf(first!.getChannelData(0))).toBeLessThan(470);
+    expect(pitchOf(forward!.getChannelData(0))).toBeGreaterThan(840);
+    expect(pitchOf(backward!.getChannelData(0))).toBeGreaterThan(420);
+    expect(pitchOf(backward!.getChannelData(0))).toBeLessThan(470);
+  });
+  it('跨块推进到后半段不同音调，不重复读取源片段开头', async () => {
+    const { media } = sineMediaHarness(true);
+    const project = retimedProject({ num: 2, den: 1 });
+    const { io } = makeFakeFileIO(); mocks.muxers.length = 0;
+    await exportProject(optionsFor(project, io, media, verifierFor(1)) as any);
+    const buffers = mocks.muxers[0].addedAudio;
+    const flat = new Float32Array(buffers.reduce((sum: number, b: any) => sum + b.length, 0));
+    let at = 0; for (const b of buffers) { flat.set(b.getChannelData(0), at); at += b.length; }
+    expect(pitchOf(flat.subarray(4800, 19200))).toBeGreaterThan(420);
+    expect(pitchOf(flat.subarray(4800, 19200))).toBeLessThan(465);
+    expect(pitchOf(flat.subarray(33600, 43200))).toBeGreaterThan(840);
+    expect(pitchOf(flat.subarray(33600, 43200))).toBeLessThan(930);
+    for (let block = 2; block < buffers.length - 2; block++) {
+      const data = buffers[block].getChannelData(0);
+      const rms = Math.sqrt(data.reduce((s: number, x: number) => s + x * x, 0) / data.length);
+      expect(rms).toBeGreaterThan(0.15);
+    }
+  });
+  it('2× 片段：输出时长按时间线缩短，但音高不翻倍', async () => {
+    const { media } = sineMediaHarness();
+    const project = retimedProject({ num: 2, den: 1 });
+    const { io } = makeFakeFileIO();
+    const verifier = verifierFor(1);
+    mocks.muxers.length = 0;
+
+    const result = await exportProject(optionsFor(project, io, media, verifier) as any);
+    expect(result.ok).toBe(true);
+
+    const buffers = mocks.muxers[0].addedAudio as { length: number; getChannelData(ch: number): Float32Array }[];
+    const total = buffers.reduce((sum, b) => sum + b.length, 0);
+    // 时间线时长 = 2s / 2 = 1s → 48000 采样（不是 2s 也不是被截断）
+    expect(total).toBeGreaterThan(47_000);
+    expect(total).toBeLessThanOrEqual(48_000 + 4096);
+
+    const flat = new Float32Array(total);
+    let at = 0;
+    for (const b of buffers) {
+      flat.set(b.getChannelData(0).subarray(0, b.length), at);
+      at += b.length;
+    }
+    // 只看中段：开头一帧与结尾补零是 OLA 的固有边界
+    const mid = flat.subarray(Math.floor(total * 0.1), Math.floor(total * 0.9));
+    const pitch = pitchOf(mid);
+    expect(pitch).toBeGreaterThan(400);
+    expect(pitch).toBeLessThan(485);
+  });
+
+  it('0.5× 片段：输出时长加倍，音高不减半，且中段不是静音', async () => {
+    const { media } = sineMediaHarness();
+    const project = retimedProject({ num: 1, den: 2 });
+    const { io } = makeFakeFileIO();
+    const verifier = verifierFor(4);
+    mocks.muxers.length = 0;
+
+    const result = await exportProject(optionsFor(project, io, media, verifier) as any);
+    expect(result.ok).toBe(true);
+
+    const buffers = mocks.muxers[0].addedAudio as { length: number; getChannelData(ch: number): Float32Array }[];
+    const total = buffers.reduce((sum, b) => sum + b.length, 0);
+    // 时间线时长 = 2s / 0.5 = 4s → 192000 采样
+    expect(total).toBeGreaterThan(190_000);
+
+    const flat = new Float32Array(total);
+    let at = 0;
+    for (const b of buffers) {
+      flat.set(b.getChannelData(0).subarray(0, b.length), at);
+      at += b.length;
+    }
+    const mid = flat.subarray(Math.floor(total * 0.1), Math.floor(total * 0.85));
+    const pitch = pitchOf(mid);
+    expect(pitch).toBeGreaterThan(400);
+    expect(pitch).toBeLessThan(485);
+    let energy = 0;
+    for (let i = 0; i < mid.length; i += 37) energy += Math.abs(mid[i]);
+    expect(energy / Math.ceil(mid.length / 37)).toBeGreaterThan(0.05);
+  });
+
+  it('恒速片段不进入拉伸路径（输出与原素材逐样本一致）', async () => {
+    const { media, sine } = sineMediaHarness();
+    const project = retimedProject({ num: 1, den: 1 });
+    const { io } = makeFakeFileIO();
+    const verifier = verifierFor(2);
+    mocks.muxers.length = 0;
+
+    await exportProject(optionsFor(project, io, media, verifier) as any);
+    const buffers = mocks.muxers[0].addedAudio as { length: number; getChannelData(ch: number): Float32Array }[];
+    let at = 0;
+    let matches = 0;
+    for (const b of buffers) {
+      const data = b.getChannelData(0);
+      for (let i = 0; i < b.length; i++) {
+        if (at + i < sine.length && Math.abs(data[i] - sine[at + i]) < 1e-6) matches++;
+      }
+      at += b.length;
+    }
+    expect(matches).toBeGreaterThan(at * 0.9);
   });
 });

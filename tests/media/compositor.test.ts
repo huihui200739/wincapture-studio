@@ -23,7 +23,7 @@ import { evaluateScene, screenRectPx, type FrameScene } from '../../src/domain/s
 import { createEmptyProject } from '../../src/domain/project';
 import type { Project } from '../../src/domain/project';
 import { TICKS_PER_SECOND } from '../../src/domain/timebase';
-import { Fake2DContext } from './helpers';
+import { Fake2DContext, installFakeCanvas } from './helpers';
 
 const S = TICKS_PER_SECOND;
 const TICK = 0.5 * S;
@@ -200,22 +200,90 @@ describe('遮挡绘制', () => {
     expect(fills[0].args[4]).toBe('#000000');
   });
 
-  it('模糊与马赛克样式各自产生对应绘制（不是只画一次实色）', () => {
-    const ctx = makeCtx();
-    drawScreenPrivacy(
-      ctx as any,
-      [
-        { rect, style: 'blur', effectId: 'p-blur' },
-        { rect, style: 'mosaic', effectId: 'p-mosaic' },
-      ],
-      view,
-      target,
-    );
-    const styles = ctx.opsOf('fillRect').map((op) => op.args[4]);
-    expect(styles).toContain('rgba(0,0,0,0.88)');
-    expect(styles).toContain('rgba(24,24,24,0.94)');
-    // 马赛克网格线
-    expect(ctx.opsOf('stroke').length).toBeGreaterThan(10);
+  it('模糊与马赛克真正处理源像素（取样 + 降采样 + 放大），不再只是盖深色矩形', () => {
+    const restore = installFakeCanvas();
+    try {
+      const ctx = makeCtx();
+      drawScreenPrivacy(
+        ctx as any,
+        [
+          { rect, style: 'blur', effectId: 'p-blur' },
+          { rect, style: 'mosaic', effectId: 'p-mosaic' },
+        ],
+        view,
+        target,
+      );
+      // 关键回归：不再是「深色半透明矩形 + 网格线」的假遮挡
+      expect(ctx.opsOf('fillRect')).toHaveLength(2);
+      // 每个样式都要把遮挡区取样到离屏画布（9 参 drawImage）
+      const fullDraws = ctx.opsOf('drawImage').filter((op) => op.args.length === 9);
+      expect(fullDraws.length).toBeGreaterThanOrEqual(2);
+      // Blur includes an outer sampling margin, clipped to the mask; mosaic is exact.
+      for (const op of fullDraws) {
+        const [x, y, width, height] = op.args.slice(5, 9);
+        expect(x).toBeLessThanOrEqual(100); expect(y).toBeLessThanOrEqual(100);
+        expect(x + width).toBeGreaterThanOrEqual(300); expect(y + height).toBeGreaterThanOrEqual(300);
+        expect(op.args[3]).toBeLessThan(200);
+        expect(op.args[4]).toBeLessThan(200);
+      }
+      // 模糊确实叠加了高斯滤镜
+      const filters = ctx.opsOf('filter').map((op) => String(op.args[0]));
+      expect(filters.some((f) => f.startsWith('blur('))).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('马赛克关闭插值、模糊开启插值并裁剪在遮挡矩形内', () => {
+    const restore = installFakeCanvas();
+    try {
+      const blurred = makeCtx();
+      drawScreenPrivacy(blurred as any, [{ rect, style: 'blur', effectId: 'b' }], view, target);
+      expect(blurred.opsOf('rect').some((op) => op.args.slice(0, 4).join() === '100,100,200,200')).toBe(true);
+      expect(blurred.opsOf('clip').length).toBeGreaterThan(0);
+      expect(blurred.imageSmoothingEnabled).toBe(true);
+
+      const mosaic = makeCtx();
+      drawScreenPrivacy(mosaic as any, [{ rect, style: 'mosaic', effectId: 'm' }], view, target);
+      // 降采样到 200/14 ≈ 14 的小块，再放大回 200 —— 真马赛克
+      const back = mosaic.opsOf('drawImage').filter((op) => op.args.length === 9).at(-1)!;
+      expect(back.args[3]).toBe(Math.round(200 / 14));
+      expect(mosaic.opsOf('filter')).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('无法取样时回退为不透明遮盖，绝不把原画面原样留在成片里', () => {
+    // 画布尺寸为 0 即无法取样（同时不依赖是否安装 OffscreenCanvas）
+    const ctx = new Fake2DContext({ width: 0, height: 0 });
+    drawScreenPrivacy(ctx as any, [{ rect, style: 'blur', effectId: 'p-blur' }], view, target);
+    const fills = ctx.opsOf('fillRect');
+    expect(fills).toHaveLength(1);
+    expect(fills[0].args.slice(0, 4)).toEqual([100, 100, 200, 200]);
+    expect(fills[0].args[4]).toBe('#15171b');
+    expect(ctx.opsOf('drawImage')).toHaveLength(0);
+  });
+
+  it('遮挡区超出画布时按画布边界裁剪，不越界取样', () => {
+    const restore = installFakeCanvas();
+    try {
+      const ctx = makeCtx(); // 1920×1080
+      drawScreenPrivacy(
+        ctx as any,
+        [{ rect: { x: 0.9, y: 0.9, width: 0.5, height: 0.5 }, style: 'mosaic', effectId: 'oob' }],
+        view,
+        target,
+      );
+      const back = ctx.opsOf('drawImage').filter((op) => op.args.length === 9).at(-1)!;
+      const [dx, dy, dw, dh] = back.args.slice(5, 9);
+      expect(dx).toBeGreaterThanOrEqual(0);
+      expect(dy).toBeGreaterThanOrEqual(0);
+      expect(dx + dw).toBeLessThanOrEqual(1920);
+      expect(dy + dh).toBeLessThanOrEqual(1080);
+    } finally {
+      restore();
+    }
   });
 
   it('零宽/零高遮挡被跳过', () => {

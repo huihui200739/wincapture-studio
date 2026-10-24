@@ -42,6 +42,7 @@ import type { PointerLog } from '../src/domain/types';
 import { ProjectStore, createProject, hashFile, isPathInside, newProjectId } from './projectStore';
 import { CaptureEngine, type RecordSession } from './capture/captureEngine';
 import { DesktopVideoSource } from './capture/desktopCapture';
+import { NativeMemorySampler, nativeProcessMemory } from './capture/processMemory';
 const desktopSources = new Map<number, { worker: DesktopVideoSource; source: Electron.DesktopCapturerSource }>();
 interface RecorderReply { ok: boolean; data?: Uint8Array; mp4?: string; frames?: number; encoder?: string; durationUs?: number; error?: string }
 const recorderJobs = new Map<number, { sender: number; finish(result: RecorderReply): void }>();
@@ -954,8 +955,11 @@ function buildEngine(): CaptureEngine {
       // 摄像头分段（R04）：由 CameraCoordinator 在独立隐藏窗口里采集并落盘
       cameraClock: async clock => { await camera?.syncClock(clock); },
       commitCameraSegment: async (projectPath, index, durationTicks, fps, startTick) => {
-        if (!camera) return null;
-        return camera.commitSegment(projectPath, index, durationTicks, fps, startTick);
+        const coordinator = camera;
+        if (!coordinator?.getStatus().active) return null;
+        const result = await coordinator.commitSegment(projectPath, index, durationTicks, fps, startTick);
+        if (!result) throw new Error(coordinator.getStatus().reason ?? '摄像头分段未能保存');
+        return result;
       },
     },
     {
@@ -1378,6 +1382,7 @@ function validateCaptureConfig(raw: unknown): CaptureConfig {
   return {
     sourceId,
     backend: config.backend === 'wgc' || config.backend === 'compatibility' ? config.backend : 'auto',
+    scaling: config.scaling === 'performance' ? 'performance' : 'quality',
     sourceKind,
     qualityId: quality.id,
     fps: { num: Math.round(fpsNum), den: Math.round(fpsDen) },
@@ -2669,6 +2674,8 @@ async function runPerfProbe(): Promise<void> {
   const reportPath = path.join(outDir, 'perf-result.json');
 
   const log = (message: string) => console.log(`[perf] ${message}`);
+  const sampler = new NativeMemorySampler(() => nativeProcessMemory(
+    resolveWorkerPaths(app.getAppPath(), app.isPackaged).grabberExe, engine.getNativeProcessIds()));
 
   const finish = (report: { ok: boolean; samples: unknown[]; error?: string }) => {
     fs.mkdirSync(outDir, { recursive: true });
@@ -2678,9 +2685,8 @@ async function runPerfProbe(): Promise<void> {
   };
 
   const treeWorkingSetBytes = (): number => {
-    // 用 Electron 自身的进程指标统计本应用全部进程（含 GPU / 渲染 / 工作进程）。
-    // 注意：getAppMetrics().memory.workingSetSize 单位是 KB，需要 ×1024。
-    // 这个口径比外部 Get-Process 更容易抓到瞬时峰值（采样更密）。
+    // Electron metrics omit native grabber/audio/pointer children. Add asynchronously
+    // sampled working sets, excluding any PID already reported by Electron.
     try {
       const metrics = app.getAppMetrics();
       let total = 0;
@@ -2688,15 +2694,17 @@ async function runPerfProbe(): Promise<void> {
         const kb = m.memory?.workingSetSize ?? 0;
         if (Number.isFinite(kb) && kb > 0) total += kb * 1024;
       }
-      if (total > 0) return total;
+      const electronIds = new Set(metrics.map(metric => metric.pid));
+      if (total > 0) return total + sampler.total(engine.getNativeProcessIds().filter(id => !electronIds.has(id)));
     } catch {
       // 退化到当前进程 RSS
     }
-    return process.memoryUsage().rss;
+    return process.memoryUsage().rss + sampler.total(engine.getNativeProcessIds());
   };
 
   try {
     await new Promise((r) => setTimeout(r, 1500));
+    sampler.start();
 
     const { runPerfProbe: runProbe } = await import('../scripts/perfProbe');
 
@@ -2797,6 +2805,11 @@ async function runPerfProbe(): Promise<void> {
       seconds,
     );
 
+    Object.assign(report, { memoryScope: 'Electron processes + native grabber/audio/pointer working sets',
+      nativeMemory: { samples: sampler.samples, errors: sampler.errors, peakBytes: sampler.peakBytes, maxProcesses: sampler.maxProcesses } });
+    if (!sampler.maxProcesses || sampler.errors) {
+      report.ok = false; report.error = [report.error, '原生进程内存采样不完整'].filter(Boolean).join('；');
+    }
     log(`samples=${report.samples.length}`);
     for (const sample of report.samples) {
       const judged = sample.pass === null ? '记录' : sample.pass ? 'PASS' : 'FAIL';
@@ -2809,7 +2822,7 @@ async function runPerfProbe(): Promise<void> {
       samples: [],
       error: String(error instanceof Error ? (error.stack ?? error.message) : error),
     });
-  }
+  } finally { sampler.stop(); }
 }
 
 async function runRecorderProbe(): Promise<void> {

@@ -29,6 +29,17 @@ using System.Collections.Generic;
 
 internal static class Grabber
 {
+    private sealed class Surface : IDisposable {
+        public readonly Bitmap Bitmap;
+        public readonly Graphics Graphics;
+        public long Qpc;
+        public Surface(int width, int height) {
+            Bitmap = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+            try { Graphics = Graphics.FromImage(Bitmap); Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBilinear; }
+            catch { Bitmap.Dispose(); throw; }
+        }
+        public void Dispose() { Graphics.Dispose(); Bitmap.Dispose(); }
+    }
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int Left, Top, Right, Bottom; }
     private delegate bool EnumWindowCallback(IntPtr hwnd, IntPtr parameter);
@@ -82,6 +93,12 @@ internal static class Grabber
 
     [DllImport("user32.dll")]
     private static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+    [DllImport("gdi32.dll", SetLastError=true)]
+    private static extern bool BitBlt(IntPtr destination, int x, int y, int width, int height, IntPtr source, int sx, int sy, uint operation);
+    [DllImport("gdi32.dll", SetLastError=true)]
+    private static extern bool StretchBlt(IntPtr destination, int x, int y, int width, int height, IntPtr source, int sx, int sy, int sourceWidth, int sourceHeight, uint operation);
+    [DllImport("gdi32.dll")] private static extern int SetStretchBltMode(IntPtr dc, int mode);
+    [DllImport("gdi32.dll")] private static extern bool SetBrushOrgEx(IntPtr dc, int x, int y, IntPtr previous);
 
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int index);
@@ -115,10 +132,11 @@ internal static class Grabber
 
     private static Stream _stdout;
 
-    private static void WriteFrame(byte[] jpeg, long qpc)
+    private static readonly byte[] frameHeader = new byte[12];
+    private static void WriteFrame(byte[] jpeg, int length, long qpc)
     {
-        byte[] header = new byte[12];
-        int len = jpeg.Length;
+        byte[] header = frameHeader;
+        int len = length;
         header[0] = (byte)(len & 0xFF);
         header[1] = (byte)((len >> 8) & 0xFF);
         header[2] = (byte)((len >> 16) & 0xFF);
@@ -128,7 +146,7 @@ internal static class Grabber
             header[4 + i] = (byte)((qpc >> (8 * i)) & 0xFF);
         }
         _stdout.Write(header, 0, header.Length);
-        _stdout.Write(jpeg, 0, jpeg.Length);
+        _stdout.Write(jpeg, 0, length);
         _stdout.Flush();
     }
 
@@ -145,6 +163,16 @@ internal static class Grabber
         catch { /* 旧系统忽略 */ }
 
         if (args.Length == 1 && args[0] == "--list-windows") return ListWindows();
+        if (args.Length == 1 && args[0].StartsWith("--process-memory=")) {
+            List<string> rows = new List<string>();
+            foreach (string value in args[0].Substring(17).Split(',')) {
+                int id; if (!int.TryParse(value, out id) || id <= 0) continue;
+                try { using (Process process = Process.GetProcessById(id)) {
+                    rows.Add("{\"pid\":" + id + ",\"workingSetBytes\":" + process.WorkingSet64 + ",\"privateBytes\":" + process.PrivateMemorySize64 + "}");
+                } } catch { /* A worker may exit between enumeration and sampling. */ }
+            }
+            Console.WriteLine("[" + string.Join(",", rows.ToArray()) + "]"); return 0;
+        }
 
         QueryPerformanceFrequency(out _qpcFrequency);
         if (args.Length == 1 && args[0] == "--clock") { long qpc; QueryPerformanceCounter(out qpc); Console.WriteLine("{\"qpc\":\"" + qpc + "\",\"frequency\":\"" + _qpcFrequency + "\"}"); return 0; }
@@ -159,6 +187,7 @@ internal static class Grabber
         int width, height, offsetX, offsetY, quality;
         int fps = 30;
         bool probe = false;
+        bool fastScale = false;
         IntPtr windowHandle = IntPtr.Zero;
         int outputWidth = 0, outputHeight = 0;
         try
@@ -172,6 +201,7 @@ internal static class Grabber
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "--probe") probe = true;
+                if (args[i] == "--fast-scale") fastScale = true;
                 if (args[i].StartsWith("--window=")) windowHandle = new IntPtr(long.Parse(args[i].Substring(9)));
                 if (args[i].StartsWith("--output=")) { string[] output = args[i].Substring(9).Split('x'); outputWidth = int.Parse(output[0]); outputHeight = int.Parse(output[1]); }
             }
@@ -217,16 +247,21 @@ internal static class Grabber
         EncoderParameters encoderParams = new EncoderParameters(1);
         encoderParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, (long)quality);
 
-        Bitmap bitmap;
-        Graphics graphics;
-        MemoryStream buffer = new MemoryStream(512 * 1024);
+        List<Surface> surfaces = new List<Surface>();
+        Queue<Surface> free = new Queue<Surface>();
+        Queue<Surface> ready = new Queue<Surface>();
+        object queueLock = new object();
+        AutoResetEvent available = new AutoResetEvent(false);
         try
         {
-            bitmap = new Bitmap(width, height, PixelFormat.Format24bppRgb);
-            graphics = Graphics.FromImage(bitmap);
+            for (int i = 0; i < 4; i++) { Surface item = new Surface(outputWidth, outputHeight);
+                if (fastScale) item.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+                surfaces.Add(item); free.Enqueue(item); }
         }
         catch (Exception ex)
         {
+            foreach (Surface item in surfaces) item.Dispose();
+            available.Dispose(); encoderParams.Dispose();
             Log("BITMAP_ERROR " + ex.GetType().Name + ": " + ex.Message);
             return 3;
         }
@@ -255,11 +290,31 @@ internal static class Grabber
         long nextDeadlineUs = 0;
         int frames = 0;
         int failures = 0;
+        int poolMisses = 0;
+        bool captureDone = false;
+        // Capture and JPEG encoding own different pool surfaces. The four-surface
+        // pool bounds memory and avoids making every capture wait for compression/IPC.
+        Thread encoder = new Thread(delegate() {
+            using (MemoryStream buffer = new MemoryStream(512 * 1024)) {
+                while (true) {
+                    Surface item = null;
+                    lock (queueLock) { if (ready.Count > 0) item = ready.Dequeue(); else if (captureDone) break; }
+                    if (item == null) { available.WaitOne(50); continue; }
+                    try {
+                        buffer.SetLength(0); item.Bitmap.Save(buffer, jpegCodec, encoderParams);
+                        WriteFrame(buffer.GetBuffer(), checked((int)buffer.Length), item.Qpc);
+                        Interlocked.Increment(ref frames);
+                    } catch (IOException) { _quit = true; break; }
+                    catch (Exception ex) {
+                        Interlocked.Increment(ref failures); Log("ENCODE_ERROR " + ex.GetType().Name + ": " + ex.Message); _quit = true; break;
+                    } finally { lock (queueLock) { free.Enqueue(item); Monitor.Pulse(queueLock); } }
+                }
+            }
+        });
+        encoder.IsBackground = true; encoder.Start();
         Stopwatch clock = Stopwatch.StartNew();
         Bitmap windowBitmap = null;
-        Bitmap outputBitmap = outputWidth != width || outputHeight != height ? new Bitmap(outputWidth, outputHeight, PixelFormat.Format24bppRgb) : null;
-        Graphics outputGraphics = outputBitmap != null ? Graphics.FromImage(outputBitmap) : null;
-        if (outputGraphics != null) outputGraphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBilinear;
+        IntPtr desktopDC = windowHandle == IntPtr.Zero ? GetDC(IntPtr.Zero) : IntPtr.Zero;
         int lastWindowWidth = 0, lastWindowHeight = 0;
 
         try
@@ -283,11 +338,30 @@ internal static class Grabber
                     continue;
                 }
 
+                Surface surface;
+                lock (queueLock) {
+                    if (free.Count == 0) Monitor.Wait(queueLock, Math.Max(1, Math.Min(8, 1000 / fps)));
+                    surface = free.Count > 0 ? free.Dequeue() : null;
+                }
+                if (surface == null) { poolMisses++; nextDeadlineUs = nowUs + frameIntervalUs; Thread.Sleep(1); continue; }
+                QueryPerformanceCounter(out qpc);
+                Graphics graphics = surface.Graphics;
                 bool ok = false;
                 try
                 {
                     if (windowHandle == IntPtr.Zero) {
-                        graphics.CopyFromScreen(offsetX, offsetY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+                        if (desktopDC == IntPtr.Zero) throw new Exception("Desktop DC unavailable");
+                        IntPtr destination = graphics.GetHdc();
+                        try {
+                            bool captured;
+                            if (width == outputWidth && height == outputHeight) captured = BitBlt(destination, 0, 0, outputWidth, outputHeight, desktopDC, offsetX, offsetY, 0x40CC0020);
+                            else {
+                                SetStretchBltMode(destination, fastScale ? 3 : 4); SetBrushOrgEx(destination, 0, 0, IntPtr.Zero);
+                                captured = StretchBlt(destination, 0, 0, outputWidth, outputHeight, desktopDC, offsetX, offsetY, width, height, 0x40CC0020);
+                                if (!captured) captured = StretchBlt(destination, 0, 0, outputWidth, outputHeight, desktopDC, offsetX, offsetY, width, height, 0x00CC0020);
+                            }
+                            if (!captured) throw new Exception("Desktop blit failed: " + Marshal.GetLastWin32Error());
+                        } finally { graphics.ReleaseHdc(destination); }
                     } else {
                         RECT bounds;
                         if (!IsWindow(windowHandle) || IsIconic(windowHandle) || !GetWindowRect(windowHandle, out bounds)) {
@@ -311,9 +385,9 @@ internal static class Grabber
                             if (!captured) { Log("SOURCE_CLOSED PrintWindow rejected"); _quit = true; break; }
                         }
                         graphics.Clear(Color.Black);
-                        double fit = Math.Min(width/(double)ww, height/(double)wh);
+                        double fit = Math.Min(outputWidth/(double)ww, outputHeight/(double)wh);
                         int dw = Math.Max(1, (int)Math.Round(ww*fit)), dh = Math.Max(1, (int)Math.Round(wh*fit));
-                        graphics.DrawImage(windowBitmap, (width-dw)/2, (height-dh)/2, dw, dh);
+                        graphics.DrawImage(windowBitmap, (outputWidth-dw)/2, (outputHeight-dh)/2, dw, dh);
                     }
                     ok = true;
                 }
@@ -325,29 +399,14 @@ internal static class Grabber
 
                 if (ok)
                 {
-                    try
-                    {
-                        buffer.SetLength(0);
-                        if (outputBitmap != null) { outputGraphics.DrawImage(bitmap, 0, 0, outputWidth, outputHeight); outputBitmap.Save(buffer, jpegCodec, encoderParams); }
-                        else bitmap.Save(buffer, jpegCodec, encoderParams);
-                        WriteFrame(buffer.ToArray(), qpc);
-                        frames++;
-                    }
-                    catch (IOException)
-                    {
-                        // 管道关闭：父进程退出
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        failures++;
-                        if (failures <= 3) Log("ENCODE_ERROR " + ex.GetType().Name + ": " + ex.Message);
-                    }
+                    surface.Qpc = qpc;
+                    lock (queueLock) ready.Enqueue(surface);
+                    available.Set();
                 }
+                else { lock (queueLock) free.Enqueue(surface); }
 
                 if (probe)
                 {
-                    Log("PROBE_DONE frames=" + frames);
                     break;
                 }
 
@@ -362,17 +421,22 @@ internal static class Grabber
         }
         finally
         {
+            lock (queueLock) captureDone = true;
+            available.Set();
+            encoder.Join(1500);
             if (windowBitmap != null) windowBitmap.Dispose();
-            if (outputGraphics != null) outputGraphics.Dispose();
-            if (outputBitmap != null) outputBitmap.Dispose();
+            if (desktopDC != IntPtr.Zero) ReleaseDC(IntPtr.Zero, desktopDC);
             timeEndPeriod(1);
-            try { graphics.Dispose(); } catch { }
-            try { bitmap.Dispose(); } catch { }
-            try { buffer.Dispose(); } catch { }
-            try { encoderParams.Dispose(); } catch { }
+            // A blocked stdout is terminated with the process; never dispose a
+            // bitmap while the background encoder is still inside GDI+.
+            if (!encoder.IsAlive) {
+                foreach (Surface item in surfaces) item.Dispose();
+                available.Dispose(); encoderParams.Dispose();
+            }
         }
 
-        Log("DONE frames=" + frames + " failures=" + failures);
+        if (probe) Log("PROBE_DONE frames=" + frames);
+        Log("DONE frames=" + frames + " failures=" + failures + " poolMisses=" + poolMisses);
         return failures > 0 && frames == 0 ? 4 : 0;
     }
 }

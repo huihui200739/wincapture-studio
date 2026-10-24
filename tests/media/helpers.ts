@@ -38,8 +38,16 @@ export class Fake2DContext {
   fillStyle: any = '#000';
   strokeStyle: any = '#000';
   lineWidth = 1;
-  filter = 'none';
   globalAlpha = 1;
+  private _filter = 'none';
+  /** filter 赋值会被记录，便于断言「真正的模糊」确实应用了高斯滤镜 */
+  get filter(): string {
+    return this._filter;
+  }
+  set filter(value: string) {
+    this._filter = value;
+    this.push('filter', value);
+  }
   font = '10px sans-serif';
   textBaseline = 'alphabetic';
   imageSmoothingEnabled = true;
@@ -97,6 +105,9 @@ export class Fake2DContext {
   }
   fillRect(...args: any[]): void {
     this.push('fillRect', ...args, this.fillStyle);
+  }
+  clearRect(...args: any[]): void {
+    this.push('clearRect', ...args);
   }
   strokeRect(...args: any[]): void {
     this.push('strokeRect', ...args);

@@ -8,6 +8,7 @@ it('maps modern frame timestamps to native QPC and reports source loss once', ()
   source.onFrame(frame => frames.push(frame.qpc)); source.onExit(() => exits++);
   source.accept({ jpeg: new Uint8Array([255, 216, 255, 217]), wallTimeMs: 1033 });
   source.accept({ jpeg: new Uint8Array([255]), wallTimeMs: 1040 });
+  source.accept({ jpeg: new Uint8Array([0, 0, 0, 0]), wallTimeMs: 1050 });
   source.accept({ ended: true }); source.accept({ error: 'closed' });
   expect(frames).toEqual([100_330_000n]); expect(exits).toBe(1);
 });

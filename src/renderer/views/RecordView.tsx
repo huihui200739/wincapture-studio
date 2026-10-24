@@ -853,6 +853,11 @@ export function RecordView() {
           <Panel title="采集方式" icon="settings">
             <Select ariaLabel="采集方式" value={config.backend ?? 'auto'} onChange={next => updateConfig({ backend: next as 'auto' | 'wgc' | 'compatibility' })}
               options={[{ value: 'auto', label: '自动：优先现代采集，失败后兼容回退' }, { value: 'wgc', label: '现代采集 · Chromium / WGC' }, { value: 'compatibility', label: '兼容采集 · GDI / PrintWindow' }]} />
+            {config.backend !== 'wgc' && <Field label="兼容采集缩放" hint="仅改变缩放采样方式，不影响输出尺寸。帧率优先可能让文字边缘出现锯齿。">
+              <Select ariaLabel="兼容采集缩放" value={config.scaling ?? 'quality'}
+                onChange={next => updateConfig({ scaling: next as 'quality' | 'performance' })}
+                options={[{ value: 'quality', label: '清晰优先' }, { value: 'performance', label: '帧率优先' }]} />
+            </Field>}
           </Panel>
           {/* ---- 录制区域（R01）：只在整屏来源上可用 ---- */}
           {selectedSource?.kind === 'screen' && (
@@ -1015,7 +1020,7 @@ export function RecordView() {
                     <>
                       <canvas ref={cameraRef} width={480} height={360} aria-label="摄像头实时预览" />
                       <div className="camera-preview-overlay">
-                        {/* 这里是合成示意画面：真开摄像头会占用设备，录制时独立采集窗口就打不开了 */}
+                        {/* 正式预览与录制共用摄像头连接；示例模式使用合成画面。 */}
                         <Badge tone={cameraPreviewError ? 'warn' : 'neutral'} icon="camera">{apiMode === 'mock' ? '示例画面' : cameraPreviewError ? '摄像头不可用' : '实时取景'}</Badge>
                       </div>
                     </>
@@ -1126,9 +1131,15 @@ export function RecordView() {
                     <td>{effectiveResolution}</td>
                   </tr>
                   <tr>
-                    <td>帧率</td>
+                    <td>输出帧率</td>
                     <td>{quality.fps} fps</td>
                     <td>{capture?.effective ? `${capture.effective.fps} fps` : '开始录制后确认'}</td>
+                  </tr>
+                  <tr>
+                    <td>平均采集帧率</td>
+                    <td>按实际到达帧统计</td>
+                    <td>{capture && capture.mediaTick >= 10_000_000
+                      ? `${(capture.framesArrived * 10_000_000 / capture.mediaTick).toFixed(1)} fps` : '录制满 1 秒后统计'}</td>
                   </tr>
                   <tr>
                     <td>视频编码</td>

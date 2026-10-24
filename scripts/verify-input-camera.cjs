@@ -52,9 +52,13 @@ async function pointerProbe(win) {
 
 async function cameraProbe() {
   const { mb } = CameraProbe;
-  const source = document.createElement('canvas'); source.width = 320; source.height = 180;
+  const source = document.createElement('canvas'); source.width = 2560; source.height = 1440;
   const context = source.getContext('2d'); let color = 'red';
-  const paint = () => { context.fillStyle = color; context.fillRect(0, 0, 320, 180); };
+  const paint = () => { context.fillStyle = color; context.fillRect(0, 0, source.width, source.height); };
+  const OriginalFrame = window.VideoFrame; let maxWidth = 0, maxHeight = 0;
+  window.VideoFrame = new Proxy(OriginalFrame, { construct(target, args) {
+    const frame = Reflect.construct(target, args); maxWidth = Math.max(maxWidth, frame.displayWidth); maxHeight = Math.max(maxHeight, frame.displayHeight); return frame;
+  } });
   paint(); const stream = source.captureStream(30); const timer = setInterval(paint, 30);
   Object.defineProperty(navigator.mediaDevices, 'getUserMedia', { value: async () => stream, configurable: true });
   const camera = window.__wcsCamera;
@@ -86,8 +90,12 @@ async function cameraProbe() {
         output.push({ segment: index + 1, frames: stats.packetCount, duration: await input.computeDuration(), samples });
       } finally { input.dispose(); }
     }
-    return { controlledMediaStream: true, pauseExcluded: true, stopDoesNotRecapture: true, segments: output };
-  } finally { clearInterval(timer); await camera.close(); }
+    if (maxWidth !== 1280 || maxHeight > 720) throw new Error('Camera retained oversized frames: ' + JSON.stringify({maxWidth,maxHeight}));
+    clock('recording', 0); color = 'red'; await sleep(180); clock('stopped', 1_800_000);
+    const expired = await camera.encodeSegment({ index: 3, startTick: 100_000_000, durationTicks: 8_000_000, fps: 30, width: 320, height: 180 });
+    if (expired.ok || !expired.error.includes('过期')) throw new Error('Stale camera frames accepted');
+    return { controlledMediaStream: true, pauseExcluded: true, stopDoesNotRecapture: true, oversizedSourceBounded: {maxWidth,maxHeight}, staleFramesRejected: true, segments: output };
+  } finally { clearInterval(timer); await camera.close(); window.VideoFrame = OriginalFrame; }
 }
 
 app.whenReady().then(async () => {

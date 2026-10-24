@@ -15,6 +15,7 @@
  */
 
 import { ContinuousMuxer } from './encode';
+import { PitchPreservingStretcher } from './timeStretch';
 import { drawScene } from './compositor';
 import type { SceneResources } from './compositor';
 import { evaluateScene } from '../domain/scene';
@@ -421,6 +422,10 @@ function intrinsicSize(source: CanvasImageSource): { width: number; height: numb
  *
  * rate 是播放速度倍数：rate=2 表示源 10s 压成 5s，输出第 k 个采样对应源 k×2 处。
  * 越界部分留 0（解码不足时宁可有极短静音，也不读越界内存）。
+ *
+ * 注意：**这是会变音高的重采样**，等价于改变播放采样率，已不再用于变速导出/试听
+ * ——那条路径改走 `PitchPreservingStretcher`（WSOLA，保持音调）。
+ * 保留本函数只是因为它仍被单测与少量一次性工具覆盖。
  */
 export function resampleAudioChannels(
   channels: readonly Float32Array[],
@@ -460,6 +465,16 @@ export class TimelineAudioMixer {
   private addedSamples = 0;
   private readonly sampleRate: number;
   private readonly channels: number;
+  /**
+   * clipId → 保持音调的拉伸器与其源游标。
+   *
+   * WSOLA 是有状态的：跨块必须沿用同一个波形相位，否则每 85ms（AUDIO_CHUNK_SAMPLES）
+   * 就会在块边界出现一次相位跳变，听感是规律的「咔哒」声。
+   */
+  private readonly stretchers = new Map<
+    string,
+    { rate: number; stretcher: PitchPreservingStretcher; cursor: number; nextSample: number }
+  >();
 
   constructor(
     private readonly plan: ExportPlan,
@@ -574,7 +589,8 @@ export class TimelineAudioMixer {
   }
 
   /** 取某个音频区间在输出采样 [a, b) 对应的源 PCM，并对齐到该区间起点。 */
-  private async decodeInterval(    provider: FrameProvider,
+  private async decodeInterval(
+    provider: FrameProvider,
     interval: AudioMixInterval,
     a: number,
     b: number,
@@ -583,7 +599,9 @@ export class TimelineAudioMixer {
     const sr = this.sampleRate;
     const timelineStartTick = Math.round((a * TICKS_PER_SECOND) / sr);
     const timelineEndTick = Math.round((b * TICKS_PER_SECOND) / sr);
-    const rate = this.clipRate.get(interval.clipId) ?? 1;
+    // clipRate 由工程片段补齐（音频与画面共用同一条时间映射）；
+    // 计划里也带了一份数值 rate，两者一致，缺失时互为兜底。
+    const rate = this.clipRate.get(interval.clipId) ?? interval.rate ?? 1;
     const sourceStart =
       interval.source.start + Math.round((timelineStartTick - interval.timeline.start) * rate);
     const sourceEnd =
@@ -593,6 +611,11 @@ export class TimelineAudioMixer {
       end: Math.min(interval.source.end, Math.max(sourceStart + 1, sourceEnd)),
     };
     if (range.end <= range.start) return null;
+
+    // 变速：走保持音调的时间拉伸，而不是重采样（重采样会同步改变音高）。
+    if (Math.abs(rate - 1) > 1e-6) {
+      return this.decodeStretched(provider, interval, a, b, channels, rate);
+    }
 
     let decoded: DecodedAudio | null = null;
     try {
@@ -606,19 +629,6 @@ export class TimelineAudioMixer {
       return null;
     }
     if (!decoded || decoded.frameCount <= 0) return null;
-
-    // 变速片段：解码得到的是「源时长」的采样（输出时长 × rate），
-    // 必须按 rate 重采样成输出采样数，否则 rate>1 会写到片段结束之后、
-    // rate<1 则每块只填前 rate 比例（听感是周期性断音）。
-    // 当前 UI 尚未暴露变速，但领域模型与导出计划都支持，属「一启用就必须正确」的路径。
-    if (Math.abs(rate - 1) > 1e-6) {
-      const outCount = Math.max(0, b - a);
-      decoded = {
-        ...decoded,
-        channels: resampleAudioChannels(decoded.channels, outCount, rate),
-        frameCount: outCount,
-      };
-    }
 
     // 解码结果按采样网格对齐；把它的源起点换算成相对本区间起点的输出采样偏移
     const offset = Math.round(
@@ -636,6 +646,89 @@ export class TimelineAudioMixer {
       return dst;
     });
     return { ...decoded, channels: shifted };
+  }
+
+  /**
+   * 变速片段的解码：按 WSOLA 做保持音调的时间拉伸。
+   *
+   * 与恒速路径不同，这里不能「每块按 range 取一次就够」——OLA 需要
+   * frameSize − analysisHop 个源采样的前瞻才能凑齐一个分析帧，放慢时首次取源
+   * 必须多取一段（primerSamples），否则每块都会少产出、在块边界留下周期性静音。
+   * 所以改为「按需续取」：源游标只前进不回退，直到拉伸器能凑够本块所需输出。
+   */
+  private async decodeStretched(
+    provider: FrameProvider,
+    interval: AudioMixInterval,
+    a: number,
+    b: number,
+    channels: number,
+    rate: number,
+  ): Promise<DecodedAudio | null> {
+    const sr = this.sampleRate;
+    const needed = Math.max(0, b - a);
+    if (needed <= 0) return null;
+    const sourceStartTick = interval.source.start + Math.round((a - interval.sampleStart) * TICKS_PER_SECOND / sr * rate);
+    const state = this.stretcherFor(interval.clipId, channels, rate, sourceStartTick, a);
+    const { stretcher } = state;
+    let guard = 0;
+    while (stretcher.available < needed && guard++ < 64) {
+      if (state.cursor >= interval.source.end) break;
+      // WSOLA needs a complete analysis window and search margin, beyond the
+      // nominal source range. Fetching one extra tick can stall on sample rounding.
+      const missing = needed - stretcher.available;
+      const readFrames = Math.ceil(missing * rate) + stretcher.layout.frameSize + 2 * stretcher.layout.search;
+      const wantEnd = Math.min(interval.source.end, state.cursor + Math.ceil(readFrames * TICKS_PER_SECOND / sr));
+      if (wantEnd <= state.cursor) break;
+      let decoded: DecodedAudio | null = null;
+      try {
+        decoded = await provider.getAudioAt!({ start: state.cursor, end: wantEnd }, { channels });
+      } catch (error) {
+        this.warnOnce(
+          `audio-decode-failed:${interval.clipId}`,
+          `音频片段 ${interval.clipId} 解码失败（${error instanceof Error ? error.message : String(error)}），对应区间已按静音导出。`,
+        );
+        return null;
+      }
+      if (!decoded || decoded.frameCount <= 0) break;
+      stretcher.push(decoded.channels, decoded.frameCount);
+      // 游标按「实际拿到的采样数」推进，而不是按请求的 tick 数：
+      // 解码器按 AAC 粒度对齐时返回的会少于请求量，按请求推进会跳过未取到的采样。
+      const advanced = Math.max(1, Math.round((decoded.frameCount * TICKS_PER_SECOND) / sr));
+      state.cursor = Math.min(wantEnd, state.cursor + advanced);
+      if (state.cursor >= interval.source.end) break;
+    }
+    if (state.cursor >= interval.source.end) stretcher.markEnd();
+    const out = stretcher.produce(needed);
+    state.nextSample = b;
+    return {
+      channels: out,
+      sampleRate: sr,
+      startTick: interval.source.start,
+      frameCount: needed,
+      hasData: true,
+    };
+  }
+
+  /** 每个片段一个拉伸器：跨块保持波形连续，速率变化或游标回退时重建。 */
+  private stretcherFor(
+    clipId: string,
+    channels: number,
+    rate: number,
+    sourceStart: number,
+    timelineSample: number,
+  ): { stretcher: PitchPreservingStretcher; cursor: number; nextSample: number } {
+    const existing = this.stretchers.get(clipId);
+    if (existing && Math.abs(existing.rate - rate) <= 1e-9 && existing.nextSample === timelineSample) {
+      return existing;
+    }
+    const created = {
+      rate,
+      stretcher: new PitchPreservingStretcher(this.sampleRate, channels, rate),
+      cursor: sourceStart,
+      nextSample: timelineSample,
+    };
+    this.stretchers.set(clipId, created);
+    return created;
   }
 }
 

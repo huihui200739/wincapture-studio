@@ -2,8 +2,8 @@
  * 性能基准探针（§16.2）——真机测量，结果写 dist/verify/perf-result.json
  *
  * 由主进程在 WCS_PERF_PROBE=1 时调用。测量项：
- *  1. 首次有效画面延迟（start 返回 → 第一段已提交）
- *  2. 处理超时丢帧率（期望帧 vs 实际编码帧）
+ *  1. 首次有效画面延迟（启动 → 首帧到达）
+ *  2. 实际采集帧缺失率与输出时间槽缺失率（重复补帧不能冒充源帧）
  *  3. 音画偏差（视频总时长 vs 音频总时长）
  *  4. 1080p 导出是否快于实时
  *  5. 工作集内存峰值
@@ -137,6 +137,7 @@ export async function runPerfProbe(deps: PerfProbeDeps, seconds = 20): Promise<P
       cameraEnabled: false,
       countdownSeconds: 0,
       testMode: true,
+      scaling: process.env.WCS_PERF_SCALING === 'performance' ? 'performance' : 'quality',
     };
 
     const projectPath = deps.newProjectPath(`性能基准 ${Date.now()}`);
@@ -163,7 +164,7 @@ export async function runPerfProbe(deps: PerfProbeDeps, seconds = 20): Promise<P
         lower('首次有效画面延迟', Math.round(firstFrameMs), 'ms', 2000, '从 start 到采集进程产出第一帧'),
       );
     } else {
-      report.samples.push(info('首次有效画面延迟', -1, 'ms', '15 秒内未采到任何帧'));
+      report.samples.push(lower('首次有效画面延迟', 15000, 'ms', 2000, '15 秒内未采到任何帧'));
     }
 
     // ---- 2. 录制到目标时长，期间采样内存 ----
@@ -178,7 +179,6 @@ export async function runPerfProbe(deps: PerfProbeDeps, seconds = 20): Promise<P
     const recordDeadline = recordStartedAt + seconds * 1000;
     let capturedFrames = 0;
     while (true) {
-      const elapsed = performance.now() - recordStartedAt;
       const now = deps.treeWorkingSetBytes();
       if (now > memPeak) memPeak = now;
       memSamples.push(now);
@@ -192,6 +192,7 @@ export async function runPerfProbe(deps: PerfProbeDeps, seconds = 20): Promise<P
     const actualRecordMs = performance.now() - recordStartedAt;
 
     const stopped = await deps.stopCapture();
+    capturedFrames = Math.max(capturedFrames, deps.getStatus()?.framesArrived ?? 0);
 
     // ---- 3. 丢帧率 ----
     // 文档定义：「使用含帧序号的 60 帧动态测试源，处理超时丢帧不高于 0.5%」。
@@ -216,22 +217,25 @@ export async function runPerfProbe(deps: PerfProbeDeps, seconds = 20): Promise<P
     }
 
     const framesArrived = capturedFrames;
+    report.samples.push(higher('有效视频帧', actualFrames, '帧', 1));
 
     if (videoSeconds > 0) {
-      // 期望帧数按「成片时长 × fps」算，而不是「探针设定的秒数 × fps」。
-      // 成片时长是引擎实际交付的时长，用它做基准才是「编码链路有没有丢帧」的正确口径；
-      // 探针墙钟时长只用于记录「录制是否覆盖了目标时长」这一独立指标。
+      // Missing capture frames and missing output time slots are different metrics.
+      // Repeated frames can fill the output slots but cannot prove real capture FPS.
       const expectedFrames = Math.round(videoSeconds * fps);
       const dropRate = expectedFrames > 0 ? (Math.max(0, expectedFrames - actualFrames) / expectedFrames) * 100 : 0;
       report.samples.push(
         lower(
-          '处理超时丢帧率',
+          '输出时间槽缺失率',
           Number(dropRate.toFixed(3)),
           '%',
           0.5,
           `成片 ${actualFrames} 帧 / 期望 ${expectedFrames} 帧；采集层到达 ${framesArrived} 帧`,
         ),
       );
+      const captureLoss = expectedFrames > 0 ? Math.max(0, expectedFrames - framesArrived) / expectedFrames * 100 : 100;
+      report.samples.push(lower('采集帧缺失率', Number(captureLoss.toFixed(3)), '%', 0.5,
+        `源回调 ${framesArrived} 帧 / 时间槽 ${expectedFrames} 帧；不能把重复补帧算作采集帧。静态桌面结果不是动态源验收。`));
       const captureFps = videoSeconds > 0 ? framesArrived / videoSeconds : 0;
       report.samples.push(
         info('采集实际帧率', Number(captureFps.toFixed(2)), 'fps', `目标 ${fps} fps`),
@@ -278,7 +282,7 @@ export async function runPerfProbe(deps: PerfProbeDeps, seconds = 20): Promise<P
     // ---- 6. 内存 ----
     const memAfter = deps.treeWorkingSetBytes();
     report.samples.push(
-      lower('录制工作集峰值', Number((memPeak / 1024 / 1024).toFixed(1)), 'MB', 1228, '1080p 录制，进程树合计'),
+      lower('录制工作集峰值', Number((memPeak / 1024 / 1024).toFixed(1)), 'MiB', 1228, '1080p 录制；Electron 与原生采集进程工作集合计，500ms 采样'),
     );
     report.samples.push(
       info(
@@ -304,7 +308,7 @@ export async function runPerfProbe(deps: PerfProbeDeps, seconds = 20): Promise<P
         ),
       );
     } else {
-      report.samples.push(info('1080p 导出速度', 0, '× 实时', '导出失败，未计入判定'));
+      report.samples.push(higher('1080p 导出速度', 0, '× 实时', 1, '导出失败'));
     }
 
     report.samples.push(info('实际录制时长', Number(videoSeconds.toFixed(2)), 's', `目标 ${seconds}s`));

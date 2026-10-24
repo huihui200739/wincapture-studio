@@ -368,7 +368,7 @@ function ClipTab({
         ) : (
           <>
             {selectedClip.track.kind === 'primaryVideo' && (
-              <Field label="播放速度" htmlFor="clip-speed" hint="画面、关联音频和摄像头同步变速，后续片段自动衔接。音调会随速度变化。">
+              <Field label="播放速度" htmlFor="clip-speed" hint="画面、关联音频和摄像头同步变速，后续片段自动衔接。音频用时间拉伸保持音调，不会变尖或变闷。">
                 <select id="clip-speed" className="wcs-select" aria-label="播放速度"
                   value={selectedClip.clip.rate.num / selectedClip.clip.rate.den}
                   onChange={(event) => execute({ kind: 'SetClipRate', clipId: selectedClip.clip.id,
@@ -965,7 +965,8 @@ function PrivacyTab({
               />
             </Field>
             <p className="wcs-field-hint">
-              高敏感信息建议用实色：模糊与马赛克只是视觉样式，不保证不可恢复。
+              模糊与马赛克对源像素真正执行模糊/像素化，细节已不可还原；但仍有轮廓与色彩可辨。
+              高敏感信息请用实色——那是唯一完全不透明的遮挡。
             </p>
           </div>
 

@@ -107,6 +107,168 @@ function parseBackground(
   ctx.fillRect(0, 0, width, height);
 }
 
+/** 马赛克块边长（输出像素）。越小越接近原图，越大越不可辨。 */
+const MOSAIC_BLOCK_PX = 14;
+/** 模糊降采样倍数：先缩到 1/N 再用双线性放大，配合 ctx.filter 得到真正的模糊。 */
+const BLUR_DOWNSCALE = 5;
+/** 模糊半径占遮挡区短边的比例（外加一个固定的最小可见半径）。 */
+const BLUR_RADIUS_RATIO = 0.03;
+const BLUR_RADIUS_MIN = 6;
+const BLUR_RADIUS_MAX = 48;
+
+/** 离屏画布与其 2D 上下文。两种宿主类型在取样/绘制上用法一致。 */
+interface ScratchCanvas {
+  canvas: CanvasImageSource & { width: number; height: number };
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+}
+
+/** 取样用的整块区域缓存（每帧尺寸基本不变，命中率很高）。 */
+let scratchSource: ScratchCanvas | null = null;
+/** 降采样用的小画布缓存。 */
+let scratchReduced: ScratchCanvas | null = null;
+
+/**
+ * 创建（或复用）一块离屏画布。
+ *
+ * 返回 null 表示当前环境没有任何可用的离屏画布（部分沙箱化的 Worker、
+ * 关闭了 OffscreenCanvas 的旧版运行时）。调用方必须据此回退到不透明遮盖，
+ * 绝不能把未处理的原画面留在成片里。
+ */
+function scratchCanvas(slot: 'source' | 'reduced', width: number, height: number): ScratchCanvas | null {
+  const w = Math.max(1, Math.round(width));
+  const h = Math.max(1, Math.round(height));
+  const cached = slot === 'source' ? scratchSource : scratchReduced;
+  if (cached && cached.canvas.width === w && cached.canvas.height === h) return cached;
+
+  const scope = globalThis as unknown as {
+    OffscreenCanvas?: new (w: number, h: number) => { width: number; height: number; getContext(id: string): unknown };
+    document?: { createElement(tag: string): { width: number; height: number; getContext(id: string): unknown } };
+  };
+  let created: ScratchCanvas | null = null;
+  try {
+    const Ctor = scope.OffscreenCanvas;
+    if (typeof Ctor === 'function') {
+      const canvas = new Ctor(w, h);
+      const ctx = canvas.getContext('2d') as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
+      if (ctx) created = { canvas: canvas as unknown as ScratchCanvas['canvas'], ctx };
+    }
+  } catch {
+    created = null;
+  }
+  if (!created) {
+    try {
+      const doc = scope.document;
+      if (doc && typeof doc.createElement === 'function') {
+        const canvas = doc.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d') as CanvasRenderingContext2D | null;
+        if (ctx) created = { canvas: canvas as unknown as ScratchCanvas['canvas'], ctx };
+      }
+    } catch {
+      created = null;
+    }
+  }
+  if (!created) return null;
+  if (slot === 'source') scratchSource = created;
+  else scratchReduced = created;
+  return created;
+}
+
+/**
+ * 对**已经画好的源画面**执行真正的模糊 / 像素化。
+ *
+ * 旧实现只是在遮挡区上盖一层深色半透明矩形：看起来是「模糊」，实际成片里
+ * 源像素原封不动地留在下面，任何截图放大都能还原。这里改为：
+ *   1. 把遮挡区（含模糊所需的少量外扩边距）取样到离屏画布；
+ *   2. 降采样到 1/N —— 这一步就已经不可逆地丢掉了细节（马赛克 N 更大）；
+ *   3. 放大回原尺寸：马赛克关掉插值得到硬边色块，模糊开插值并叠加 ctx.filter
+ *      的高斯模糊得到柔和效果；
+ *   4. 全程裁剪在遮挡矩形内，不会把遮挡区外的画面「吸」进来。
+ *
+ * 只用 drawImage 取样、不用 getImageData：后者在画布被跨源内容污染时会抛
+ * SecurityError，遮挡失败比遮挡不好更严重。
+ *
+ * @returns 是否成功执行了像素处理；false 表示调用方必须回退到不透明遮盖。
+ */
+function obfuscatePixels(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  area: { x: number; y: number; width: number; height: number },
+  style: 'blur' | 'mosaic',
+): boolean {
+  const host = ctx as unknown as { canvas?: { width?: number; height?: number } };
+  const canvasWidth = Math.floor(host.canvas?.width ?? 0);
+  const canvasHeight = Math.floor(host.canvas?.height ?? 0);
+  if (canvasWidth <= 0 || canvasHeight <= 0) return false;
+
+  // 遮挡区可能部分落在画布外（运镜取景把源裁到画面外时），按画布裁剪
+  const x0 = Math.max(0, Math.floor(area.x));
+  const y0 = Math.max(0, Math.floor(area.y));
+  const x1 = Math.min(canvasWidth, Math.ceil(area.x + area.width));
+  const y1 = Math.min(canvasHeight, Math.ceil(area.y + area.height));
+  const w = x1 - x0;
+  const h = y1 - y0;
+  // 2px 以下的处理只会引入锯齿，直接跳过让上层回退到实色
+  if (w < 2 || h < 2) return false;
+
+  const shortSide = Math.min(w, h);
+  const radius = Math.min(BLUR_RADIUS_MAX, Math.max(BLUR_RADIUS_MIN, shortSide * BLUR_RADIUS_RATIO));
+  // 模糊需要从遮挡区外多取一圈像素，否则边缘会因为高斯核采样到透明而发灰
+  const margin = style === 'blur' ? Math.ceil(radius * 3) : 0;
+  const sx = Math.max(0, x0 - margin);
+  const sy = Math.max(0, y0 - margin);
+  const sw = Math.min(canvasWidth, x1 + margin) - sx;
+  const sh = Math.min(canvasHeight, y1 + margin) - sy;
+  if (sw < 2 || sh < 2) return false;
+
+  const source = scratchCanvas('source', sw, sh);
+  if (!source) return false;
+  const factor = style === 'mosaic' ? MOSAIC_BLOCK_PX : BLUR_DOWNSCALE;
+  const bw = Math.max(1, Math.round(sw / factor));
+  const bh = Math.max(1, Math.round(sh / factor));
+  const reduced = scratchCanvas('reduced', bw, bh);
+  if (!reduced) return false;
+
+  try {
+    source.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    source.ctx.imageSmoothingEnabled = true;
+    source.ctx.imageSmoothingQuality = 'high';
+    source.ctx.clearRect(0, 0, sw, sh);
+    source.ctx.drawImage(host.canvas as CanvasImageSource, sx, sy, sw, sh, 0, 0, sw, sh);
+
+    reduced.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    reduced.ctx.imageSmoothingEnabled = true;
+    reduced.ctx.imageSmoothingQuality = 'high';
+    reduced.ctx.clearRect(0, 0, bw, bh);
+    // Preserve the sampled margin through filtering; clipping happens on output.
+    reduced.ctx.drawImage(source.canvas, 0, 0, sw, sh, 0, 0, bw, bh);
+  } catch {
+    // 取样失败（画布被销毁、GPU 上下文丢失）：交给上层回退到实色遮盖
+    return false;
+  }
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x0, y0, w, h);
+  ctx.clip();
+  // Gaussian edges contain alpha. Replace underlying detail before compositing,
+  // including masks touching a canvas edge where no outer margin is available.
+  ctx.fillStyle = '#15171b';
+  ctx.fillRect(x0, y0, w, h);
+  if (style === 'mosaic') {
+    // 关掉插值 → 每个色块是原区域的均值，放大后就是真正的马赛克
+    ctx.imageSmoothingEnabled = false;
+  } else {
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    // filter 不是所有运行时都支持；不支持时仅靠降采样放大也已经破坏了细节
+    if ('filter' in ctx) ctx.filter = `blur(${radius.toFixed(1)}px)`;
+  }
+  ctx.drawImage(reduced.canvas, 0, 0, bw, bh, sx, sy, sw, sh);
+  ctx.restore();
+  return true;
+}
+
 /** 源坐标遮挡在输出画布上的像素矩形（含运镜取景变换）。 */
 export function mapSourceRectToScreen(
   rect: NormalizedRect,
@@ -128,6 +290,12 @@ export function mapSourceRectToScreen(
  *
  * 这是遮挡唯一的绘制入口：导出、预览与教程截图都经过 drawScene → 本函数，
  * 不存在「某一产物旁路取原帧」的分支。
+ *
+ * 三种样式（§12.2）：
+ * - solid：不透明实色，唯一「确认可用」的遮挡，高敏感信息应优先使用；
+ * - blur / mosaic：对**源像素本身**执行模糊 / 像素化（见 obfuscatePixels），
+ *   不再只是盖一层深色。若取样环境不可用则回退为不透明遮盖——
+ *   宁可变成黑块，也不能因滤镜失败把原画面原样留在成片里。
  */
 export function drawScreenPrivacy(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
@@ -143,15 +311,13 @@ export function drawScreenPrivacy(
       // 高敏感信息优先使用不透明实色覆盖（§12.2）
       ctx.fillStyle = '#000000';
       ctx.fillRect(px.x, px.y, px.width, px.height);
-    } else if (privacy.style === 'blur') {
-      // 注意：模糊与马赛克按文档只是视觉样式，不作为不可恢复保证（§12.2）。
-      ctx.filter = 'blur(16px)';
-      ctx.fillStyle = 'rgba(0,0,0,0.88)';
-      ctx.fillRect(px.x, px.y, px.width, px.height);
-      ctx.filter = 'none';
-    } else {
-      // 马赛克：深色底 + 网格线，保证既不透明也能看出「已遮挡」
-      ctx.fillStyle = 'rgba(24,24,24,0.94)';
+    } else if (privacy.style === 'blur' || privacy.style === 'mosaic') {
+      if (obfuscatePixels(ctx, px, privacy.style)) {
+        ctx.restore();
+        continue;
+      }
+      // 取样不可用：退回不透明遮盖（仍然要能看出「已遮挡」）
+      ctx.fillStyle = '#15171b';
       ctx.fillRect(px.x, px.y, px.width, px.height);
       ctx.strokeStyle = 'rgba(255,255,255,0.10)';
       ctx.lineWidth = 1;

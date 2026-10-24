@@ -58,10 +58,11 @@ const frameBuffer = new CameraFrameBuffer<VideoFrame>(120);
 let mediaClock: CameraMediaClock | null = null;
 let frameCallback = 0;
 let lastFrameTick = -Infinity;
+let sampleCanvas: OffscreenCanvas | null = null;
 
 function setClock(clock: CameraMediaClock): void {
   if (clock.state === 'recording' && clock.mediaTick === 0) { frameBuffer.clear(); lastFrameTick = -Infinity; }
-  if (clock.state !== 'recording') frameBuffer.trimFrom(clock.mediaTick);
+  if (clock.state !== 'recording') { frameBuffer.trimFrom(clock.mediaTick); lastFrameTick = Math.min(lastFrameTick, clock.mediaTick - 250_000); }
   mediaClock = clock;
 }
 
@@ -69,12 +70,22 @@ function startFrameSampling(): void {
   if (!video) return;
   const sample = () => {
     if (!video || !stream) return;
-    if (mediaClock?.state === 'recording' && video.readyState >= 2) {
+    try { if (mediaClock?.state === 'recording' && video.readyState >= 2) {
       const tick = Math.round(mediaClock.mediaTick + (performance.timeOrigin + performance.now() - mediaClock.wallTimeMs) * 10_000);
       if (tick >= 0 && tick - lastFrameTick >= 250_000) {
-        frameBuffer.push(tick, new VideoFrame(video, { timestamp: Math.round(tick / 10) })); lastFrameTick = tick;
+        let source: HTMLVideoElement | OffscreenCanvas = video;
+        // Some drivers ignore ideal constraints and deliver 4K frames. Bound the
+        // live frame surfaces before retaining up to four seconds in the buffer.
+        if (video.videoWidth > 1280 || video.videoHeight > 720) {
+          const scale = Math.min(1280 / video.videoWidth, 720 / video.videoHeight);
+          const width = Math.max(2, Math.floor(video.videoWidth * scale / 2) * 2), height = Math.max(2, Math.floor(video.videoHeight * scale / 2) * 2);
+          sampleCanvas ??= new OffscreenCanvas(width, height);
+          if (sampleCanvas.width !== width || sampleCanvas.height !== height) { sampleCanvas.width = width; sampleCanvas.height = height; }
+          sampleCanvas.getContext('2d')!.drawImage(video, 0, 0, width, height); source = sampleCanvas;
+        }
+        frameBuffer.push(tick, new VideoFrame(source, { timestamp: Math.round(tick / 10) })); lastFrameTick = tick;
       }
-    }
+    } } catch { /* Transient driver/context failures must not cancel future frame callbacks. */ }
     frameCallback = video.requestVideoFrameCallback(sample);
   };
   frameCallback = video.requestVideoFrameCallback(sample);
@@ -202,6 +213,7 @@ async function open(deviceId?: string): Promise<{ ok: boolean; deviceId?: string
 async function close(): Promise<void> {
   if (video && frameCallback) video.cancelVideoFrameCallback(frameCallback);
   frameCallback = 0; mediaClock = null; frameBuffer.clear(); lastFrameTick = -Infinity;
+  if (sampleCanvas) { sampleCanvas.width = 0; sampleCanvas.height = 0; sampleCanvas = null; }
   if (video) {
     try {
       video.pause();
@@ -279,6 +291,9 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
     const start = request.startTick ?? 0;
     captured = frameBuffer.take(start, start + request.durationTicks);
     if (!captured.length) return { ok: false, error: '此时间段没有已采集的摄像头帧；不会用停止后的画面补录。' };
+    if (captured[0].tick - start > Math.max(1_000_000, 3 * 10_000_000 / fps) || captured.at(-1)!.tick < start - 1_000_000) {
+      return { ok: false, error: '摄像头采集已落后或缓冲帧已过期，此段跳过以免画中画显示错误时间的画面。' };
+    }
 
     encoder = new SegmentEncoder({
       width,

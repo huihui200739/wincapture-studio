@@ -13,6 +13,8 @@ import { QUALITY_PROFILES } from '@shared/ipc';
 
 /** 设置页可调的采集默认值（工程无关）。 */
 export interface CaptureDefaults {
+  backend?: CaptureConfig['backend'];
+  scaling?: CaptureConfig['scaling'];
   qualityId: string;
   countdownSeconds: number;
   systemAudioEnabled: boolean;
@@ -34,6 +36,8 @@ export const SETTINGS_STORAGE_KEY = 'wcs.renderer.settings.v1';
 const QUALITY_IDS = new Set(QUALITY_PROFILES.map((profile) => profile.id));
 
 export const DEFAULT_CAPTURE_DEFAULTS: CaptureDefaults = {
+  backend: 'auto',
+  scaling: 'quality',
   qualityId: '1080p30',
   countdownSeconds: 3,
   systemAudioEnabled: true,
@@ -88,6 +92,8 @@ export function normalizeCaptureDefaults(raw: unknown): CaptureDefaults {
     : DEFAULT_CAPTURE_DEFAULTS.countdownSeconds;
   return {
     qualityId,
+    backend: source.backend === 'wgc' || source.backend === 'compatibility' ? source.backend : 'auto',
+    scaling: source.scaling === 'performance' ? 'performance' : 'quality',
     countdownSeconds,
     systemAudioEnabled: boolOr(source.systemAudioEnabled, DEFAULT_CAPTURE_DEFAULTS.systemAudioEnabled),
     microphoneEnabled: boolOr(source.microphoneEnabled, DEFAULT_CAPTURE_DEFAULTS.microphoneEnabled),
@@ -146,6 +152,8 @@ export function captureConfigFromDefaults(defaults: CaptureDefaults): CaptureCon
   return {
     sourceId: '',
     sourceKind: 'screen',
+    backend: defaults.backend ?? 'auto',
+    scaling: defaults.scaling ?? 'quality',
     qualityId: profile.id,
     fps: { num: profile.fps, den: 1 },
     systemAudioEnabled: defaults.systemAudioEnabled,
@@ -157,6 +165,8 @@ export function captureConfigFromDefaults(defaults: CaptureDefaults): CaptureCon
 
 export function captureDefaultsOf(config: CaptureConfig): CaptureDefaults {
   return {
+    backend: config.backend ?? 'auto',
+    scaling: config.scaling ?? 'quality',
     qualityId: config.qualityId,
     countdownSeconds: config.countdownSeconds,
     systemAudioEnabled: config.systemAudioEnabled,
