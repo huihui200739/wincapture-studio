@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT } from './lib/local-temp.mjs';
+import { electronExecutable } from './lib/electron-runtime.mjs';
 
 const scriptArg = process.argv[2];
 if (!scriptArg) {
@@ -28,7 +29,7 @@ if (!fs.existsSync(scriptPath)) {
   process.exit(1);
 }
 
-const electronExe = path.join(ROOT, 'node_modules', 'electron', 'dist', process.platform === 'win32' ? 'electron.exe' : 'electron');
+const electronExe = electronExecutable();
 if (!fs.existsSync(electronExe)) {
   console.error('[electron] 找不到 Electron 可执行文件，请先 npm install');
   process.exit(1);

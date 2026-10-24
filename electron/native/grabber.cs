@@ -69,7 +69,7 @@ internal static class Grabber
             bmi.bmiHeader.biWidth = width;
             bmi.bmiHeader.biHeight = -height; // top-down，与 GDI+ 行序一致
             bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = bpp;
+            bmi.bmiHeader.biBitCount = (ushort)bpp;
             bmi.bmiHeader.biCompression = 0; // BI_RGB
             Dib = CreateDIBSection(referenceDc, bmi, 0, out Bits, IntPtr.Zero, 0);
             if (Dib == IntPtr.Zero || Bits == IntPtr.Zero) throw new Exception("CreateDIBSection failed (" + Marshal.GetLastWin32Error() + ")");

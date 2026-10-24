@@ -54,7 +54,7 @@ let activeDeviceId: string | null = null;
 /** 采集画布：摄像头原始帧先画到这里再编码，避免直接编码 VideoFrame 的尺寸差异 */
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
-const frameBuffer = new CameraFrameBuffer<VideoFrame>(120);
+const frameBuffer = new CameraFrameBuffer<VideoFrame>(120, frame => frame.clone());
 let mediaClock: CameraMediaClock | null = null;
 let frameCallback = 0;
 let lastFrameTick = -Infinity;
@@ -326,6 +326,12 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
       drawContext.drawImage(frame, (width - w) / 2, (height - h) / 2, w, h);
       await encoder.commitVideoFrame(i * frameStepUs);
       written++;
+      // WebCodecs/mediabunny may resolve each commit as a microtask. Yield a
+      // browser task while recording so requestVideoFrameCallback can keep
+      // sampling the next segment instead of losing its opening frames.
+      if (mediaClock?.state === 'recording' && i % 4 === 3) {
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+      }
       // Encode only frames captured within this screen segment's media-clock range.
     }
 

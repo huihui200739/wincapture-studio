@@ -18,7 +18,7 @@ Windows 录屏、非破坏性剪辑与图文教程制作工具。参考 [DogSC](
 - MP4（H.264/AAC）、M4A 纯音频、HTML/Markdown 教程导出；支持多画幅、720p–4K、30/60 FPS 输出。
 - 分段 MP4、独立 WAV、工程原子保存、自动保存、崩溃恢复与工程包导入导出。
 
-功能边界和未完成项目见 [当前状态](docs/status.md)。现代采集、物理点击送达和物理摄像头的设备验收尚有环境限制，不能视为所有硬件均已通过。
+功能边界和未完成项目见 [当前状态](docs/status.md)。本机内置摄像头的真实取景与编码已验证；多设备、拔插和长时间同步仍需复验，不能视为所有硬件均已通过。
 
 ## 运行
 
@@ -28,6 +28,8 @@ Windows 录屏、非破坏性剪辑与图文教程制作工具。参考 [DogSC](
 npm ci
 npm start
 ```
+
+Windows 启动器会将已安装的 Electron 运行时缓存到 `%LOCALAPPDATA%/WinCaptureStudio/runtime/`，源码和工程仍在原处。本机源码目录内的可执行文件触发 Windows 路径安全区域判定异常，曾导致摄像头已授权却报拒绝；从正常本地运行目录启动已恢复。首次启动需要复制一次运行时，不修改系统权限设置。
 
 npm run dev 启用界面热更新。受限环境可设置 WCS_USER_DATA 指定可写数据目录。录制工程为 .wcaproj 目录；清理缓存时请保留工程及其媒体文件。
 
@@ -46,6 +48,6 @@ npm run verify:capture-perf  # 编号动态图源，单独报告原生 30/60fps 
 npm run release             # 安装包、资源/归档检查、实际启动解压版
 ```
 
-安装包：release/WinCapture Studio-0.1.0-Setup.exe。测试结果和截图统一写入 dist/verify/，不再混入文档目录。验证口径、模块划分和设备复验见 [开发与验证](docs/testing.md)。
+安装包可用 `npm run release` 重新生成，产物为 release/WinCapture Studio-0.1.0-Setup.exe。测试结果和截图统一写入 dist/verify/，不再混入文档目录。验证口径、模块划分和设备复验见 [开发与验证](docs/testing.md)。
 
 历史审计、重复规格和一次性实验已合并清理；需要追溯时可查看 Git 历史。

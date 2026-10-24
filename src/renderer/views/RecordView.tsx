@@ -207,7 +207,8 @@ export function RecordView() {
       const current = configRef.current;
       if (list.length > 0 && !list.some((device) => device.deviceId === current.cameraDeviceId)) {
         // 之前选的摄像头被拔掉了：回退到默认设备，而不是留着一个不存在的 deviceId
-        updateConfig({ cameraDeviceId: list[0].deviceId });
+        const preferred = list.find(device => /integrated|built.in|内置/i.test(device.label)) ?? list[0];
+        updateConfig({ cameraDeviceId: preferred.deviceId });
       }
     } catch (error) {
       if (!mountedRef.current) return;
@@ -264,7 +265,8 @@ export function RecordView() {
         deviceBundle.audio.find((d) => d.kind === 'audioinput' && d.isDefault) ??
         deviceBundle.audio.find((d) => d.kind === 'audioinput');
       if (micDefault && !current.microphoneDeviceId) updateConfig({ microphoneDeviceId: micDefault.deviceId });
-      const camDefault = videoList[0];
+      // Prefer the built-in device over disconnected phone/remote virtual cameras.
+      const camDefault = videoList.find(device => /integrated|built.in|内置/i.test(device.label)) ?? videoList[0];
       if (camDefault && !current.cameraDeviceId) updateConfig({ cameraDeviceId: camDefault.deviceId });
     } catch (error) {
       if (loadGeneration.current !== generation) return;

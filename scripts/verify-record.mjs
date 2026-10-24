@@ -2,12 +2,13 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT, useLocalTempDir } from './lib/local-temp.mjs';
+import { electronExecutable } from './lib/electron-runtime.mjs';
 
 useLocalTempDir('record-probe');
 const env = { ...process.env, WCS_RECORDER_PROBE: '1',
   WCS_USER_DATA: path.join(ROOT, '.tmp', 'record-probe', `data-${Date.now()}`) };
 delete env.ELECTRON_RUN_AS_NODE;
-const electron = path.join(ROOT, 'node_modules', 'electron', 'dist', 'electron.exe');
+const electron = electronExecutable();
 function run(command, args, environment) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: ROOT, env: environment, stdio: 'inherit', windowsHide: true });

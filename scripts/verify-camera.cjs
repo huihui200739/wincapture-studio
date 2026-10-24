@@ -9,7 +9,8 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, session } = require('electron');
+const { pathToFileURL } = require('node:url');
 
 const ROOT = path.resolve(__dirname, '..');
 const OUT_DIR = path.join(ROOT, 'dist', 'verify');
@@ -20,7 +21,11 @@ function log(message) {
 }
 
 async function main() {
-  const result = { steps: [], ok: false };
+  const result = { startedAt: new Date().toISOString(), steps: [], ok: false };
+  const watchdog = setTimeout(() => {
+    result.reason = '摄像头验证超过 60 秒，已停止并释放设备';
+    finish(1);
+  }, 60_000);
   const step = (name, data) => {
     result.steps.push(name);
     log(`${name}${data === undefined ? '' : ' ' + JSON.stringify(data)}`);
@@ -28,6 +33,12 @@ async function main() {
 
   try {
     await app.whenReady();
+
+    // 与正式应用一样，只给本地应用页面授予媒体权限。
+    const rendererUrl = pathToFileURL(path.join(ROOT, 'dist', 'renderer', 'index.html')).href;
+    const allowed = (contents, permission) => permission === 'media' && contents?.getURL().split('#')[0] === rendererUrl;
+    session.defaultSession.setPermissionRequestHandler((contents, permission, callback) => callback(allowed(contents, permission)));
+    session.defaultSession.setPermissionCheckHandler(allowed);
 
     const win = new BrowserWindow({
       width: 640,
@@ -66,13 +77,46 @@ async function main() {
       return;
     }
 
-    // ---- 2. 打开摄像头 ----
-    const opened = await win.webContents.executeJavaScript('window.__wcsCamera.open(null)', true);
+    // 逐个精确打开，保留原始错误；默认设备可能是不可用的虚拟摄像头。
+    result.deviceChecks = [];
+    for (const device of devices) {
+      const check = await win.webContents.executeJavaScript(`(async () => {
+        let media;
+        try {
+          const request = navigator.mediaDevices.getUserMedia({video:{deviceId:{exact:${JSON.stringify(device.deviceId)}}},audio:false});
+          let expired = false, timer;
+          const timeout = new Promise((_, reject) => { timer = setTimeout(() => { expired = true; reject(new Error('设备打开超时')); }, 8000); });
+          request.then(value => { if (expired) value.getTracks().forEach(track => track.stop()); }, () => {});
+          try { media = await Promise.race([request, timeout]); } finally { clearTimeout(timer); }
+          const track = media.getVideoTracks()[0];
+          return {ok:true, label:track.label, settings:track.getSettings()};
+        } catch(error) { return {ok:false, name:error.name, error:error.message}; }
+        finally { media?.getTracks().forEach(track => track.stop()); }
+      })()`, true);
+      result.deviceChecks.push({ deviceId: device.deviceId, label: device.label, ...check });
+      step('device-check', { label: device.label, ...check });
+    }
+
+    // 默认优先验证内置设备。虚拟摄像头可用不能替代物理设备验收。
+    const selector = process.env.WCS_CAMERA_DEVICE?.trim().toLowerCase();
+    const matches = selector ? devices.filter(device => device.deviceId.toLowerCase() === selector || device.label.toLowerCase().includes(selector)) : [];
+    if (selector && matches.length !== 1) throw new Error('WCS_CAMERA_DEVICE 必须唯一匹配一个设备名称或 ID');
+    const selected = selector ? matches[0] : devices.find(device => /integrated|built.in|内置/i.test(device.label)) ?? devices[0];
+    result.targetDevice = selected;
+    const deviceCheck = result.deviceChecks.find(check => check.deviceId === selected.deviceId);
+    if (!deviceCheck.ok) {
+      result.reason = `${selected.label}: ${deviceCheck.name}: ${deviceCheck.error}`;
+      finish(1);
+      return;
+    }
+
+    // ---- 2. 打开目标摄像头，确认运行时没有悄悄回退到其它设备 ----
+    const opened = await win.webContents.executeJavaScript(`window.__wcsCamera.open(${JSON.stringify(selected.deviceId)})`, true);
     result.opened = opened;
     step('open', { ok: opened.ok, label: opened.label, error: opened.error });
-    if (!opened.ok) {
+    if (!opened.ok || opened.deviceId !== selected.deviceId) {
       result.ok = false;
-      result.reason = opened.error;
+      result.reason = opened.error ?? '摄像头运行时回退到了其它设备';
       finish(1);
       return;
     }
@@ -195,6 +239,7 @@ async function main() {
   }
 
   function finish(code) {
+    clearTimeout(watchdog);
     fs.mkdirSync(OUT_DIR, { recursive: true });
     fs.writeFileSync(path.join(OUT_DIR, 'camera-result.json'), JSON.stringify(result, null, 2));
     log(`done ok=${result.ok}`);

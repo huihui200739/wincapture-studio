@@ -65,6 +65,11 @@ async function cameraProbe() {
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const clock = (state, mediaTick) => camera.setClock({ state, mediaTick, wallTimeMs: performance.timeOrigin + performance.now() });
   const output = [];
+  const originalCallback = HTMLVideoElement.prototype.requestVideoFrameCallback;
+  let frameCallbacks = 0;
+  HTMLVideoElement.prototype.requestVideoFrameCallback = function(callback) {
+    return originalCallback.call(this, (...args) => { frameCallbacks++; callback(...args); });
+  };
   try {
     const opened = await camera.open(); if (!opened.ok) throw new Error(opened.error);
     clock('recording', 0); await sleep(850); clock('paused', 8_000_000);
@@ -94,8 +99,16 @@ async function cameraProbe() {
     clock('recording', 0); color = 'red'; await sleep(180); clock('stopped', 1_800_000);
     const expired = await camera.encodeSegment({ index: 3, startTick: 100_000_000, durationTicks: 8_000_000, fps: 30, width: 320, height: 180 });
     if (expired.ok || !expired.error.includes('过期')) throw new Error('Stale camera frames accepted');
-    return { controlledMediaStream: true, pauseExcluded: true, stopDoesNotRecapture: true, oversizedSourceBounded: {maxWidth,maxHeight}, staleFramesRejected: true, segments: output };
-  } finally { clearInterval(timer); await camera.close(); window.VideoFrame = OriginalFrame; }
+    clock('recording', 0); color = 'red'; await sleep(800);
+    const callbacksBefore = frameCallbacks;
+    const live = await camera.encodeSegment({ index: 1, startTick: 0, durationTicks: 8_000_000, fps: 60, width: 1280, height: 720, sampleTimesMs: [] });
+    const callbacksDuringEncode = frameCallbacks - callbacksBefore;
+    if (!live.ok || callbacksDuringEncode < 1) throw new Error('Live camera encoding starved capture callbacks: ' + JSON.stringify({result:live.error, callbacksDuringEncode}));
+    await sleep(850); clock('stopped', 16_000_000);
+    const next = await camera.encodeSegment({ index: 2, startTick: 8_000_000, durationTicks: 8_000_000, fps: 30, width: 1280, height: 720, sampleTimesMs: [] });
+    if (!next.ok || next.frames !== 24) throw new Error('Live encoding lost the following camera segment: ' + next.error);
+    return { controlledMediaStream: true, pauseExcluded: true, stopDoesNotRecapture: true, oversizedSourceBounded: {maxWidth,maxHeight}, staleFramesRejected: true, liveEncoding: {callbacksDuringEncode, nextSegmentFrames: next.frames}, segments: output };
+  } finally { clearInterval(timer); await camera.close(); window.VideoFrame = OriginalFrame; HTMLVideoElement.prototype.requestVideoFrameCallback = originalCallback; }
 }
 
 app.whenReady().then(async () => {

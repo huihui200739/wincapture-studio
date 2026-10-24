@@ -11,7 +11,7 @@
     "build:main": "node scripts/build-main.mjs",
     "build:renderer": "node scripts/vite-run.mjs build",
     "build": "npm run build:native && npm run build:main && npm run build:renderer",
-    "start": "npm run build && electron .",
+    "start": "npm run build && node scripts/run-electron.mjs .",
     "dev": "npm run build:native && npm run build:main && node scripts/vite-run.mjs dev",
     "test": "vitest run",
     "test:watch": "vitest",

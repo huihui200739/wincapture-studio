@@ -13,16 +13,13 @@ release/
 .appdata/
 .appdata-*/
 .tmp/
-.verify-data/
-.verify-ui-data/
-.verify-exporter-data/
-.verify-wpf-data/
+.verify-*/
 .camera-probe/
 .camera-probe-data/
 work/
 spike-work/
 
-# 自动化探针的输出（结果 JSON 保留，大文件不入库）
+# 自动化探针的输出（必要 JSON 报告仅本地保留，大媒体与缓存不入库）
 dist/verify/
 *.log
 *-o.txt

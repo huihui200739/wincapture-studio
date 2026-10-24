@@ -2487,6 +2487,7 @@ async function runEndToEndProbe(): Promise<void> {
       systemAudioEnabled: true,
       microphoneEnabled: true,
       cameraEnabled: wantCamera,
+      cameraDeviceId: process.env.WCS_E2E_CAMERA_DEVICE || undefined,
       countdownSeconds: 0,
       testMode: true,
     };
@@ -2501,7 +2502,7 @@ async function runEndToEndProbe(): Promise<void> {
       result.cameraOpened = opened;
       if (!opened) {
         result.cameraReason = coordinator.getStatus().reason;
-        step('camera-degraded', { reason: result.cameraReason });
+        throw new Error(`摄像头验收要求真实打开目标设备：${result.cameraReason}`);
       } else {
         step('camera-open', { label: coordinator.getStatus().label });
       }
@@ -2549,6 +2550,10 @@ async function runEndToEndProbe(): Promise<void> {
       const cameraTrack = project.tracks.find((t) => t.kind === 'camera');
       result.cameraAssetCount = cameraAssets.length;
       result.cameraClipCount = cameraTrack ? cameraTrack.clips.length : 0;
+      const cameraFiles = fs.readdirSync(path.join(projectPath, 'media', 'camera')).filter(name => name.endsWith('.mp4'));
+      const screenFiles = fs.readdirSync(path.join(projectPath, 'media', 'screen')).filter(name => name.endsWith('.mp4'));
+      result.cameraSegmentCount = cameraFiles.length;
+      if (screenFiles.some(name => !cameraFiles.includes(name))) throw new Error('存在没有对应摄像头画面的屏幕分段');
       step('camera-project', { assets: result.cameraAssetCount, clips: result.cameraClipCount });
       if (result.cameraOpened === true && result.cameraAssetCount === 0) {
         throw new Error('摄像头已打开但工程里没有摄像头资产');
