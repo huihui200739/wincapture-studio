@@ -185,6 +185,11 @@ export class CaptureEngine {
     return [this.grabber instanceof GrabberWorker ? this.grabber.pid : null, this.audio?.pid, this.pointerWorker?.pid]
       .filter((id): id is number => typeof id === 'number' && id > 0);
   }
+
+  /** 当前兼容采集进程 PID（长录探针注入崩溃用；现代采集无子进程返回 null）。 */
+  getGrabberPid(): number | null {
+    return this.grabber instanceof GrabberWorker ? this.grabber.pid : null;
+  }
   private pointerWorker: PointerWorker | null = null;
   private state: CaptureState = 'Idle';
   private session: RecordSession | null = null;
@@ -651,14 +656,14 @@ export class CaptureEngine {
   // -------------------------------------------------------------------------
 
   private handleVideoFrame(frame: VideoFramePacket): void {
-    // 停止过程中仍必须收帧。
+    // 停止/暂停过程中仍必须收帧。
     //
-    // 为什么：管道里通常还压着 1~2 秒已采集、尚未被主进程读走的帧。
-    // doStop 会 transition('Stopping') 之后再等 grabber 把 stdout 排空；
-    // 如果这里只认 'Recording'，这些「停止前已经采集」的帧会被全部丢掉，
-    // 恰好复现文档里记录的「20 秒只成片 18 秒」缺陷（注释声称已修，实际被状态守卫吃掉）。
+    // 为什么：管道里通常还压着 1~2 秒已采集、尚未被主进程读走的帧；
+    // 排空阶段（编码收尾要数百毫秒）到达的帧，其媒体时间仍早于暂停/停止边界，
+    // 丢弃它们等于每次暂停/停止都丢约 0.3~0.7 秒画面（11 次暂停实测累计 7.4 秒）。
+    // 暂停边界之后的帧由 isDuringPause/stopQpc 过滤，因此放宽状态守卫是安全的。
     const accepting =
-      this.state === 'Recording' || (this.state === 'Stopping' && this.stopping);
+      this.state === 'Recording' || this.state === 'Pausing' || (this.state === 'Stopping' && this.stopping);
     if (!accepting) return;
 
     // 看门狗基准：只要源还在产出帧就刷新（含停止排空阶段，虽然那时看门狗已停）。
@@ -803,9 +808,9 @@ export class CaptureEngine {
   }
 
   private handleAudioPacket(packet: AudioPacket): void {
-    // 与视频同理：停止排空阶段到达的音频包属于停止前已采集的内容，不能丢。
+    // 与视频同理：暂停/停止排空阶段到达的音频包属于边界之前已采集的内容，不能丢。
     const accepting =
-      this.state === 'Recording' || (this.state === 'Stopping' && this.stopping);
+      this.state === 'Recording' || this.state === 'Pausing' || (this.state === 'Stopping' && this.stopping);
     if (!accepting) return;
     if (packet.streamId === 0) {
       this.levels.system = packet.rms;
@@ -1330,8 +1335,10 @@ export class CaptureEngine {
     this.transition('Pausing');
     this.clock.pause(pauseQpc);
     await this.syncCameraClock('paused', pauseQpc);
-    // 提交当前段，保证暂停点之前的画面完整（结束边界取冻结后的媒体时长，
-    // 让末帧与暂停点之间的音频样本也能落在本段，而不是被裁掉）
+    // 先等在途分段编码完，再把缓冲里的帧一次性收尾成段（Pausing 状态此刻仍在收帧）。
+    // 旧顺序是「先 flush 再 drain」：drain 窗口（数百毫秒）内到达的暂停前帧被永久丢弃，
+    // 每次暂停损失约 0.3~0.7 秒画面，60 分钟 11 次暂停实测累计 7.4 秒。
+    await this.drainSegmentQueue();
     this.flushRemainingFrames(this.clock.durationTicks(this.nowQpc()));
     await this.drainSegmentQueue();
     await this.appendJournal('pause', { at: pauseQpc });

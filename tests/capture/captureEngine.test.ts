@@ -676,6 +676,59 @@ describe('CaptureEngine: 采集进程异常退出保护', () => {
   });
 });
 
+describe('CaptureEngine: 暂停排空阶段不再丢帧', () => {
+  it('Pausing 期间到达的边界前帧被接收，边界后帧仍被暂停过滤丢弃', () => {
+    const { internals } = makeEngine();
+    internals.session = makeSession('C:\\test');
+    internals.state = 'Pausing';
+    internals.stopping = false;
+    internals.clock.setZero(0);
+    internals.clock.pause(secondsToTicks(1.0)); // 暂停边界 1.0s
+    internals.grabber = { frequency: FREQ, stop: async () => {} };
+
+    internals.handleVideoFrame(videoFrame(secondsToTicks(0.9))); // 边界前 → 必须收
+    internals.handleVideoFrame(videoFrame(secondsToTicks(1.1))); // 边界后 → 丢弃
+    expect(internals.frames).toHaveLength(1);
+    expect(internals.frames[0].mediaTick).toBe(secondsToTicks(0.9));
+  });
+
+  it('pause() 先排空在途段再收尾缓冲，drain 窗口内到达的暂停前帧落盘', async () => {
+    const projectPath = await makeProjectDir();
+    const requests: { index: number; frameCount: number; micPackets: number }[] = [];
+    let releaseFirst: (() => void) | null = null;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const { engine, internals } = prepareRecording(projectPath, {
+      hooks: {
+        requestSegment: async (info) => {
+          requests.push({ index: info.index, frameCount: info.frames.length, micPackets: info.audio.mic.length });
+          if (info.index === 1) await firstGate; // 让第一段编码挂起，制造 drain 窗口
+          return { mp4: null, frames: 0, encoder: 'test', durationUs: 0 };
+        },
+      },
+    });
+    // 直接锚定 nowQpc = 2.0s：合成帧的 qpc 会污染 QpcClock 的中位数锚点，
+    // 不能依赖 observe（真实时钟下帧 qpc 与到达时刻单调一致，无此问题）。
+    (internals as unknown as { nowQpc: () => number }).nowQpc = () => secondsToTicks(2.0);
+
+    feedFrames(internals, 0, secondsToTicks(1.8)); // 越过 1.6s 栅格边界 → 第 1 段入队
+    const pausing = engine.pause();
+    await new Promise((r) => setTimeout(r, 30)); // 等 drain 进入第一段的编码挂起
+
+    // drain 窗口内到达的帧/音频：媒体时间仍在暂停边界之前，必须被接收并落盘
+    internals.handleVideoFrame(videoFrame(secondsToTicks(1.9)));
+    internals.handleAudioPacket(audioPacket(secondsToTicks(1.85), 960));
+
+    releaseFirst?.();
+    await pausing;
+    expect(internals.state).toBe('Paused');
+    expect(requests.length).toBeGreaterThanOrEqual(2);
+    expect(requests[0].frameCount).toBe(50); // 帧 0→1.633s（含跨越 1.6s 边界的那帧）
+    const tail = requests[requests.length - 1];
+    expect(tail.frameCount).toBeGreaterThanOrEqual(1); // drain 窗口帧进入收尾段
+    expect(tail.micPackets).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe('CaptureEngine: 会话失败时排空已采集画面', () => {
   it('failSession 把缓冲中的残余帧收尾成段并送编码（尾部损失从 ~3s 收敛到 0）', async () => {
     const projectPath = await makeProjectDir();

@@ -40,6 +40,7 @@
     "release": "npm run pack && npm run verify:package && npm run verify:packaged-start",
     "verify:input-camera": "node scripts/verify-input-camera.mjs",
     "verify:performance": "node scripts/verify-performance.mjs",
+    "verify:longrun": "node scripts/verify-longrun.mjs",
     "verify:packaged-start": "node scripts/verify-packaged-start.mjs",
     "verify:capture-perf": "node scripts/run-electron.mjs scripts/verify-capture-performance.cjs",
     "verify:pointer-desktop": "node scripts/run-electron.mjs scripts/verify-pointer-desktop.cjs"

@@ -2402,6 +2402,12 @@ function startApp(): void {
       void runPerfProbe();
     }
 
+    // 长时间录制与内存稳定性探针：WCS_LONGRUN_PROBE=1 时执行，
+    // 结果写 dist/verify/longrun-result.json（详见 scripts/longrunProbe.ts）。
+    if (process.env.WCS_LONGRUN_PROBE === '1') {
+      void runLongrunProbe();
+    }
+
     // 自动化自检钩子：WCS_SELFTEST=screenshot 时，主窗口加载完成后截图退出。
     // 用于无人工干预的界面验证（真实主进程 + 真实 IPC + 真实 preload）。
     if (process.env.WCS_SELFTEST === 'screenshot') {
@@ -2668,6 +2674,130 @@ async function runEndToEndProbe(): Promise<void> {
  * 「性能回归对比必须使用相同测试素材和驱动，不用系统静态桌面的低回调频率充当 60 帧达标证据」。
  * 所以这里跑的是真实 GDI 采集 + 真实 WebCodecs 编码 + 真实落盘 + 真实导出。
  */
+/**
+ * 长时间录制与内存稳定性探针（WCS_LONGRUN_PROBE=1）。
+ *
+ * 与 runPerfProbe 共用「完整进程树工作集」口径；录制参数与性能探针一致（1080p30
+ * 双音轨），额外做周期性暂停/恢复与中途 grabber 崩溃注入。指标判定与阈值见
+ * scripts/longrunProbe.ts。
+ */
+async function runLongrunProbe(): Promise<void> {
+  const minutes = Number(process.env.WCS_LONGRUN_MINUTES ?? 60);
+  const pauseEveryMinutes = Number(process.env.WCS_LONGRUN_PAUSE_MIN ?? 5);
+  const pauseSeconds = Number(process.env.WCS_LONGRUN_PAUSE_SEC ?? 5);
+  const outDir = path.join(APP_ROOT, 'dist', 'verify');
+  const reportPath = path.join(outDir, 'longrun-result.json');
+  const log = (message: string) => console.log(`[longrun] ${message}`);
+  const sampler = new NativeMemorySampler(() => nativeProcessMemory(
+    resolveWorkerPaths(app.getAppPath(), app.isPackaged).grabberExe, engine.getNativeProcessIds()));
+
+  const finish = (report: { ok: boolean; notes?: string[]; error?: string }) => {
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+    console.log(`[longrun] done ok=${report.ok}${report.error ? ' error=' + report.error : ''}${report.notes?.length ? ' notes=' + JSON.stringify(report.notes) : ''}`);
+    setTimeout(() => app.exit(report.ok ? 0 : 1), 500);
+  };
+
+  const treeWorkingSetBytes = (): number => {
+    try {
+      const metrics = app.getAppMetrics();
+      let total = 0;
+      for (const m of metrics) {
+        const kb = m.memory?.workingSetSize ?? 0;
+        if (Number.isFinite(kb) && kb > 0) total += kb * 1024;
+      }
+      const electronIds = new Set(metrics.map(metric => metric.pid));
+      if (total > 0) return total + sampler.total(engine.getNativeProcessIds().filter(id => !electronIds.has(id)));
+    } catch {
+      // 退化到当前进程 RSS
+    }
+    return process.memoryUsage().rss + sampler.total(engine.getNativeProcessIds());
+  };
+
+  try {
+    await new Promise((r) => setTimeout(r, 1500));
+    sampler.start();
+
+    const { runLongrunProbe: runProbe } = await import('../scripts/longrunProbe');
+
+    const report = await runProbe(
+      {
+        startCapture: async (projectPath) => {
+          allowProjectRoot(projectPath);
+          const config: CaptureConfig = {
+            sourceId: 'display:0',
+            sourceKind: 'screen',
+            qualityId: '1080p30',
+            fps: { num: 30, den: 1 },
+            systemAudioEnabled: true,
+            microphoneEnabled: true,
+            cameraEnabled: false,
+            countdownSeconds: 0,
+            testMode: true,
+          };
+          const session = await engine.start(config, projectPath, newProjectId());
+          return { sessionId: session.sessionId };
+        },
+        stopCapture: async () => {
+          const stopped = await engine.stop();
+          return { state: stopped.status.state, segmentsCommitted: stopped.status.segmentsCommitted };
+        },
+        pauseCapture: async () => { await engine.pause(); },
+        resumeCapture: async () => { await engine.resume(); },
+        getStatus: () => {
+          const status = engine.status();
+          return {
+            state: status.state,
+            mediaTick: status.mediaTick,
+            framesArrived: status.framesArrived,
+            degradation: status.degradation,
+          };
+        },
+        getGrabberPid: () => engine.getGrabberPid(),
+        killProcess: (pid) => { try { process.kill(pid); } catch { /* 进程可能已退出 */ } },
+        probeSegment: async (absPath) => {
+          try {
+            const mediabunny = await import('mediabunny');
+            const input = new mediabunny.Input({
+              formats: mediabunny.ALL_FORMATS,
+              source: new mediabunny.FilePathSource(absPath),
+            });
+            const track = await input.getPrimaryVideoTrack();
+            if (!track) {
+              await input.dispose?.();
+              return null;
+            }
+            const durationSeconds = await input.computeDuration();
+            const stats = await track.computePacketStats();
+            await input.dispose?.();
+            return { durationSeconds, frames: stats.packetCount };
+          } catch {
+            return null;
+          }
+        },
+        newProjectPath: (name) => store.defaultProjectPath(name),
+        treeWorkingSetBytes,
+        log,
+      },
+      { minutes, pauseEveryMinutes, pauseSeconds },
+    );
+
+    Object.assign(report, { memoryScope: 'Electron processes + native grabber/audio/pointer working sets',
+      nativeMemory: { samples: sampler.samples, errors: sampler.errors, peakBytes: sampler.peakBytes, maxProcesses: sampler.maxProcesses } });
+    log(`wallSeconds=${report.wallSeconds} video=${report.metrics.videoSeconds}s audio=${report.metrics.audioSeconds}s ` +
+      `drift=${report.metrics.avDriftMs}ms loss=${report.metrics.captureLossPercent}% ` +
+      `peakMem=${report.metrics.memoryPeakMiB}MiB growth=${report.metrics.memoryGrowthMiB}MiB ` +
+      `restart=${report.metrics.restartDetected} gap=${report.metrics.timelineGapMs}ms`);
+    if (!sampler.maxProcesses || sampler.errors) {
+      report.ok = false;
+      report.error = [report.error, '原生进程内存采样不完整'].filter(Boolean).join('；');
+    }
+    finish(report);
+  } catch (error) {
+    finish({ ok: false, error: String(error instanceof Error ? (error.stack ?? error.message) : error) });
+  } finally { sampler.stop(); }
+}
+
 async function runPerfProbe(): Promise<void> {
   const seconds = Number(process.env.WCS_PERF_SECONDS ?? 20);
   const outDir = path.join(APP_ROOT, 'dist', 'verify');
