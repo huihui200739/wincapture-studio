@@ -9,14 +9,16 @@ async function stop(): Promise<void> {
   desktopStream?.getTracks().forEach(track => track.stop()); desktopStream = null;
   if (video) video.srcObject = null;
 }
-async function start(options: { width: number; height: number; fps: number; region?: { x: number; y: number; width: number; height: number }; sourceWidth: number; sourceHeight: number }): Promise<void> {
+async function start(options: { width: number; height: number; fps: number; deviceId?: string; region?: { x: number; y: number; width: number; height: number }; sourceWidth: number; sourceHeight: number }): Promise<void> {
   await stop();
   if (!video) throw new Error('视频元素不可用');
-  desktopStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: options.fps, max: options.fps } }, audio: false });
+  desktopStream = options.deviceId
+    ? await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: options.deviceId }, width: { ideal: options.width }, height: { ideal: options.height }, frameRate: { ideal: options.fps } }, audio: false })
+    : await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: options.fps, max: options.fps } }, audio: false });
   const track = desktopStream.getVideoTracks()[0];
   // Chromium 的部分后端会把系统光标烧入视频。尽力关闭，并报告实际结果以防双光标。
   try { await track.applyConstraints({ cursor: 'never' } as MediaTrackConstraints); } catch { /* 使用实际设置降级。 */ }
-  const cursorEmbedded = (track.getSettings() as MediaTrackSettings & { cursor?: string }).cursor !== 'never';
+  const cursorEmbedded = !options.deviceId && (track.getSettings() as MediaTrackSettings & { cursor?: string }).cursor !== 'never';
   video.srcObject = desktopStream; video.muted = true; await video.play(); stopped = false;
   const canvas = new OffscreenCanvas(options.width, options.height), context = canvas.getContext('2d')!;
   let busy = false, last = -Infinity;

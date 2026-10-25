@@ -380,7 +380,7 @@ export class CaptureEngine {
 
     // ---- 采集区域（§7.1 / R01）----
     // region 是「源显示器内的物理像素矩形」。整屏时用显示器原点。
-    const display = windowSource ?? this.resolveDisplayBounds(config.sourceId);
+    const display = windowSource ?? (config.sourceKind === 'device' ? { x: 0, y: 0, width, height } : this.resolveDisplayBounds(config.sourceId));
     const region = this.normalizeRegion(windowSource ? undefined : config.region, display, degradationParts);
     if (windowSource) {
       region.width -= region.width % 2; region.height -= region.height % 2;
@@ -475,13 +475,13 @@ export class CaptureEngine {
 
     try {
       let modern: VideoCaptureSource | null = null;
-      if (this.hooks.modernCapture && config.backend !== 'compatibility') {
+      if (this.hooks.modernCapture && (config.sourceKind === 'device' || config.backend !== 'compatibility')) {
         try {
           modern = await this.hooks.modernCapture(config, { ...region, outputWidth: width, outputHeight: height }, fps); await modern.start();
           grabber = modern; this.grabber = grabber; this.grabberIsCompat = false; degradationParts.push('现代采集：Chromium/WGC');
         } catch (error) {
           await modern?.stop().catch(() => {});
-          if (config.backend === 'wgc') throw error;
+          if (config.backend === 'wgc' || config.sourceKind === 'device') throw error;
           degradationParts.push(`现代采集不可用，已回退兼容采集：${String(error).slice(0, 180)}`);
         }
       }
@@ -1659,6 +1659,7 @@ export class CaptureEngine {
     if (this.pointerTimer) clearInterval(this.pointerTimer);
     this.pointerTimer = setInterval(() => {
       if (this.state !== 'Recording') return;
+      if (this.session?.config.sourceKind === 'device') return;
       // 原生事件在鼠标发生移动的瞬间打 QPC 时间戳；主进程轮询只作为降级。
       if (this.nativePointerAvailable && this.lastPointer) return;
       const point = this.deps.getCursorPoint();
@@ -1694,6 +1695,7 @@ export class CaptureEngine {
   }
 
   recordPointerEvent(event: NativePointerEvent, frequency: bigint): void {
+    if (this.session?.config.sourceKind === 'device') return;
     if (!this.session || !this.clock.hasZero || this.state !== 'Recording' || frequency <= 0n) return;
     const window = this.session.config.sourceKind === 'window';
     if (event.kind !== 'move' && window && event.hwnd && this.session.config.sourceId !== `window:${event.hwnd}`) return;

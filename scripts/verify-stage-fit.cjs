@@ -67,11 +67,14 @@ async function setVariant(win, variantId) {
   // 通过画布属性页签切画幅（与用户操作一致，走真实命令层）
   await win.webContents.executeJavaScript(`(() => {
     const tabs = [...document.querySelectorAll('.inspector-tab')];
-    const tab = tabs.find((t) => t.textContent.includes('画布'));
+    const tab = document.getElementById('inspector-tab-canvas');
     if (tab) tab.click();
+    [...document.querySelectorAll('.studio-canvas-tabs button')].find(b => b.textContent === '布局')?.click();
     return !!tab;
   })()`);
   await wait(350);
+  await win.webContents.executeJavaScript(`[...document.querySelectorAll('.studio-canvas-tabs button')].find(b=>b.textContent==='布局')?.click()`);
+  await wait(150);
   return win.webContents.executeJavaScript(`(() => {
     const cards = [...document.querySelectorAll('.variant-card')];
     const card = cards.find((c) => (c.getAttribute('aria-label') || c.textContent || '').includes(${JSON.stringify(variantId)}));

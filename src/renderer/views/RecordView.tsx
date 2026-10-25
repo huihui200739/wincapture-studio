@@ -162,7 +162,7 @@ export function RecordView() {
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [sourceKind, setSourceKind] = useState<'screen' | 'window'>(config.sourceKind ?? 'screen');
+  const [sourceKind, setSourceKind] = useState<'screen' | 'window'>(config.sourceKind === 'window' ? 'window' : 'screen');
   const [regionEnabled, setRegionEnabled] = useState(false);
   const [freeBytes, setFreeBytes] = useState<number | null>(null);
   const [pathCheck, setPathCheck] = useState<{ ok: boolean; writable: boolean; reason?: string } | null>(null);

@@ -25,6 +25,7 @@ import './exporterRuntime';
 import './cameraRuntime';
 import './desktopRuntime';
 import './styles.css';
+import './studio.css';
 
 type Role = 'main' | 'overlay' | 'recorder' | 'exporter' | 'camera';
 

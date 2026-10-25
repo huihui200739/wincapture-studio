@@ -94,7 +94,6 @@ const ROWS: RowDef[] = [
   { key: 'step', label: '步骤标记', kind: 'step', advanced: true },
 ];
 
-const BASE_PX_PER_SECOND = 34;
 
 /** 领域层分割命令要求两侧都不短于 1ms（commands.ts MIN_CLIP_TICKS），界面提前做同样校验。 */
 const MIN_CLIP_TICKS = 10_000;
@@ -254,10 +253,18 @@ export function Timeline({
 }: TimelineProps) {
   const hasZoom = project.effects.some(e => e.kind === 'zoom');
   const [showAdvanced, setShowAdvanced] = useState(hasZoom);
+  const [detailTracks, setDetailTracks] = useState(false);
   useEffect(() => { if (hasZoom) setShowAdvanced(true); }, [project.id, hasZoom]);
   const thumbnailMedia = usePreviewMedia(projectPath ?? null);
   const [snapGuide, setSnapGuide] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const [viewportWidth, setViewportWidth] = useState(900);
+  useEffect(() => {
+    const node = scrollRef.current; if (!node) return;
+    const observer = new ResizeObserver(() => setViewportWidth(node.clientWidth));
+    observer.observe(node); setViewportWidth(node.clientWidth);
+    return () => observer.disconnect();
+  }, [collapsed]);
   const scrubbing = useRef(false);
 
   /** 轨道静音状态一律从工程派生：撤销/重做、其它面板切换静音后无需手动同步。 */
@@ -267,10 +274,14 @@ export function Timeline({
   );
 
   const duration = useMemo(() => Math.max(timelineDuration(project), TICKS_PER_SECOND), [project]);
-  const pxPerTick = (BASE_PX_PER_SECOND * zoom) / TICKS_PER_SECOND;
-  const contentWidth = Math.max(600, (duration / TICKS_PER_SECOND) * BASE_PX_PER_SECOND * zoom + 80);
+  const fitPixelsPerSecond = Math.max(1, (viewportWidth - 55) / (duration / TICKS_PER_SECOND));
+  const pxPerTick = (fitPixelsPerSecond * zoom) / TICKS_PER_SECOND;
+  const contentWidth = Math.max(viewportWidth, (duration / TICKS_PER_SECOND) * fitPixelsPerSecond * zoom + 55);
 
-  const rows = useMemo(() => ROWS.filter((row) => showAdvanced || !row.advanced), [showAdvanced]);
+  const rows = useMemo(() => ROWS.filter(row => (showAdvanced || !row.advanced) &&
+    (detailTracks || row.key === 'primaryVideo' || row.key === 'zoom' ||
+      (row.key === 'privacy' && project.effects.some(e => e.kind === 'privacy')) || (row.key === 'step' && project.steps.length > 0))),
+    [showAdvanced, detailTracks, project.effects, project.steps]);
 
   const tickToX = useCallback((value: number) => value * pxPerTick, [pxPerTick]);
 
@@ -515,7 +526,9 @@ export function Timeline({
           {showAdvanced ? '隐藏高级轨道' : '显示高级轨道（运镜 / 遮挡 / 步骤）'}
         </button>
         <div className="timeline-toolbar-spacer" />
+        <button className="studio-track-toggle" aria-pressed={detailTracks} onClick={() => setDetailTracks(!detailTracks)}><Icon name="volume" size={13} />{detailTracks ? '收起音频 / 摄像头' : '音频 / 摄像头'}</button>
         <div className="timeline-zoom">
+          <button className="studio-track-toggle" aria-label="适应整个时间线" onClick={() => onZoomChange(1)}>适应</button>
           <Icon name="zoomOut" size={12} />
           <input
             type="range"

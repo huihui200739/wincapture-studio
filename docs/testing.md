@@ -16,6 +16,10 @@
 
 ## 自动验证
 
+`npm run verify:startup` 通过正式入口验收胶囊启动耗时、启动扫描次数、空闲事件循环延迟、重复启动互斥、默认摄像头连续两轮真实录制与正常退出。需要物理摄像头可用；独立 userData，结果写入 dist/verify/startup-camera-result.json。对应回归单测为 tests/main-ipc/singleInstance.test.ts 与 tests/media/cameraDevices.test.ts。
+
+`npm run verify:studio` 验证新的胶囊与桌面确认流程，包括区域框移动、真实录屏、停止后恢复浅色编辑器、两路 WAV 分段读取与含 AAC 音轨的 MP4 导出。可设置 `WCS_STUDIO_DEVICE=1` 验证实际视频设备直录；`WCS_STUDIO_PROJECT` 指定已有工程，复验此前音频缺失警告。结果与界面截图写入 dist/verify/studio/。
+
 先运行 npm run check 和 npm run build。本批 928 项单测、55 条 IPC 契约；测试数量不代表所有硬件均已验收。
 
 鼠标运镜接入批次新增 tests/domain/autoZoom.test.ts，目前共 934 项单测：覆盖真实日志到工程效果、裁剪/倍速映射、静止点压缩、镜头跟随、重生成撤销及焦点路径移动。正式鼠标进程使用内容哈希缓存的本地可执行文件；verify:pointer-desktop 共用 pointer-runtime.cjs，要求真实移动和 down/up 与目标 DOM 点击同时成立。

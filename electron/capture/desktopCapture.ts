@@ -18,7 +18,7 @@ export class DesktopVideoSource implements VideoCaptureSource {
   private epochMs = 0;
   constructor(private readonly deps: { createWindow: () => BrowserWindow; ready(win: BrowserWindow): Promise<void>; clockExe: string },
     readonly captureBounds: { x: number; y: number; width: number; height: number },
-    private readonly options: { width: number; height: number; fps: number; sourceWidth: number; sourceHeight: number; region?: { x: number; y: number; width: number; height: number } }) {}
+    private readonly options: { width: number; height: number; fps: number; deviceId?: string; sourceWidth: number; sourceHeight: number; region?: { x: number; y: number; width: number; height: number } }) {}
   onFrame(listener: (frame: VideoFramePacket) => void): () => void { this.frames.add(listener); return () => this.frames.delete(listener); }
   onExit(listener: (reason: { code: number | null; signal: string | null; stderr: string }) => void): () => void { this.exits.add(listener); return () => this.exits.delete(listener); }
   async start(): Promise<void> {

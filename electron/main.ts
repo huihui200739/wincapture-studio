@@ -6,6 +6,7 @@
  *   - IPC 注册：严格按 src/shared/ipc.ts 的 IPC 常量
  *   - 全局快捷键：Ctrl+Alt+R 开始/停止、Ctrl+Alt+P 暂停/恢复、Ctrl+Alt+M 标记
  *   - 单实例锁、内容保护（录制时不把自己的悬浮条录进去）
+ *   - 托盘：录制期间的兜底「停止并保存」入口（左键单击停止，右键完整菜单）
  *
  * 运行约束（本机实测）：
  *   Electron 必须带 --no-sandbox，否则进程以 0x80000003 退出。
@@ -18,12 +19,14 @@ import {
   globalShortcut,
   ipcMain,
   Menu,
+  nativeImage,
   screen,
   session,
   shell,
   protocol,
   net,
   desktopCapturer,
+  Tray,
   webContents,
   type OpenDialogOptions,
   type SaveDialogOptions,
@@ -40,11 +43,16 @@ import { AppError } from '../src/shared/errors';
 import type { Project } from '../src/domain/project';
 import { planProjectAutoZoom } from '../src/domain/zoom';
 import { readPointerLog } from './pointerLog';
+import { recordedSegmentNames } from './mediaSegments';
+import { SingleInstance } from './singleInstance';
+import { runStudioProbe } from '../scripts/studioProbe';
+import { runStartupProbe } from '../scripts/startupProbe';
+const startupScans = { sources: 0, audio: 0 };
 import { ProjectStore, createProject, hashFile, isPathInside, newProjectId } from './projectStore';
 import { CaptureEngine, type RecordSession } from './capture/captureEngine';
 import { DesktopVideoSource } from './capture/desktopCapture';
 import { NativeMemorySampler, nativeProcessMemory } from './capture/processMemory';
-const desktopSources = new Map<number, { worker: DesktopVideoSource; source: Electron.DesktopCapturerSource }>();
+const desktopSources = new Map<number, { worker: DesktopVideoSource; source?: Electron.DesktopCapturerSource }>();
 interface RecorderReply { ok: boolean; data?: Uint8Array; mp4?: string; frames?: number; encoder?: string; durationUs?: number; error?: string }
 const recorderJobs = new Map<number, { sender: number; finish(result: RecorderReply): void }>();
 let recorderJobSequence = 0;
@@ -111,6 +119,8 @@ let mainWindow: BrowserWindow | null = null;
 let overlayWindow: BrowserWindow | null = null;
 let recorderWindow: BrowserWindow | null = null;
 let cameraWindow: BrowserWindow | null = null;
+/** 托盘：录制的兜底停止入口。必须常驻引用，否则 GC 回收后图标自动消失。 */
+let tray: Tray | null = null;
 
 let store: ProjectStore;
 let engine: CaptureEngine;
@@ -147,6 +157,8 @@ let lastExport: ExportResult | null = null;
 
 /** 悬浮窗是否完成 ready 握手（决定快捷键「标记」走悬浮窗备忘录还是直接落标记）。 */
 let overlayReady = false;
+/** 悬浮条归属的采集来源：自动重建时把它放回被录制画面所在的显示器。 */
+let overlaySourceId: string | null = null;
 /** 导出隐藏窗口集合：取消导出只对这些窗口广播，退出时统一销毁。 */
 const exporterWindows = new Set<BrowserWindow>();
 /** 退出流程只执行一次。 */
@@ -524,12 +536,12 @@ function loadRenderer(win: BrowserWindow, hash = ''): void {
 
 function createMainWindow(): BrowserWindow {
   const icon = appIconPath();
+  const area = screen.getPrimaryDisplay().workArea;
   const win = new BrowserWindow({
-    width: 1440,
-    height: 900,
-    minWidth: 1080,
-    minHeight: 680,
-    backgroundColor: '#14161b',
+    width: 620, height: 96,
+    x: Math.round(area.x + (area.width - 620) / 2), y: area.y + 28,
+    frame: false, transparent: true, backgroundColor: '#00000000',
+    resizable: false, hasShadow: false,
     show: false,
     title: 'WinCapture Studio',
     ...(icon ? { icon } : {}),
@@ -561,11 +573,71 @@ function createMainWindow(): BrowserWindow {
   return win;
 }
 
+let editorBounds: Electron.Rectangle | null = null;
+let mainLayout: 'launcher' | 'editor' | 'selection' = 'launcher';
+function layoutMain(options: { mode: 'launcher' | 'editor' | 'selection' | 'maximize'; height?: number; sourceId?: string }) {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return { width: 620, height: 96 };
+  if (options.mode === 'maximize') { if (win.isMaximized()) win.unmaximize(); else win.maximize(); return win.getBounds(); }
+  if (mainLayout === 'editor' && options.mode !== 'editor' && !win.isMaximized()) editorBounds = win.getBounds();
+  if (options.mode !== 'editor' && win.isMaximized()) win.unmaximize();
+  win.setMinimumSize(0, 0);
+  let target: Electron.Rectangle | undefined;
+  if (options.mode === 'selection') {
+    const sourceId = options.sourceId ?? 'display:0';
+    let display = screen.getAllDisplays()[Number(sourceId.split(':')[1])] ?? screen.getPrimaryDisplay();
+    const source = windowSources.get(sourceId);
+    if (source) display = screen.getDisplayNearestPoint(screen.screenToDipPoint({ x: source.x, y: source.y }));
+    const bounds = display.bounds;
+    if (source) { const rect = screen.screenToDipRect(null, source); target = { ...rect, x: rect.x - bounds.x, y: rect.y - bounds.y }; }
+    win.setResizable(false); win.setAlwaysOnTop(true, 'screen-saver'); win.setContentProtection(true);
+    win.setBounds(bounds);
+  } else if (options.mode === 'launcher') {
+    const area = screen.getPrimaryDisplay().workArea;
+    win.setResizable(false); win.setAlwaysOnTop(true, 'floating'); win.setContentProtection(true);
+    win.setBounds({ x: Math.round(area.x + (area.width - 620) / 2), y: area.y + 28, width: 620,
+      height: Math.min(area.height - 56, Math.max(96, Math.round(options.height ?? 96))) });
+  } else {
+    const area = screen.getPrimaryDisplay().workArea;
+    win.setAlwaysOnTop(false); win.setContentProtection(false); win.setResizable(true);
+    if (mainLayout !== 'editor') win.setBounds(editorBounds ?? { x: area.x + 32, y: area.y + 32,
+      width: Math.min(1440, area.width - 64), height: Math.min(940, area.height - 64) });
+    win.setMinimumSize(Math.min(1000, area.width - 32), Math.min(640, area.height - 32));
+  }
+  mainLayout = options.mode;
+  win.show();
+  const { width, height } = win.getBounds();
+  return { width, height, target };
+}
+
+/** 悬浮条应出现在哪块显示器：跟随被录制的屏幕/窗口，默认主显示器。
+ *  注意窗口必须在目标显示器上直接创建（Cap 在混 DPI 副屏上的教训：
+ *  先在主屏创建再移动会触发 WM_DPICHANGED，窗口被整倍缩放）。 */
+function overlayDisplayFor(sourceId: string | null): Electron.Display {
+  try {
+    if (sourceId?.startsWith('window:')) {
+      const source = windowSources.get(sourceId);
+      if (source) return screen.getDisplayNearestPoint({ x: source.x, y: source.y });
+    } else if (sourceId?.startsWith('screen:') || sourceId?.startsWith('display:')) {
+      const display = screen.getAllDisplays()[Number(sourceId.split(':')[1])];
+      if (display) return display;
+    }
+  } catch {
+    // 显示器拓扑变化等异常：回退主显示器
+  }
+  return screen.getPrimaryDisplay();
+}
+
 /** 录制悬浮控制条：置顶、无边框、不进任务栏，且对采集隐藏（§6.1）。 */
 function createOverlayWindow(): BrowserWindow {
-  if (overlayWindow && !overlayWindow.isDestroyed()) return overlayWindow;
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    // 已存在（可能被临时隐藏）：直接复用显示，绝不能销毁重建——
+    // 它是录制中唯一常驻的「停止」入口（悬浮条与托盘二选一都不可靠，两个都保）。
+    if (!overlayWindow.isVisible()) overlayWindow.showInactive();
+    return overlayWindow;
+  }
   overlayReady = false;
-  const display = screen.getPrimaryDisplay();
+  const display = overlayDisplayFor(overlaySourceId);
   const width = 460;
   const height = 64;
   const win = new BrowserWindow({
@@ -602,6 +674,11 @@ function createOverlayWindow(): BrowserWindow {
       message: '当前系统不支持窗口内容保护，悬浮控制条可能会出现在录制画面中。',
     });
   }
+  // 关键修复：必须保存窗口引用。旧实现创建后从不给 overlayWindow 赋值，
+  // ready-to-show 里 overlayWindow !== win 恒成立 → 窗口刚就绪就被销毁，
+  // 用户录制中找不到任何「停止」按钮；closeOverlayWindow 也永远关不到真窗口。
+  // （同因：Electron FAQ 里托盘/窗口被 GC 后静默消失的同类问题。）
+  overlayWindow = win;
   win.once('ready-to-show', () => {
     if (overlayWindow !== win || !ACTIVE_CAPTURE_STATES.has(engine.getState())) { win.destroy(); return; }
     win.showInactive();
@@ -762,7 +839,7 @@ async function probeSegmentDurationTicks(filePath: string): Promise<number> {
       source: new mediabunny.FilePathSource(filePath),
     });
     const opened = input as InstanceType<typeof mediabunny.Input>;
-    const track = await opened.getPrimaryVideoTrack();
+    const track = await opened.getPrimaryVideoTrack() ?? await opened.getPrimaryAudioTrack();
     if (!track) return 0;
     const durationSeconds = await opened.computeDuration();
     return Math.max(0, Math.round(durationSeconds * 10_000_000));
@@ -855,15 +932,17 @@ function buildEngine(): CaptureEngine {
     workers,
     {
       modernCapture: async (config, region, fps) => {
-        const list = await desktopCapturer.getSources({ types: [config.sourceKind === 'window' ? 'window' : 'screen'], thumbnailSize: { width: 0, height: 0 } });
-        const display = screen.getAllDisplays()[Number(config.sourceId.split(':')[1])];
+        const device = config.sourceKind === 'device';
+        const list = device ? [] : await desktopCapturer.getSources({ types: [config.sourceKind === 'window' ? 'window' : 'screen'], thumbnailSize: { width: 0, height: 0 } });
+        const display = device ? undefined : screen.getAllDisplays()[Number(config.sourceId.split(':')[1])];
         const source = list.find(item => config.sourceKind === 'window' ? item.id.startsWith(config.sourceId + ':') : item.display_id === String(display?.id));
-        if (!source) throw new Error('所选来源不支持现代采集');
+        if (!device && !source) throw new Error('所选来源不支持现代采集');
         const worker = new DesktopVideoSource({ clockExe: workers.grabberExe, ready: waitForReady, createWindow: () => {
           const win = new BrowserWindow({ show: false, width: 640, height: 360, webPreferences: { preload: path.join(APP_ROOT, 'dist', 'main', 'preload.cjs'), sandbox: false, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
           const id = win.webContents.id; desktopSources.set(id, { worker, source }); win.once('closed', () => desktopSources.delete(id));
           loadRenderer(win, '#camera-desktop'); return win;
         } }, region, { width: region.outputWidth, height: region.outputHeight, fps,
+          deviceId: device ? config.sourceId.slice('device:'.length) : undefined,
           sourceWidth: display ? screen.dipToScreenRect(null, display.bounds).width : region.width,
           sourceHeight: display ? screen.dipToScreenRect(null, display.bounds).height : region.height,
           region: config.sourceKind === 'screen' && display ? { x: region.x - screen.dipToScreenRect(null, display.bounds).x,
@@ -875,6 +954,13 @@ function buildEngine(): CaptureEngine {
         send(IPC.captureStatus, status);
         sendToOverlay(IPC.captureStatus, status);
         if (!ACTIVE_CAPTURE_STATES.has(status.state)) closeOverlayWindow();
+        // 自愈：录制进行中悬浮条崩溃/被误关时立即重建——录制期间必须始终有可点的「停止」入口。
+        else if (!shutdownStarted && (!overlayWindow || overlayWindow.isDestroyed())) createOverlayWindow();
+        // 托盘菜单跟随录制状态（仅状态迁移时重建，电平等高频推送不触发）。
+        if (!shutdownStarted && status.state !== trayState) rebuildTrayMenu();
+        if (status.state === 'Recording' || status.state === 'Countdown') mainWindow?.hide();
+        if (status.state === 'ReadyToEdit') layoutMain({ mode: 'editor' });
+        if (status.state === 'RecoverableFailure') { layoutMain({ mode: 'launcher', height: 190 }); }
       },
       requestSegment: async (info) => {
         // 交给录制窗口编码：把帧通过一次 IPC 传递（帧数受 2 秒分段限制，量可控）
@@ -1063,7 +1149,7 @@ function waitForReady(win: BrowserWindow, timeoutMs = 20_000): Promise<void> {
 async function finalizeSessionProject(session: RecordSession): Promise<void> {
   const segments = engine.getCommittedSegments();
   const durationTicks = Math.max(1, engine.getDurationTicks());
-  const project = createProject(`录制 ${new Date(session.startedAt).toLocaleString('zh-CN')}`);
+  const project = createProject(session.config.projectName?.trim() || `录制 ${new Date(session.startedAt).toLocaleString('zh-CN')}`);
   project.id = session.projectId;
 
   if (segments.length > 0) {
@@ -1202,6 +1288,86 @@ function closeOverlayWindow(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 托盘：录制的兜底停止入口
+//
+// 设计参考同类成熟录屏软件（只借鉴行为约定，不抄实现）：
+//   - Kap（MIT）：录制中左键单击托盘 = 停止录制，右键菜单含暂停/停止与实时状态；
+//   - Cap（AGPL，仅参考思路）：RecordingStarted 后托盘切换为停止入口。
+// 悬浮条可能被全屏应用遮挡或意外销毁，托盘是「永远可点」的最后停止手段。
+// ---------------------------------------------------------------------------
+
+/** 非录制状态下唤起主界面（录制中不调用，避免打断采集）。 */
+function showMainWindow(): void {
+  if (shutdownStarted) return;
+  if (!mainWindow || mainWindow.isDestroyed()) { mainWindow = createMainWindow(); return; }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+/** 按当前录制状态重建托盘菜单与提示；状态变化都从这里走，保持幂等。 */
+let trayState: CaptureStatus['state'] | null = null;
+function rebuildTrayMenu(): void {
+  if (!tray || tray.isDestroyed()) return;
+  const state = typeof engine === 'undefined' ? 'Idle' : engine.getState();
+  trayState = state;
+  const active = ACTIVE_CAPTURE_STATES.has(state);
+  const paused = state === 'Paused' || state === 'Pausing';
+  tray.setContextMenu(Menu.buildFromTemplate([
+    {
+      label: paused ? '继续录制（Ctrl+Alt+P）' : '暂停录制（Ctrl+Alt+P）',
+      enabled: state === 'Recording' || state === 'Paused',
+      click: () => {
+        if (!engine) return;
+        if (engine.getState() === 'Recording') void engine.pause().catch(() => {});
+        else if (engine.getState() === 'Paused') void engine.resume().catch(() => {});
+        rebuildTrayMenu();
+      },
+    },
+    {
+      label: '停止并保存',
+      enabled: active,
+      click: () => {
+        void stopCaptureSession().catch((error) => console.warn('[tray] 停止录制失败', error));
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '显示悬浮控制条',
+      enabled: active,
+      click: () => { if (!shutdownStarted && ACTIVE_CAPTURE_STATES.has(engine.getState())) createOverlayWindow(); },
+    },
+    { label: '打开主界面', click: () => showMainWindow() },
+    { type: 'separator' },
+    { label: '退出', click: () => app.quit() },
+  ]));
+  tray.setToolTip(active ? 'WinCapture Studio — 正在录制，点击图标停止并保存' : 'WinCapture Studio');
+}
+
+/** 创建常驻托盘。模块级引用保证不被 GC（Electron FAQ：托盘被回收后图标静默消失）。 */
+function ensureTray(): void {
+  if (tray && !tray.isDestroyed()) return;
+  const iconPath = appIconPath();
+  try {
+    const icon = iconPath ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
+    tray = new Tray(icon);
+  } catch (error) {
+    console.warn('[tray] 创建失败（托盘停止入口不可用）', error);
+    tray = null;
+    return;
+  }
+  tray.on('click', () => {
+    // 与 Kap/Cap 一致：录制中左键单击托盘 = 停止并保存；空闲时唤起主界面。
+    if (engine && ACTIVE_CAPTURE_STATES.has(engine.getState())) {
+      void stopCaptureSession().catch((error) => console.warn('[tray] 停止录制失败', error));
+      return;
+    }
+    showMainWindow();
+  });
+  rebuildTrayMenu();
+}
+
 /** 关闭摄像头协调器与隐藏窗口（停止录制后必须调用，否则指示灯常亮）。 */
 async function closeCamera(): Promise<void> {
   const coordinator = camera;
@@ -1240,6 +1406,7 @@ async function stopCaptureSession(): Promise<{ projectPath: string; status: Capt
       return await engine.stop();
     } finally {
       currentSession = null;
+      overlaySourceId = null;
       closeOverlayWindow();
       await closeCamera();
     }
@@ -1255,6 +1422,15 @@ async function stopCaptureSession(): Promise<{ projectPath: string; status: Capt
 /** 销毁所有隐藏窗口（退出前调用，否则 window-all-closed 永远不会触发）。 */
 function destroyAuxiliaryWindows(): void {
   closeOverlayWindow();
+  if (tray && !tray.isDestroyed()) {
+    try {
+      tray.destroy();
+    } catch {
+      // 忽略
+    }
+  }
+  tray = null;
+  trayState = null;
   for (const win of [...exporterWindows]) {
     exporterWindows.delete(win);
     if (!win.isDestroyed()) {
@@ -1290,6 +1466,12 @@ function destroyAuxiliaryWindows(): void {
 async function shutdownApp(reason: string): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  const deadline = setTimeout(() => {
+    console.error('[main] 退出清理超时，保留已落盘素材并结束后台实例');
+    destroyAuxiliaryWindows();
+    app.exit(1);
+  }, 20_000);
+  deadline.unref();
   console.log(`[main] 开始退出：${reason}`);
   try {
     const state = typeof engine === 'undefined' ? 'Idle' : engine.getState();
@@ -1322,8 +1504,11 @@ async function shutdownApp(reason: string): Promise<void> {
     console.warn('[main] 退出清理失败', error);
   }
   currentSession = null;
-  await closeCamera().catch(() => undefined);
+  let cameraTimer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([closeCamera().catch(() => undefined), new Promise<void>(resolve => { cameraTimer = setTimeout(resolve, 3000); })]);
+  clearTimeout(cameraTimer);
   destroyAuxiliaryWindows();
+  if (!mainWindow || mainWindow.isDestroyed()) { app.exit(0); return; }
   app.quit();
 }
 
@@ -1362,7 +1547,7 @@ function validateCaptureConfig(raw: unknown): CaptureConfig {
   const quality = QUALITY_PROFILES.find((profile) => profile.id === config.qualityId);
   if (!quality) throw invalid(`qualityId=${String(config.qualityId)}`);
   const sourceKind: CaptureConfig['sourceKind'] =
-    config.sourceKind === 'screen' || config.sourceKind === 'window'
+    config.sourceKind === 'screen' || config.sourceKind === 'window' || config.sourceKind === 'device'
       ? config.sourceKind
       : invalid(`sourceKind=${String(config.sourceKind)}`);
   const sourceId = typeof config.sourceId === 'string' ? config.sourceId.trim() : '';
@@ -1407,6 +1592,8 @@ function validateCaptureConfig(raw: unknown): CaptureConfig {
     cameraDeviceId,
     countdownSeconds: Math.round(countdownSeconds),
     testMode: config.testMode === true,
+    projectName: typeof config.projectName === 'string' ? config.projectName.slice(0, 120) : undefined,
+    outputDirectory: typeof config.outputDirectory === 'string' ? config.outputDirectory : undefined,
     ...(region ? { region } : {}),
   };
 }
@@ -1513,7 +1700,11 @@ function registerIpc(): void {
     return coordinator.snapshot();
   });
   // ---- 采集 ----
-  handleFor(IPC.captureListSources, ['main'], async (): Promise<CaptureSourceInfo[]> => {
+  handleFor(IPC.captureListSources, ['main'], async (raw?: unknown): Promise<CaptureSourceInfo[]> => {
+    startupScans.sources++;
+    const options = raw as { kind?: string; thumbnails?: boolean } | undefined;
+    const includeWindows = options?.kind !== 'screen';
+    const includeScreens = options?.kind !== 'window';
     const displays = screen.getAllDisplays();
     const sources: CaptureSourceInfo[] = displays.map((display, index) => {
       const scale = display.scaleFactor || 1;
@@ -1529,18 +1720,21 @@ function registerIpc(): void {
     });
     const ownHandles = new Set(BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed())
       .map((w) => { const buffer = w.getNativeWindowHandle(); return `window:${buffer.length >= 8 ? buffer.readBigUInt64LE().toString() : buffer.readUInt32LE().toString()}`; }));
-    const native = await listNativeWindows().catch((error) => { console.warn('[sources] 窗口枚举失败', error); return []; });
-    windowSources.clear();
-    for (const item of native) if (!ownHandles.has(item.id)) windowSources.set(item.id, item);
-    const windows: CaptureSourceInfo[] = [...windowSources.values()].map((item) => ({ ...item, kind: 'window' }));
+    if (includeWindows) {
+      const native = await listNativeWindows().catch((error) => { console.warn('[sources] 窗口枚举失败', error); return []; });
+      windowSources.clear();
+      for (const item of native) if (!ownHandles.has(item.id)) windowSources.set(item.id, item);
+    }
+    const windows: CaptureSourceInfo[] = includeWindows ? [...windowSources.values()].map((item) => ({ ...item, kind: 'window' })) : [];
+    const listed = [...(includeScreens ? sources : []), ...windows];
     try {
-      const thumbnails = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 480, height: 270 }, fetchWindowIcons: true });
-      for (const source of [...sources, ...windows]) {
+      const thumbnails = options?.thumbnails === false ? [] : await desktopCapturer.getSources({ types: includeWindows ? includeScreens ? ['screen', 'window'] : ['window'] : ['screen'], thumbnailSize: { width: 320, height: 180 }, fetchWindowIcons: false });
+      for (const source of listed) {
         const thumb = thumbnails.find((t) => source.kind === 'screen' ? t.display_id === source.displayId : t.id.startsWith(source.id + ':'));
         if (thumb && !thumb.thumbnail.isEmpty()) source.thumbnail = thumb.thumbnail.toDataURL();
       }
     } catch (error) { console.warn('[sources] 缩略图不可用', error); }
-    return [...sources, ...windows];
+    return listed;
   });
 
   // 独立的显示器枚举：listSources 返回的 CaptureSourceInfo 没有 bounds/scaleFactor，
@@ -1559,6 +1753,7 @@ function registerIpc(): void {
   });
 
   handleFor(IPC.captureListDevices, ['main'], async (): Promise<{ audio: AudioDeviceInfo[]; video: VideoDeviceInfo[] }> => {
+    startupScans.audio++;
     const audio = await listAudioDevices(resolveWorkerPaths(app.getAppPath(), app.isPackaged).audioExe);
     // 视频设备由渲染进程通过 navigator.mediaDevices 枚举后回传，这里返回空表示"界面自行枚举"
     return { audio, video: [] };
@@ -1579,9 +1774,14 @@ function registerIpc(): void {
         if (!fresh?.available || !windowSources.has(config.sourceId)) throw new AppError({ code: 'E_SOURCE_CLOSED', message: '所选窗口已关闭或最小化，请重新选择。', retryable: true, preservedData: true });
         windowSources.set(fresh.id, fresh);
       }
-      const name = `录制 ${new Date().toLocaleString('zh-CN')}`;
+      const name = config.projectName?.trim() || `录制 ${new Date().toLocaleString('zh-CN')}`;
       // 唯一目录：同名录制（同一秒内多次开始）绝不能覆盖已有工程
-      const projectPath = store.uniqueProjectPath(name);
+      let projectPath = store.uniqueProjectPath(name);
+      if (config.outputDirectory) {
+        const directory = await assertAllowedPath(config.outputDirectory);
+        const safeName = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+        projectPath = path.join(directory, `${safeName}-${Date.now()}.wcaproj`);
+      }
       await store.ensureDir(projectPath);
       const projectId = newProjectId();
       allowProjectRoot(projectPath);
@@ -1612,6 +1812,7 @@ function registerIpc(): void {
       if (cameraNote) {
         session.degradation = session.degradation ? `${session.degradation}；${cameraNote}` : cameraNote;
       }
+      overlaySourceId = config.sourceId;
       createOverlayWindow();
       return { sessionId: session.sessionId, projectPath, cameraNote };
     } finally {
@@ -1630,6 +1831,7 @@ function registerIpc(): void {
       await engine.cancel();
     } finally {
       currentSession = null;
+      overlaySourceId = null;
       closeOverlayWindow();
       await closeCamera();
     }
@@ -1858,7 +2060,7 @@ function registerIpc(): void {
     const assetAbs = ProjectStore.resolveInside(root, relativePath);
     const dir = path.dirname(assetAbs);
     if (!fs.existsSync(dir)) return [];
-    const names = (await fsp.readdir(dir)).filter((n) => n.toLowerCase().endsWith('.mp4')).sort();
+    const names = recordedSegmentNames(relativePath, await fsp.readdir(dir));
     // 段文件名形如 seg-000001.mp4，序号即时间顺序；起始 tick 由段时长累加得出
     const out: { path: string; startTick: number; durationTicks: number; bytes: number }[] = [];
     let cursor = 0;
@@ -2151,6 +2353,16 @@ function registerIpc(): void {
   });
 
   // ---- 窗口 ----
+  handleFor(IPC.windowLayout, ['main'], async (raw: unknown) => {
+    const options = raw as { mode: 'launcher' | 'editor' | 'selection' | 'maximize'; height?: number; sourceId?: string };
+    if (!options || !['launcher', 'editor', 'selection', 'maximize'].includes(options.mode)) throw new Error('窗口模式无效');
+    if (options.mode === 'selection' && options.sourceId?.startsWith('window:')) {
+      const source = (await listNativeWindows()).find(item => item.id === options.sourceId && item.available);
+      if (!source) throw new Error('所选窗口已关闭或最小化');
+      windowSources.set(source.id, source);
+    }
+    return layoutMain(options);
+  });
   handleFor(IPC.windowSetAlwaysOnTop, ['main'], async (value: unknown) => {
     if (typeof value === 'boolean' && mainWindow && !mainWindow.isDestroyed()) mainWindow.setAlwaysOnTop(value);
     return null;
@@ -2300,23 +2512,20 @@ function registerMediaProtocol(): void {
 // 启动
 // ---------------------------------------------------------------------------
 
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  // 另一个实例已在运行。注意：某些受限环境下锁文件无法创建（EPERM/EACCES），
-  // 这时 Chromium 会报告 "Lock file can not be created" 并让这里返回 false，
-  // 但并没有真正在运行的实例。此时直接退出会表现为"应用无法启动"，
-  // 因此这里的处理是：接受锁失败并继续启动（单实例保护退化为尽力而为）。
-  console.warn('[main] 单实例锁不可用（受限环境），继续以独立实例启动。');
-  startApp();
-} else {
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-    }
-  });
-  startApp();
-}
+let activationPending = false;
+const instance = new SingleInstance(app.getPath('userData'), () => {
+  if (!mainWindow || mainWindow.isDestroyed()) { activationPending = true; return; }
+  if (ACTIVE_CAPTURE_STATES.has(engine.getState())) { createOverlayWindow().show(); return; }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show(); mainWindow.focus();
+});
+void instance.acquire().then(primary => {
+  if (primary) startApp();
+  else app.exit(0);
+}).catch(error => {
+  console.error('[main] 无法建立单实例互斥', error);
+  app.exit(1);
+});
 
 function startApp(): void {
   // 隐藏窗口里连续做 WebCodecs 硬件编码时，Chromium 的 GPU 沙箱在受限环境下
@@ -2383,15 +2592,23 @@ function startApp(): void {
     session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
       const contents = request.frame ? webContents.fromFrame(request.frame) : undefined;
       const capture = contents ? desktopSources.get(contents.id) : undefined;
-      callback(capture ? { video: capture.source } : {});
+      callback(capture?.source ? { video: capture.source } : {});
     }, { useSystemPicker: false });
 
     registerMediaProtocol();
     registerIpc();
     registerShortcuts();
+    // 托盘是录制的兜底停止入口（悬浮条被全屏遮挡/意外销毁时仍可停止），随应用常驻。
+    ensureTray();
 
     Menu.setApplicationMenu(null);
     mainWindow = createMainWindow();
+    if (activationPending) mainWindow.once('ready-to-show', () => mainWindow?.focus());
+    if (process.env.WCS_STARTUP_PROBE === '1') void runStartupProbe(mainWindow, APP_ROOT, startupScans, () => camera?.getStatus());
+    if (process.env.WCS_STUDIO_PROBE === '1') void runStudioProbe(mainWindow, APP_ROOT,
+      () => !overlayWindow || overlayWindow.isDestroyed(),
+      () => (overlayWindow && !overlayWindow.isDestroyed() ? overlayWindow : null),
+      root => { allowProjectRoot(root); allowOutputRoot(root); });
 
     // 自动化端到端录制验证（无人工干预）：
     //   WCS_RECORDER_PROBE=1 时，启动后自动走一次完整录制会话并输出结果。

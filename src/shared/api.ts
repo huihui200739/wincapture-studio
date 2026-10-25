@@ -79,10 +79,11 @@ export interface OverlayApi {
 }
 
 export interface WcsApi {
+  windowLayout(options: { mode: 'launcher' | 'editor' | 'selection' | 'maximize'; height?: number; sourceId?: string }): Promise<IpcResponse<{ width: number; height: number; target?: { x: number; y: number; width: number; height: number } }>>;
   desktop?: { frame(payload: unknown): void };
   recorder?: { onSegment(callback: (request: unknown) => void): () => void; complete(reply: unknown): void };
   // ---- 采集 ----
-  listSources(): Promise<IpcResponse<CaptureSourceInfo[]>>;
+  listSources(options?: { kind?: 'screen' | 'window'; thumbnails?: boolean }): Promise<IpcResponse<CaptureSourceInfo[]>>;
   listDisplays(): Promise<IpcResponse<DisplayInfo[]>>;
   listDevices(): Promise<IpcResponse<{ audio: AudioDeviceInfo[]; video: VideoDeviceInfo[] }>>;
   qualityProfiles(): Promise<IpcResponse<QualityProfile[]>>;

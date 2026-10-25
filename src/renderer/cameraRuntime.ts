@@ -17,6 +17,7 @@
 
 import { SegmentEncoder } from '../media/encode';
 import { CameraFrameBuffer, type CameraMediaClock } from '../media/cameraBuffer';
+import { cameraCandidates, cameraStreamWithTimeout } from '../media/cameraDevices';
 
 export interface CameraSegmentRequest {
   /** 段序号，与 screen 段一致 */
@@ -130,14 +131,15 @@ async function listDevices(): Promise<CameraDeviceInfo[]> {
  */
 async function waitForFirstFrame(videoEl: HTMLVideoElement, timeoutMs = 3000): Promise<void> {
   if (videoEl.readyState >= 2) return;
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     let settled = false;
     const finish = (): void => {
       if (settled) return;
       settled = true;
       window.clearTimeout(timer);
       videoEl.onloadeddata = null;
-      resolve();
+      if (videoEl.readyState >= 2 && videoEl.videoWidth > 0) resolve();
+      else reject(new Error('摄像头已连接，但没有收到画面'));
     };
     const timer = window.setTimeout(finish, timeoutMs);
     videoEl.onloadeddata = finish;
@@ -158,23 +160,14 @@ async function open(deviceId?: string): Promise<{ ok: boolean; deviceId?: string
   await close();
   const { video: videoEl } = ensureElements();
 
-  const attempts: (MediaStreamConstraints | null)[] = [];
-  if (deviceId) {
-    attempts.push({
-      video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-      audio: false,
-    });
-  }
-  attempts.push({
-    video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-    audio: false,
-  });
+  const candidates = cameraCandidates(await listDevices(), deviceId);
 
   let lastError = '';
-  for (const constraints of attempts) {
-    if (!constraints) continue;
+  for (const candidate of candidates) {
     try {
-      const media = await navigator.mediaDevices.getUserMedia(constraints);
+      const media = await cameraStreamWithTimeout(navigator.mediaDevices.getUserMedia({
+        video: { ...(candidate ? { deviceId: { exact: candidate } } : {}), width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }, audio: false,
+      }));
       stream = media;
       videoEl.srcObject = media;
       await videoEl.play();
@@ -185,7 +178,7 @@ async function open(deviceId?: string): Promise<{ ok: boolean; deviceId?: string
       startFrameSampling();
       return { ok: true, deviceId: activeDeviceId ?? undefined, label };
     } catch (error) {
-      lastError = String(error instanceof Error ? error.message : error);
+      lastError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
       // 释放本轮可能已经拿到的流（play() 失败时 getUserMedia 已成功）
       await close();
       // NotAllowedError 说明是权限问题，换约束重试也没用

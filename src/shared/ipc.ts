@@ -102,7 +102,7 @@ export interface CaptureConfig {
   /** 兼容采集缩放：清晰度或帧率优先，原尺寸采集不受影响。 */
   scaling?: 'quality' | 'performance';
   sourceId: string;
-  sourceKind: 'screen' | 'window';
+  sourceKind: 'screen' | 'window' | 'device';
   qualityId: string;
   fps: { num: number; den: number };
   /**
@@ -121,6 +121,8 @@ export interface CaptureConfig {
   countdownSeconds: number;
   /** 是否为 30 秒自动停止的测试模式（诊断用） */
   testMode?: boolean;
+  projectName?: string;
+  outputDirectory?: string;
 }
 
 export interface CaptureStatus {
@@ -277,6 +279,7 @@ export const IPC = {
 
   // 窗口
   windowSetAlwaysOnTop: 'window:set-always-on-top',
+  windowLayout: 'window:layout',
   windowMinimize: 'window:minimize',
   windowClose: 'window:close',
   windowOpenOverlay: 'window:open-overlay',

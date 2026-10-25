@@ -135,6 +135,7 @@ const ICON_PATHS: Record<string, ReactNode> = {
       <path d="M3.5 7.5V5h5l2 2" />
     </>
   ),
+  crop: <><path d="M6 2v16h16M2 6h16v16" /><path d="M10 6h8v8" /></>,
   chevronDown: <path d="M6 9.5l6 6 6-6" />,
   chevronRight: <path d="M9.5 6l6 6-6 6" />,
   chevronLeft: <path d="M14.5 6l-6 6 6 6" />,

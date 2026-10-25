@@ -156,6 +156,7 @@ async function interactions(win) {
     const tabs = [...document.querySelectorAll('.inspector-tab')];
     const tab = tabs.find((t) => t.textContent.includes('遮挡'));
     if (tab) tab.click();
+    [...document.querySelectorAll('.studio-canvas-tabs button')].find(b => b.textContent === '布局')?.click();
     return tabs.map((t) => t.textContent.trim());
   })()`);
   await settle(win, 350);
@@ -348,11 +349,14 @@ app.whenReady().then(async () => {
     // ---- 编辑器 · 画布属性 ----
     await win.webContents.executeJavaScript(`(() => {
       const tabs = [...document.querySelectorAll('.inspector-tab')];
-      const tab = tabs.find((t) => t.textContent.includes('画布'));
+      const tab = document.getElementById('inspector-tab-canvas');
       if (tab) tab.click();
+    [...document.querySelectorAll('.studio-canvas-tabs button')].find(b => b.textContent === '布局')?.click();
       return true;
     })()`);
     await settle(win, 500);
+    await win.webContents.executeJavaScript(`[...document.querySelectorAll('.studio-canvas-tabs button')].find(b=>b.textContent==='布局')?.click()`);
+    await settle(win, 200);
     summary.checks.canvasTab = await win.webContents.executeJavaScript(`(() => ({
       variantCards: document.querySelectorAll('.variant-card').length,
       swatches: document.querySelectorAll('.swatch').length,

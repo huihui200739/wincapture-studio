@@ -82,7 +82,7 @@ const DEFAULT_CONFIG: CaptureConfig = captureConfigFromDefaults(loadSettings().c
 function readHashView(): ViewId {
   const hash = typeof location !== 'undefined' ? location.hash.replace(/^#\/?/, '') : '';
   const found = VIEWS.find((v) => v.id === hash);
-  return found ? found.id : 'home';
+  return found ? found.id : typeof window !== 'undefined' && window.wcs ? 'record' : 'home';
 }
 
 interface AppContextValue {
@@ -137,7 +137,7 @@ interface AppContextValue {
   updateConfig: (patch: Partial<CaptureConfig>) => void;
   capture: CaptureStatus | null;
   capturing: boolean;
-  startRecording: () => Promise<void>;
+  startRecording: (overrides?: Partial<CaptureConfig>) => Promise<void>;
   pauseRecording: () => Promise<void>;
   resumeRecording: () => Promise<void>;
   stopRecording: () => Promise<void>;
@@ -701,14 +701,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
     saveSettings({ captureDefaults: captureDefaultsOf(config) });
   }, [config]);
 
-  const startRecording = useCallback(async () => {
-    if (!config.sourceId) {
+  const startRecording = useCallback(async (overrides?: Partial<CaptureConfig>) => {
+    const recordingConfig = { ...config, ...overrides };
+    if (!recordingConfig.sourceId) {
       pushToast({ tone: 'warn', title: '请先选择录制来源', message: '在「来源」里选择显示器或窗口后再开始。' });
       return;
     }
     setBusy('capture', true);
     try {
-      const result = unwrap(await wcs().startCapture(config));
+      const result = unwrap(await wcs().startCapture(recordingConfig));
       capturePathRef.current = result.projectPath;
       readyHandledRef.current = null;
       pushToast({ tone: 'ok', title: '录制已开始', message: '倒计时结束后开始采集画面与声音。' });

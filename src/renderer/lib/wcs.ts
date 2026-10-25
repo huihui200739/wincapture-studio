@@ -601,6 +601,10 @@ class MockWcs implements WcsApi {
     return ok(null);
   }
 
+  async windowLayout(options: { mode: 'launcher' | 'editor' | 'selection' | 'maximize'; height?: number; sourceId?: string }): Promise<IpcResponse<{ width: number; height: number }>> {
+    return ok({ width: window.innerWidth, height: options.height ?? window.innerHeight });
+  }
+
   async minimize(): Promise<IpcResponse<null>> {
     return ok(null);
   }

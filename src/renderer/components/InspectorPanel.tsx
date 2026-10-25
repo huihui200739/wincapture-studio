@@ -29,6 +29,7 @@ import { Badge, Button, Field, Icon, IconButton, InlineNote, Segmented, Slider, 
 import { cn, clamp } from '../lib/format';
 import { planClipMove, splittableTick, clipEndTick } from './Timeline';
 import { CANVAS_PRESETS } from '@domain/presets';
+import { PreviewCanvas } from './PreviewCanvas';
 import { planProjectAutoZoom } from '@domain/zoom';
 import { wcs } from '../lib/wcs';
 import { unwrap } from '../lib/format';
@@ -36,11 +37,11 @@ import { unwrap } from '../lib/format';
 type Tab = 'clip' | 'zoom' | 'privacy' | 'cursor' | 'canvas';
 
 const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: 'clip', label: '片段', icon: 'layers' },
-  { id: 'zoom', label: '运镜', icon: 'zoomIn' },
-  { id: 'privacy', label: '遮挡', icon: 'shield' },
+  { id: 'canvas', label: '画面', icon: 'image' },
+  { id: 'clip', label: '剪辑', icon: 'layers' },
+  { id: 'zoom', label: '缩放', icon: 'zoomIn' },
   { id: 'cursor', label: '光标', icon: 'cursor' },
-  { id: 'canvas', label: '画布', icon: 'image' },
+  { id: 'privacy', label: '遮挡', icon: 'shield' },
 ];
 
 const BACKGROUND_SWATCHES = [
@@ -161,7 +162,7 @@ export function InspectorPanel() {
     tick,
     pushToast,
   } = useApp();
-  const [tab, setTab] = useState<Tab>('clip');
+  const [tab, setTab] = useState<Tab>('canvas');
 
   const selectedClip = useMemo(() => {
     if (!project || !selectedClipId) return null;
@@ -227,6 +228,7 @@ export function InspectorPanel() {
       </div>
 
       <div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${tab}`}>
+        <div className="studio-inspector-title"><h2>{TABS.find(t => t.id === tab)?.label}</h2><span>{selectedEffect || selectedClip ? '所选片段' : '全片'}</span></div>
         {tab === 'clip' && (
           <ClipTab
             project={project}
@@ -1367,6 +1369,8 @@ function CanvasTab({
   selectedEffect: Effect | null;
   execute: ReturnType<typeof useApp>['execute'];
 }) {
+  const { projectPath, tick } = useApp();
+  const [page, setPage] = useState<'background' | 'layout' | 'camera'>('background');
   const canvas = project.settings.canvas;
   const variant = project.variants.find((v) => v.id === project.settings.activeVariantId) ?? project.variants[0];
 
@@ -1407,8 +1411,10 @@ function CanvasTab({
   };
 
   return (
-    <>
-      <div className="inspector-section">
+    <div className="studio-canvas-controls" data-page={page}>
+      <div className="studio-canvas-tabs" role="tablist" aria-label="画面设置分类">{([['background','背景'],['layout','布局'],['camera','摄像头']] as const).map(([id,label]) => <button key={id} role="tab" aria-selected={page === id} onClick={() => setPage(id)}>{label}</button>)}</div>
+      <div className="studio-canvas-preview"><PreviewCanvas project={project} projectPath={projectPath} tick={tick} maxWidth={320} includeOverlays={false} /></div>
+      <div className="inspector-section" data-canvas-group="background">
         <div className="inspector-section-head"><h3>场景预设</h3><Badge tone="muted">一键应用</Badge></div>
         <div className="canvas-presets" role="group" aria-label="场景预设">
           {CANVAS_PRESETS.map((preset) => {
@@ -1423,7 +1429,7 @@ function CanvasTab({
           })}
         </div>
       </div>
-      <div className="inspector-section">
+      <div className="inspector-section" data-canvas-group="layout">
         <div className="inspector-section-head">
           <h3>
             <Icon name="image" size={12} />
@@ -1454,7 +1460,7 @@ function CanvasTab({
         </p>
       </div>
 
-      <div className="inspector-section">
+      <div className="inspector-section" data-canvas-group="background">
         <div className="inspector-section-head">
           <h3>背景</h3>
         </div>
@@ -1492,7 +1498,7 @@ function CanvasTab({
         </p>
       </div>
 
-      <div className="inspector-section">
+      <div className="inspector-section" data-canvas-group="layout">
         <div className="inspector-section-head">
           <h3>画面装饰</h3>
         </div>
@@ -1534,7 +1540,7 @@ function CanvasTab({
         />
       </div>
 
-      <div className="inspector-section">
+      <div className="inspector-section" data-canvas-group="camera">
         <div className="inspector-section-head">
           <h3>摄像头布局</h3>
           <button
@@ -1590,6 +1596,6 @@ function CanvasTab({
           遮挡矩形按「源画面坐标」记录，换画幅后仍会跟随内容位置，不需要重新框选。
         </InlineNote>
       )}
-    </>
+    </div>
   );
 }
