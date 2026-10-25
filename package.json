@@ -29,6 +29,7 @@
     "verify:layout": "node scripts/run-electron.mjs scripts/verify-layout.cjs",
     "verify:icon": "node scripts/run-electron.mjs scripts/verify-icon.cjs",
     "verify:overlay": "node scripts/run-electron.mjs scripts/verify-overlay.cjs",
+    "verify:drag": "node scripts/run-electron.mjs scripts/verify-drag.cjs",
     "verify:exporter": "node scripts/run-electron.mjs scripts/verify-exporter.cjs",
     "verify:parity": "node scripts/run-electron.mjs scripts/verify-parity.cjs",
     "verify:remaining": "node scripts/run-electron.mjs scripts/verify-remaining.cjs",

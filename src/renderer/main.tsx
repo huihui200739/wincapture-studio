@@ -15,6 +15,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { OverlayWindow } from './views/OverlayWindow';
+import { ReviewCard } from './views/ReviewCard';
 import { AppProvider } from './lib/store';
 import { ErrorBoundary } from './components/ui';
 // 隐藏窗口的运行时必须在构建期静态引入，否则 Vite 不会把它打进产物，
@@ -27,7 +28,7 @@ import './desktopRuntime';
 import './styles.css';
 import './studio.css';
 
-type Role = 'main' | 'overlay' | 'recorder' | 'exporter' | 'camera';
+type Role = 'main' | 'overlay' | 'recorder' | 'exporter' | 'camera' | 'review';
 
 function resolveRole(): Role {
   const declared = typeof window !== 'undefined' ? window.wcs?.role : undefined;
@@ -35,7 +36,8 @@ function resolveRole(): Role {
     declared === 'overlay' ||
     declared === 'recorder' ||
     declared === 'exporter' ||
-    declared === 'camera'
+    declared === 'camera' ||
+    declared === 'review'
   ) {
     return declared;
   }
@@ -45,6 +47,7 @@ function resolveRole(): Role {
     if (/(^#\/?recorder\b)|([?&]role=recorder)/.test(hash)) return 'recorder';
     if (/(^#\/?exporter\b)|([?&]role=exporter)/.test(hash)) return 'exporter';
     if (/(^#\/?camera\b)|([?&]role=camera)/.test(hash)) return 'camera';
+    if (/(^#\/?review\b)|([?&]role=review)/.test(hash)) return 'review';
   }
   return 'main';
 }
@@ -101,7 +104,7 @@ if (role === 'recorder' || role === 'exporter' || role === 'camera') {
             走 AppProvider 会额外触发「最近工程/系统信息/打开示例工程」等主窗口初始化逻辑
             （真实模式下甚至会弹出打开工程对话框）。
           */}
-          {role === 'overlay' ? <OverlayWindow /> : (
+          {role === 'overlay' ? <OverlayWindow /> : role === 'review' ? <ReviewCard /> : (
             <AppProvider>
               <App />
             </AppProvider>

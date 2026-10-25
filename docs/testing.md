@@ -18,7 +18,9 @@
 
 `npm run verify:startup` 通过正式入口验收胶囊启动耗时、启动扫描次数、空闲事件循环延迟、重复启动互斥、默认摄像头连续两轮真实录制与正常退出。需要物理摄像头可用；独立 userData，结果写入 dist/verify/startup-camera-result.json。对应回归单测为 tests/main-ipc/singleInstance.test.ts 与 tests/media/cameraDevices.test.ts。
 
-`npm run verify:studio` 验证新的胶囊与桌面确认流程，包括区域框移动、真实录屏、停止后恢复浅色编辑器、两路 WAV 分段读取与含 AAC 音轨的 MP4 导出。可设置 `WCS_STUDIO_DEVICE=1` 验证实际视频设备直录；`WCS_STUDIO_PROJECT` 指定已有工程，复验此前音频缺失警告。结果与界面截图写入 dist/verify/studio/。
+`npm run verify:studio` 验证新的胶囊与桌面确认流程，包括区域框移动、真实录屏、停止后弹出右下角完成卡片（缩略图首帧、不自动进编辑器）、点「进入编辑」恢复浅色编辑器、两路 WAV 分段读取与含 AAC 音轨的 MP4 导出。可设置 `WCS_STUDIO_DEVICE=1` 验证实际视频设备直录；`WCS_STUDIO_PROJECT` 指定已有工程，复验此前音频缺失警告。结果与界面截图写入 dist/verify/studio/。
+
+`npm run verify:drag` 验证无边框窗口拖拽链路：加载真实 dist 渲染层与 preload，在悬浮条真实把手上派发受控 `screenX/screenY` 指针序列，断言窗口按增量移动、二次拖拽无重复步进。结果写入 dist/verify/drag-result.json。
 
 先运行 npm run check 和 npm run build。本批 928 项单测、55 条 IPC 契约；测试数量不代表所有硬件均已验收。
 

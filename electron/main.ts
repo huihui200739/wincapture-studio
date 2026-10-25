@@ -42,6 +42,7 @@ import { QUALITY_PROFILES } from '../src/shared/ipc';
 import { AppError } from '../src/shared/errors';
 import type { Project } from '../src/domain/project';
 import { planProjectAutoZoom } from '../src/domain/zoom';
+import { ticksToSeconds } from '../src/domain/timebase';
 import { readPointerLog } from './pointerLog';
 import { recordedSegmentNames } from './mediaSegments';
 import { SingleInstance } from './singleInstance';
@@ -121,6 +122,14 @@ let recorderWindow: BrowserWindow | null = null;
 let cameraWindow: BrowserWindow | null = null;
 /** 托盘：录制的兜底停止入口。必须常驻引用，否则 GC 回收后图标自动消失。 */
 let tray: Tray | null = null;
+/** 录制完成卡片（右下角小窗）：停止后弹出，进入编辑或关闭。 */
+let reviewWindow: BrowserWindow | null = null;
+/** 本次录制落盘的工程路径（卡片标题与缩略图用）；开始录制时设置，卡片消费后清除。 */
+let captureProjectPath: string | null = null;
+/** 本次录制目标显示器的 id：卡片跟随出现在被录制画面所在的显示器。 */
+let captureDisplayId: number | null = null;
+/** 已弹过卡片的会话键（sessionId:mediaTick）：ReadyToEdit 可能推送多次，不能重复开窗。 */
+let reviewOpenedKey: string | null = null;
 
 let store: ProjectStore;
 let engine: CaptureEngine;
@@ -164,7 +173,7 @@ const exporterWindows = new Set<BrowserWindow>();
 /** 退出流程只执行一次。 */
 let shutdownStarted = false;
 
-type WindowRole = 'main' | 'overlay' | 'exporter' | 'recorder' | 'camera';
+type WindowRole = 'main' | 'overlay' | 'exporter' | 'recorder' | 'camera' | 'review';
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -215,12 +224,13 @@ function sendAppEvent(type: string, payload: unknown): void {
   send(IPC.captureEvent, { type, payload });
 }
 
-/** 通过 URL hash 判定窗口角色（main/overlay/exporter/recorder/camera 各自独立加载）。 */
+/** 通过 URL hash 精确判定窗口角色（main/overlay/exporter/recorder/camera/review 各自独立加载）。
+ *  只认 hash 首段 token：旧实现用子串匹配，工程路径里含 camera/overlay 等词会误判角色。 */
 function roleFromUrl(url: string): WindowRole {
-  const hash = typeof url === 'string' && url.includes('#') ? url.slice(url.indexOf('#')) : '';
-  const candidates: WindowRole[] = ['overlay', 'exporter', 'recorder', 'camera'];
-  for (const role of candidates) {
-    if (hash.includes(role)) return role;
+  const hash = typeof url === 'string' && url.includes('#') ? url.slice(url.indexOf('#') + 1) : '';
+  const token = hash.split('?')[0].split('/')[0];
+  if (token === 'overlay' || token === 'exporter' || token === 'recorder' || token === 'camera' || token === 'review') {
+    return token;
   }
   return 'main';
 }
@@ -959,7 +969,9 @@ function buildEngine(): CaptureEngine {
         // 托盘菜单跟随录制状态（仅状态迁移时重建，电平等高频推送不触发）。
         if (!shutdownStarted && status.state !== trayState) rebuildTrayMenu();
         if (status.state === 'Recording' || status.state === 'Countdown') mainWindow?.hide();
-        if (status.state === 'ReadyToEdit') layoutMain({ mode: 'editor' });
+        // 停止后不直接把编辑器甩给用户：先弹右下角完成卡片（缩略图 + 进入编辑）。
+        // 引擎自动结束（磁盘满/崩溃）也走这里，所以卡片以 onStatus 为唯一入口。
+        if (status.state === 'ReadyToEdit' && !shutdownStarted) createReviewWindow(status);
         if (status.state === 'RecoverableFailure') { layoutMain({ mode: 'launcher', height: 190 }); }
       },
       requestSegment: async (info) => {
@@ -1289,6 +1301,104 @@ function closeOverlayWindow(): void {
 }
 
 // ---------------------------------------------------------------------------
+// 录制完成卡片：停止后出现在被录制显示器右下角的小窗
+//
+// 参考成熟录屏软件的收尾交互（借鉴行为约定，不抄代码）：停止后不直接把编辑器
+// 全屏甩到用户脸上，而是先给一张缩略图卡片（时长/分辨率 + 进入编辑），
+// 让用户决定下一步。Kap/Cap 的收尾窗口同样是独立置顶小窗。
+// ---------------------------------------------------------------------------
+
+/** 找第一个可做缩略图的分段（屏幕优先，其次摄像头）。 */
+function firstRecordingThumbnail(projectPath: string): string | null {
+  for (const kind of ['screen', 'camera']) {
+    try {
+      const dir = path.join(projectPath, 'media', kind);
+      const name = fs.readdirSync(dir).filter((item) => item.endsWith('.mp4')).sort()[0];
+      if (name) return `media/${kind}/${name}`;
+    } catch {
+      // 目录不存在（无该轨）继续找
+    }
+  }
+  return null;
+}
+
+/** 弹出录制完成卡片（幂等：同一会话只弹一次）。 */
+function createReviewWindow(status: CaptureStatus): void {
+  if (!captureProjectPath) return;
+  const key = `${status.sessionId ?? ''}:${status.mediaTick}`;
+  if (reviewOpenedKey === key) return;
+  reviewOpenedKey = key;
+  closeReviewWindow('silent');
+  const display = screen.getAllDisplays().find((item) => item.id === captureDisplayId) ?? screen.getPrimaryDisplay();
+  const width = 348;
+  const height = 330;
+  const area = display.workArea;
+  const thumbnail = firstRecordingThumbnail(captureProjectPath);
+  const params = new URLSearchParams({
+    p: captureProjectPath,
+    n: path.basename(captureProjectPath).replace(/\.wcaproj$/i, '').replace(/-\d{10,}$/, ''),
+    d: String(Math.round(ticksToSeconds(status.mediaTick) * 10) / 10),
+    w: String(status.effective?.width ?? 0),
+    h: String(status.effective?.height ?? 0),
+    t: thumbnail ?? '',
+  });
+  const win = new BrowserWindow({
+    width,
+    height,
+    x: Math.round(area.x + area.width - width - 26),
+    y: Math.round(area.y + area.height - height - 26),
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    show: false,
+    hasShadow: false,
+    webPreferences: {
+      preload: path.join(APP_ROOT, 'dist', 'main', 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      sandbox: false,
+      backgroundThrottling: false,
+    },
+  });
+  win.setAlwaysOnTop(true, 'floating');
+  reviewWindow = win;
+  win.on('closed', () => {
+    if (reviewWindow === win) reviewWindow = null;
+  });
+  win.once('ready-to-show', () => {
+    if (reviewWindow === win) win.showInactive();
+  });
+  loadRenderer(win, `#review?${params.toString()}`);
+}
+
+/**
+ * 关闭录制完成卡片。
+ *  - silent：开始新录制等场景，静默关闭，不动主窗口；
+ *  - dismiss：用户点了 ×，回到启动胶囊（应用不能因此变得无处可点）；
+ *  - consume：用户点了「进入编辑」，编辑器正在打开，不需要额外布局。
+ */
+function closeReviewWindow(mode: 'silent' | 'dismiss' | 'consume'): void {
+  const win = reviewWindow;
+  reviewWindow = null;
+  if (win && !win.isDestroyed()) {
+    try {
+      win.destroy();
+    } catch {
+      // 忽略
+    }
+  }
+  if (mode !== 'silent') captureProjectPath = null;
+  if (mode === 'dismiss') layoutMain({ mode: 'launcher', height: 96 });
+}
+
+// ---------------------------------------------------------------------------
 // 托盘：录制的兜底停止入口
 //
 // 设计参考同类成熟录屏软件（只借鉴行为约定，不抄实现）：
@@ -1422,6 +1532,7 @@ async function stopCaptureSession(): Promise<{ projectPath: string; status: Capt
 /** 销毁所有隐藏窗口（退出前调用，否则 window-all-closed 永远不会触发）。 */
 function destroyAuxiliaryWindows(): void {
   closeOverlayWindow();
+  closeReviewWindow('silent');
   if (tray && !tray.isDestroyed()) {
     try {
       tray.destroy();
@@ -1769,6 +1880,10 @@ function registerIpc(): void {
     captureStartInFlight = true;
     try {
       const config = validateCaptureConfig(rawConfig);
+      // 新录制开始：上一场的完成卡片不再有意义，静默关掉并刷新卡片定位信息
+      closeReviewWindow('silent');
+      reviewOpenedKey = null;
+      captureDisplayId = overlayDisplayFor(config.sourceId).id;
       if (config.sourceKind === 'window') {
         const fresh = (await listNativeWindows()).find(item => item.id === config.sourceId);
         if (!fresh?.available || !windowSources.has(config.sourceId)) throw new AppError({ code: 'E_SOURCE_CLOSED', message: '所选窗口已关闭或最小化，请重新选择。', retryable: true, preservedData: true });
@@ -1813,6 +1928,7 @@ function registerIpc(): void {
         session.degradation = session.degradation ? `${session.degradation}；${cameraNote}` : cameraNote;
       }
       overlaySourceId = config.sourceId;
+      captureProjectPath = projectPath;
       createOverlayWindow();
       return { sessionId: session.sessionId, projectPath, cameraNote };
     } finally {
@@ -1987,7 +2103,7 @@ function registerIpc(): void {
     return null;
   });
 
-  handleFor(IPC.projectReadMedia, ['main', 'exporter'], async (projectPath: unknown, relativePath: unknown) => {
+  handleFor(IPC.projectReadMedia, ['main', 'exporter', 'review'], async (projectPath: unknown, relativePath: unknown) => {
     const root = await assertAllowedProjectPath(projectPath);
     if (typeof relativePath !== 'string') {
       throw new AppError({ code: 'E_INVALID_COMMAND', message: '素材路径参数无效。', retryable: false, preservedData: true });
@@ -2298,7 +2414,7 @@ function registerIpc(): void {
     return null;
   });
 
-  handleFor(IPC.systemShowInFolder, ['main'], async (p: unknown) => {
+  handleFor(IPC.systemShowInFolder, ['main', 'review'], async (p: unknown) => {
     const abs = await assertOpenablePath(p);
     shell.showItemInFolder(abs);
     return null;
@@ -2381,6 +2497,35 @@ function registerIpc(): void {
   });
   handleFor(IPC.windowCloseOverlay, ['main'], async () => {
     closeOverlayWindow();
+    return null;
+  });
+  // 无边框透明窗口上 -webkit-app-region 拖拽不可靠（实测拖不动）：
+  // 渲染层在把手上用 pointer capture 采样位移，这里按增量移动发起调用的那个窗口。
+  ipcMain.handle(IPC.windowMoveBy, (event, dx: unknown, dy: unknown) => runHandler(IPC.windowMoveBy, () => {
+    assertSenderRole(event, ['main', 'overlay'], IPC.windowMoveBy);
+    const stepX = Number(dx);
+    const stepY = Number(dy);
+    if (!Number.isFinite(stepX) || !Number.isFinite(stepY)) return null;
+    const win = senderRole(event) === 'overlay' ? overlayWindow : mainWindow;
+    if (!win || win.isDestroyed()) return null;
+    const bounds = win.getBounds();
+    win.setPosition(bounds.x + Math.round(stepX), bounds.y + Math.round(stepY));
+    return null;
+  }));
+  // 录制完成卡片「进入编辑」：布局编辑器窗口并通知主窗口渲染进程打开该工程
+  handleFor(IPC.windowOpenEditor, ['review'], async (projectPath: unknown) => {
+    if (typeof projectPath !== 'string' || !projectPath) {
+      throw new AppError({ code: 'E_INVALID_COMMAND', message: '工程路径无效。', retryable: false, preservedData: true });
+    }
+    await assertAllowedProjectPath(projectPath);
+    closeReviewWindow('consume');
+    layoutMain({ mode: 'editor' });
+    sendAppEvent('review-edit', { projectPath });
+    return null;
+  });
+  // 录制完成卡片「×」：关闭卡片并回到启动胶囊（应用不能因此无处可点）
+  handleFor(IPC.windowCloseReview, ['review'], async () => {
+    closeReviewWindow('dismiss');
     return null;
   });
 
@@ -2608,6 +2753,7 @@ function startApp(): void {
     if (process.env.WCS_STUDIO_PROBE === '1') void runStudioProbe(mainWindow, APP_ROOT,
       () => !overlayWindow || overlayWindow.isDestroyed(),
       () => (overlayWindow && !overlayWindow.isDestroyed() ? overlayWindow : null),
+      () => (reviewWindow && !reviewWindow.isDestroyed() ? reviewWindow : null),
       root => { allowProjectRoot(root); allowOutputRoot(root); });
 
     // 自动化端到端录制验证（无人工干预）：

@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import type { CaptureState, CaptureStatus, IpcResponse } from '@shared/ipc';
 import { cn, formatBytes, formatClock } from '../lib/format';
+import { handleWindowDrag } from '../lib/windowDrag';
 import { Icon } from '../components/ui';
 import { createStatusCoalescer, memoMarkNote, type StatusCoalescer } from '../uiSync';
 
@@ -318,6 +319,8 @@ export function OverlayBar({
             <Icon name="editor" size={12} />
           </button>
         )}
+        {/* 与启动胶囊一致的拖拽把手：录制中也能把控制条拖到顺手的位置 */}
+        <span className="rec-drag" aria-hidden="true" title="拖动控制条" onPointerDown={handleWindowDrag}>⠿</span>
       </div>
     </div>
   );

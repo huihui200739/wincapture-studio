@@ -162,13 +162,19 @@ export interface WcsApi {
   setAlwaysOnTop(value: boolean): Promise<IpcResponse<null>>;
   minimize(): Promise<IpcResponse<null>>;
   close(): Promise<IpcResponse<null>>;
+  /** 无边框窗口拖拽：渲染层 pointer 事件驱动，主进程按增量移动窗口（app-region 在透明窗口上不可靠） */
+  moveWindowBy(dx: number, dy: number): Promise<IpcResponse<null>>;
+  /** 录制完成卡片：进入编辑器 */
+  openEditor(projectPath: string): Promise<IpcResponse<null>>;
+  /** 录制完成卡片：右上角 ×，关闭卡片并回到启动胶囊 */
+  closeReviewCard(): Promise<IpcResponse<null>>;
 
   // ---- 应用级事件 ----
   onAppEvent(cb: (event: { type: string; payload: unknown }) => void): () => void;
   /** 录制悬浮窗 */
   overlay: OverlayApi | null;
-  /** 当前窗口角色：main | overlay | exporter | recorder | camera */
-  role: 'main' | 'overlay' | 'exporter' | 'recorder' | 'camera';
+  /** 当前窗口角色：main | overlay | exporter | recorder | camera | review */
+  role: 'main' | 'overlay' | 'exporter' | 'recorder' | 'camera' | 'review';
   platform: string;
 }
 

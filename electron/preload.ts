@@ -25,9 +25,10 @@ function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
   };
 }
 
-const role: 'main' | 'overlay' | 'exporter' | 'recorder' | 'camera' = (() => {
+const role: 'main' | 'overlay' | 'exporter' | 'recorder' | 'camera' | 'review' = (() => {
   const hash = typeof window !== 'undefined' ? window.location.hash : '';
   if (hash.includes('overlay')) return 'overlay';
+  if (hash.includes('review')) return 'review';
   if (hash.includes('exporter')) return 'exporter';
   if (hash.includes('camera')) return 'camera';
   if (hash.includes('recorder')) return 'recorder';
@@ -104,6 +105,9 @@ const api: WcsApi = {
   setAlwaysOnTop: (value) => invoke(IPC.windowSetAlwaysOnTop, value),
   minimize: () => invoke(IPC.windowMinimize),
   close: () => invoke(IPC.windowClose),
+  moveWindowBy: (dx, dy) => invoke(IPC.windowMoveBy, dx, dy),
+  openEditor: (projectPath) => invoke(IPC.windowOpenEditor, projectPath),
+  closeReviewCard: () => invoke(IPC.windowCloseReview),
 
   // ---- 应用级事件 ----
   onAppEvent: (cb) => subscribe(IPC.captureEvent, cb),

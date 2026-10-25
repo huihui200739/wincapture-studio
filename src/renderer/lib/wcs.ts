@@ -613,6 +613,18 @@ class MockWcs implements WcsApi {
     return ok(null);
   }
 
+  async moveWindowBy(_dx: number, _dy: number): Promise<IpcResponse<null>> {
+    return ok(null);
+  }
+
+  async openEditor(_projectPath: string): Promise<IpcResponse<null>> {
+    return ok(null);
+  }
+
+  async closeReviewCard(): Promise<IpcResponse<null>> {
+    return ok(null);
+  }
+
   onAppEvent(cb: (event: { type: string; payload: unknown }) => void): () => void {
     return this.appEmitter.on(cb);
   }

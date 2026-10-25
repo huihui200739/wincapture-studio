@@ -4,6 +4,7 @@ import { QUALITY_PROFILES } from '@shared/ipc';
 import { useApp } from '../lib/store';
 import { wcs } from '../lib/wcs';
 import { unwrap, cn } from '../lib/format';
+import { handleWindowDrag } from '../lib/windowDrag';
 import { Icon } from '../components/ui';
 
 type Mode = 'screen' | 'window' | 'region' | 'device';
@@ -188,7 +189,7 @@ export function CaptureLauncher() {
         onClick={() => updateConfig({ [key]: !config[key] })}><Icon name={icon} size={22} />{!config[key] && <i />}</button>)}
       <button className={cn('capsule-more', panel === 'more' && 'active')} aria-label="更多录前设置" aria-expanded={panel === 'more'} onClick={() => setPanel(panel === 'more' ? null : 'more')}>•••</button>
       <button className="capsule-record" aria-label="选择范围并准备录制" title="选择范围并准备录制" onClick={() => void prepare()} disabled={busy.capture || loading}><span /></button>
-      <span className="capsule-drag" title="拖动录制胶囊">⠿</span>
+      <span className="capsule-drag" title="拖动录制胶囊" onPointerDown={handleWindowDrag}>⠿</span>
     </div>
     {error && <div className="launcher-error" role="alert">{error}<button aria-label="关闭错误" onClick={() => setError('')}>×</button></div>}
     {panel === 'sources' && <section className="launcher-popover source-popover" aria-label="录制来源选择">

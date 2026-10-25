@@ -2,6 +2,13 @@
 
 更新于 2026-10-25。本文和源码替代旧审计及阶段验收文档。
 
+## 本批实现：胶囊拖拽修复、录制条对比度与录制完成卡片
+
+- 拖拽修复：启动胶囊的 ⠿ 把手原先靠 `-webkit-app-region: drag`，但主窗口是 frameless + transparent + resizable:false 组合，实机验证拖不动。改为渲染层 `pointer capture` 采样 `screenX/screenY` 增量（rAF 合并，每帧最多一次 IPC），经新通道 `window:move-by` 由主进程移动发起调用的窗口；该钩子（`lib/windowDrag.ts`）同时接到录制悬浮条新增的 ⠿ 把手上，录制中也能拖动控制条。不再使用 app-region。
+- 录制条对比度：旧样式（`html[data-role=overlay]` 的浅灰字、无描边按钮）在明亮壁纸上几乎看不清，实测反馈「不明显」。重做：白色高不透明底 + 深色文字/粗体计时、按钮加描边与 hover、停止键红色带阴影、把手灰阶可见。
+- 录制完成卡片：停止录制（含磁盘满/崩溃自动停止）后不再直接把编辑器窗口甩给用户，而是在被录制显示器右下角弹出 348×330 置顶小卡片：视频首帧缩略图（`readMedia` 的 `wcs-media://` 流式 URL + `<video>` 定位 0.1s）、「时长 · 分辨率」角标、绿勾与工程名、「打开文件夹」「进入编辑 →」按钮与右上角 ×。点进入编辑才布局编辑器窗口并经 `review-edit` 应用事件打开工程；点 × 回到启动胶囊；开始新录制时旧卡片静默关闭。修复过程中发现 CSP `media-src` 未包含自定义协议导致 `<video>` 全部被拦，已加入 `wcs-media:`（应用自有协议，路径遍历已校验）。渲染进程角色新增 `review`（独立 hash，不挂 AppProvider），`roleFromUrl` 同时从子串匹配改为 hash 首 token 精确匹配，避免工程路径含 camera/overlay 等词时误判角色。
+- 验证：新增 `verify:drag`（真实 dist 渲染层 + 真实 preload，在真悬浮条把手上派发受控 `screenX/screenY` 指针序列，断言窗口按增量移动、二次拖拽无重复步进）；studio 探针改为卡片流程断言（停止后卡片弹出、不自动进编辑器、缩略图解码出首帧、点进入编辑后编辑器出现且卡片关闭）；卡片视觉以探针截图确认（缩略图/角标/按钮与参考设计一致）。941 项单测、56 条 IPC 契约、`verify:studio` 全链路与 `verify:overlay`（460px 内含把手后停止键仍完整可见）通过。
+
 ## 本批修复：录制中悬浮条丢失（无处点停止）与托盘兜底
 
 - 根因：`createOverlayWindow` 创建窗口后从未把引用赋给 `overlayWindow`，`ready-to-show` 里 `overlayWindow !== win` 恒成立，悬浮条刚就绪就被销毁——录制中找不到任何「停止」按钮；`closeOverlayWindow` 因此也永远关不到真窗口，每次重复创建还会多泄漏一个窗口。现在创建后立即保存引用，已存在且被隐藏时复用显示而非重建。

@@ -4,8 +4,9 @@ import path from 'node:path';
 import type { ProjectHandle } from '../src/shared/api';
 
 /** 真实主进程 / preload / React / 采集 / WAV / MP4 回归。独立 userData 运行。
- *  overlayRef：录制中必须返回悬浮条窗口——回归「悬浮条被误销毁导致无处点停止」。 */
-export async function runStudioProbe(win: BrowserWindow, root: string, overlayClosed: () => boolean, overlayRef: () => BrowserWindow | null, authorize: (root: string) => void): Promise<void> {
+ *  overlayRef：录制中必须返回悬浮条窗口——回归「悬浮条被误销毁导致无处点停止」。
+ *  reviewRef：停止后必须返回完成卡片窗口——回归「停止后无完成卡片/不弹编辑器」。 */
+export async function runStudioProbe(win: BrowserWindow, root: string, overlayClosed: () => boolean, overlayRef: () => BrowserWindow | null, reviewRef: () => BrowserWindow | null, authorize: (root: string) => void): Promise<void> {
   const out = path.join(root, 'dist', 'verify', 'studio');
   const report: Record<string, unknown> = {};
   const wait = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -69,8 +70,51 @@ export async function runStudioProbe(win: BrowserWindow, root: string, overlayCl
     const stopped = await js<{ data?: { projectPath: string; status: { state: string } }; ok: boolean }>(`window.wcs.stopCapture()`);
     check(stopped.ok && stopped.data?.status.state === 'ReadyToEdit', '从胶囊完成真实录制');
     const projectPath = stopped.data!.projectPath; report.projectPath = projectPath;
+    // 完成卡片回归（本轮交互改动）：停止后右下角弹卡片，主窗口不自动进编辑器，
+    // 点卡片「进入编辑」才打开剪辑台。旧探针断言「停止后直接显示编辑器」已不成立。
+    const reviewReady = async (): Promise<boolean> => {
+      const start = Date.now();
+      while (Date.now() - start < 15_000) {
+        const card = reviewRef();
+        if (card && !card.isDestroyed() && card.isVisible()) return true;
+        await wait(200);
+      }
+      return false;
+    };
+    check(await reviewReady(), '停止后右下角弹出录制完成卡片');
+    check(await js(`!document.querySelector('.studio-shell.is-editing')`), '停止后不自动跳转编辑器');
+    // 缩略图必须真的解码出首帧（readMedia 的 wcs-media:// 流式 URL + <video> 首帧）
+    const thumbReady = async (): Promise<boolean> => {
+      const start = Date.now();
+      while (Date.now() - start < 8_000) {
+        const card = reviewRef();
+        if (!card || card.isDestroyed()) return false;
+        try {
+          const state = await card.webContents.executeJavaScript(`(() => {
+            const v = document.querySelector('.review-thumb video');
+            return v ? v.readyState : -1;
+          })()`, true);
+          if (typeof state === 'number' && state >= 2) return true;
+        } catch { /* 窗口创建中，重试 */ }
+        await wait(200);
+      }
+      return false;
+    };
+    check(await thumbReady(), '完成卡片缩略图已解码出视频首帧');
+    const review = reviewRef()!;
+    try {
+      await fs.writeFile(path.join(out, '06-review-card.png'), (await review.webContents.capturePage()).toPNG());
+    } catch { /* 卡片截图失败不阻塞验收 */ }
+    const editClicked = await review.webContents.executeJavaScript(`(() => {
+      const btn = [...document.querySelectorAll('button')].find((b) => b.getAttribute('aria-label') === '进入编辑');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    })()`, true);
+    check(editClicked === true, '完成卡片上存在可点击的「进入编辑」按钮');
     await until(`!!document.querySelector('.studio-shell.is-editing')`); await wait(1200);
-    check(win.isVisible() && win.getBounds().width >= 1000 && overlayClosed(), '停止后显示编辑器并关闭悬浮条');
+    check(win.isVisible() && win.getBounds().width >= 1000 && overlayClosed(), '进入编辑后显示编辑器并关闭悬浮条');
+    check(!reviewRef(), '进入编辑后完成卡片已关闭');
     await shot('06-editor');
     const handle = await js<{ data: ProjectHandle }>(`window.wcs.openProject(${JSON.stringify(projectPath)})`);
     const audio = [];

@@ -285,6 +285,12 @@ export const IPC = {
   windowOpenOverlay: 'window:open-overlay',
   windowCloseOverlay: 'window:close-overlay',
   windowUpdateOverlay: 'window:update-overlay',
+  /** 无边框透明窗口上 -webkit-app-region 拖拽不可靠：由渲染层 pointer 事件驱动主进程移动窗口 */
+  windowMoveBy: 'window:move-by',
+  /** 录制完成卡片 → 主进程：用户点了「进入编辑」 */
+  windowOpenEditor: 'window:open-editor',
+  /** 录制完成卡片 → 主进程：用户点了右上角 ×，回到启动胶囊 */
+  windowCloseReview: 'window:close-review',
 
   // 悬浮窗（录制控制条）
   /** 主进程 → 悬浮窗的命令（暂停/恢复/停止/标记）；悬浮窗就绪前发送会被丢弃 */

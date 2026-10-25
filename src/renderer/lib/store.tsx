@@ -234,7 +234,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const tickRef = useRef(0);
   const historyRef = useRef(new CommandHistory());
   const capturePathRef = useRef<string | null>(null);
-  const readyHandledRef = useRef<string | null>(null);
   const toastTimers = useRef(new Map<string, number>());
   const toastsRef = useRef<ToastItem[]>([]);
   /** 工程打开/新建请求序号：迟到的旧响应直接丢弃，避免「后点先到」覆盖新工程。 */
@@ -711,7 +710,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     try {
       const result = unwrap(await wcs().startCapture(recordingConfig));
       capturePathRef.current = result.projectPath;
-      readyHandledRef.current = null;
       pushToast({ tone: 'ok', title: '录制已开始', message: '倒计时结束后开始采集画面与声音。' });
     } catch (error) {
       pushError(error, '开始录制失败');
@@ -747,26 +745,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const stopRecording = useCallback(async () => {
     setBusy('capture', true);
     // 主进程会先推送 ReadyToEdit 状态、再返回 stopCapture 结果。
-    // 置位后状态订阅不再自己打开工程，避免同一次停止触发两次 openProject。
+    // 置位后状态订阅不再自己处理完成态，避免同一次停止触发两次后续动作。
     stopFlowRef.current = true;
     try {
       const result = unwrap(await wcs().stopCapture());
       setCapture(result.status);
       capturePathRef.current = result.projectPath;
-      if (result.status.state === 'ReadyToEdit') {
-        const opened = await openProject(result.projectPath);
-        if (opened) {
-          setView('editor');
-          pushToast({ tone: 'ok', title: '录制完成，已进入编辑器', message: '素材封装完成，可以开始剪辑与遮挡检查。' });
-        }
-      }
+      // 停止后不自动进编辑器：主进程会在右下角弹完成卡片（缩略图 + 进入编辑），
+      // 由用户决定何时进入剪辑。
     } catch (error) {
       pushError(error, '停止录制失败');
     } finally {
       stopFlowRef.current = false;
       setBusy('capture', false);
     }
-  }, [openProject, pushError, pushToast, setBusy, setView]);
+  }, [pushError, setBusy]);
 
   const cancelRecording = useCallback(async () => {
     setBusy('capture', true);
@@ -813,25 +806,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       } else {
         lastCaptureErrorRef.current = null;
       }
-      if (status.state === 'ReadyToEdit' && !stopFlowRef.current) {
-        const key = `${status.sessionId ?? 'session'}:${status.mediaTick}`;
-        if (readyHandledRef.current !== key) {
-          readyHandledRef.current = key;
-          const path = capturePathRef.current;
-          if (path) {
-            // openProject 自己会处理失败提示；只有成功才跳编辑器
-            void openProject(path).then((opened) => {
-              if (opened) setView('editor');
-            });
-          }
-        }
-      }
+      // ReadyToEdit 不在这里打开工程：完成卡片（主进程弹出）是唯一入口，
+      // 用户点卡片上的「进入编辑」后经 review-edit 事件回来。
     });
     // 防御：某些实现可能不返回取消函数，避免 effect 清理时抛错
     return () => {
       if (typeof off === 'function') off();
     };
-  }, [openProject, pushToast, setView]);
+  }, [pushToast]);
 
   // ---- 主进程应用事件订阅 ----
   //
@@ -929,6 +911,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
             .then((response) => setCapture(unwrap(response)))
             .catch(() => undefined);
           break;
+        case 'review-edit': {
+          // 录制完成卡片「进入编辑」：主进程已布局编辑器窗口，这里打开工程并切视图。
+          const editPath = (payload as { projectPath?: string } | null)?.projectPath;
+          if (editPath) {
+            void openProject(editPath).then((opened) => {
+              if (opened) setView('editor');
+            });
+          }
+          break;
+        }
         default:
           break;
       }
@@ -936,7 +928,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return () => {
       if (typeof off === 'function') off();
     };
-  }, [pushToast, startRecording]);
+  }, [openProject, pushToast, setView, startRecording]);
 
   // ---- 启动引导 ----
   useEffect(() => {
