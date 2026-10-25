@@ -41,7 +41,7 @@ export interface PreviewCanvasProps {
   canvasRefOut?: (canvas: HTMLCanvasElement | null) => void;
 }
 
-/** 预览输出尺寸：按画幅比例，长边固定 1280，兼顾清晰度与性能。 */
+/** 按画幅和调用方提供的物理像素长边渲染；小缩略图可单独限制分辨率。 */
 export function previewSizeFor(project: Project, maxWidth = 1280): { width: number; height: number; variantId: string } {
   const variant = activeVariant(project);
   const size = outputSizeForAspect(variant.aspect, maxWidth);

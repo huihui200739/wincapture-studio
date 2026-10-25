@@ -2,7 +2,7 @@
  * 应用外壳：左侧导航 + 顶栏 + 视图切换 + 状态栏 + 提示条
  */
 
-import { useEffect, useMemo, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, type ReactNode } from 'react';
 import { useApp, VIEWS, type ViewId } from './lib/store';
 import { useShortcuts } from './lib/hooks';
 import { Icon, IconButton, ErrorBoundary } from './components/ui';
@@ -126,8 +126,7 @@ function StatusBar() {
   );
 }
 
-function ViewRouter(): ReactNode {
-  const { view } = useApp();
+function ViewRouter({ view }: { view: ViewId }): ReactNode {
   switch (view) {
     case 'home':
       return <HomeView />;
@@ -147,7 +146,13 @@ function ViewRouter(): ReactNode {
 }
 
 export function App() {
-  const { view, setView, capture, apiMode } = useApp();
+  const { view, setView, capture, apiMode, project, setPlaying } = useApp();
+  const previousView = useRef<ViewId>('editor');
+  const dialogOpen = view === 'settings' || view === 'export';
+  if (!dialogOpen) previousView.current = view;
+  const baseView = dialogOpen ? (previousView.current === 'record' && apiMode === 'native' ? (project ? 'editor' : 'home') : previousView.current) : view;
+  const closeDialog = () => setView(baseView);
+  useEffect(() => { if (dialogOpen) setPlaying(false); }, [dialogOpen, setPlaying]);
   const launcher = view === 'record' && apiMode === 'native';
   useEffect(() => {
     document.documentElement.dataset.surface = launcher ? 'launcher' : 'studio';
@@ -184,17 +189,20 @@ export function App() {
 
   if (launcher) return <><CaptureLauncher /><ToastStack /></>;
   return (
-    <div className={cn('app-shell studio-shell', view === 'editor' ? 'is-editing' : 'has-navigation')}>
-      {view !== 'editor' && <Rail />}
+    <div className={cn('app-shell studio-shell', baseView === 'editor' ? 'is-editing' : 'has-navigation')}>
+      {baseView !== 'editor' && <Rail />}
       <StudioHeader />
-      <main className="app-main" id="main-content">
+      <main className="app-main" id="main-content" inert={dialogOpen}>
         {recordingBanner}
         {/* 单个视图崩溃不应导致整窗白屏：保留导航与状态栏，只降级出错区域 */}
-        <ErrorBoundary key={view} scope={VIEW_TITLES[view].title}>
-          <ViewRouter />
+        <ErrorBoundary key={baseView} scope={VIEW_TITLES[baseView].title}>
+          <ViewRouter view={baseView} />
         </ErrorBoundary>
       </main>
-      <StatusBar />
+      {/* 编辑台没有状态栏：时间线直达窗口底缘（参考应用同款停靠布局） */}
+      {baseView !== 'editor' && <StatusBar />}
+      {view === 'settings' && <SettingsView onClose={closeDialog} />}
+      {view === 'export' && <ExportView onClose={closeDialog} />}
       <ToastStack />
     </div>
   );

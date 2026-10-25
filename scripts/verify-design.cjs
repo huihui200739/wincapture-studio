@@ -1,0 +1,83 @@
+const { app, BrowserWindow } = require('electron');
+const fs = require('node:fs');
+const path = require('node:path');
+const root = path.resolve(__dirname, '..');
+const out = path.join(root, 'dist', 'verify', 'design');
+app.setPath('userData', path.join(root, '.tmp', 'design-check'));
+app.commandLine.appendSwitch('disable-gpu-sandbox');
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+const report = { checks:[], screenshots:[], errors:[] };
+const check = (ok,label) => { report.checks.push({ok:!!ok,label}); console.log(`[design] ${ok?'PASS':'FAIL'} ${label}`); if(!ok)throw new Error(label); };
+app.whenReady().then(async () => {
+ let win;
+ try {
+  fs.mkdirSync(out,{recursive:true});
+  win = new BrowserWindow({width:1366,height:900,show:true,webPreferences:{contextIsolation:true,nodeIntegration:false,sandbox:false}});
+  const js = code => win.webContents.executeJavaScript(code,true);
+  win.webContents.on('console-message',event => { if(event.level==='error'||event.level===3)report.errors.push(event.message); });
+  const until = async code => {const start=Date.now();while(Date.now()-start<15000){if(await js(code))return;await wait(100);}throw new Error('Timeout '+code);};
+  const click = async selector => {await js(`document.querySelector(${JSON.stringify(selector)})?.click()`);await wait(380);};
+  const go = async view => {await js(`location.hash='#/${view}'`);await wait(650);};
+  const shot = async name => {win.show();win.focus();win.webContents.invalidate();await wait(200);const [width,height]=win.getContentSize();const file=path.join(out,name+'.png');fs.writeFileSync(file,(await win.webContents.capturePage({x:0,y:0,width,height})).toPNG());report.screenshots.push(file);};
+  const dialogFits = () => js(`(() => {const d=document.querySelector('[role=dialog]');if(!d)return false;const r=d.getBoundingClientRect();return r.x>=0&&r.y>=0&&r.right<=innerWidth+1&&r.bottom<=innerHeight+1&&d.scrollWidth<=d.clientWidth+2;})()`);
+  await win.loadFile(path.join(root,'dist','renderer','index.html'));
+  await until(`document.documentElement.dataset.ready==='1'`);
+  await go('editor'); await until(`!!document.querySelector('.stage-canvas-inner canvas')`);
+  await shot('01-editor');
+  await js(`window.__designCanvas=document.querySelector('.stage-canvas-inner canvas')`);
+  await click('#inspector-tab-canvas');
+  await click('.studio-canvas-tabs button:nth-child(2)');
+  check(await js(`document.querySelectorAll('.parameter-dial').length===4`),'布局面板显示四个实际参数旋钮');
+  const initial = await js(`document.querySelector('[aria-label="圆角数值"]').value`);
+  await js(`(() => {const el=document.querySelector('[aria-label="圆角数值"]');el.focus();Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,'24');el.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+  await js(`document.querySelector('[aria-label="圆角数值"]').blur()`);
+  await wait(150);
+  await click('.studio-canvas-tabs button:nth-child(2)');
+  check(await js(`document.querySelector('[aria-label="圆角数值"]').value==='24'`),'参数数值输入提交到工程');
+  const dialPoint=await js(`(() => {const r=document.querySelector('.dial-face input[aria-label="圆角"]').getBoundingClientRect();return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};})()`);
+  win.webContents.sendInputEvent({type:'mouseDown',...dialPoint,button:'left',clickCount:1});
+  for(let i=1;i<=12;i++){win.webContents.sendInputEvent({type:'mouseMove',x:dialPoint.x,y:dialPoint.y-i*2,movementY:-2});await wait(10);}
+  win.webContents.sendInputEvent({type:'mouseUp',x:dialPoint.x,y:dialPoint.y-24,button:'left',clickCount:1});await wait(200);
+  check(await js(`Number(document.querySelector('[aria-label="圆角数值"]').value)>24`),'旋钮拖动实际修改画面参数');
+  await click('.studio-history button[aria-label="撤销（Ctrl+Z）"]');
+  report.dial = { initial, afterUndo: await js(`document.querySelector('[aria-label="圆角数值"]').value`), undoDisabled: await js(`document.querySelector('.studio-history button[aria-label="撤销（Ctrl+Z）"]').disabled`) };
+  console.log('[design] dial '+JSON.stringify(report.dial));
+  check(await js(`document.querySelector('[aria-label="圆角数值"]').value==='24'`),'一次撤销完整回退旋钮手势');
+  await click('.studio-history button[aria-label="重做（Ctrl+Y）"]');
+  await shot('02-layout-controls');
+  await go('settings');
+  check(await dialogFits(),'设置弹窗在窗口内完整显示');
+  check(await js(`document.querySelector('.stage-canvas-inner canvas')===window.__designCanvas && document.querySelector('main').inert`),'设置覆盖编辑台并保留工作区实例');
+  await shot('03-settings-general');
+  for(const tab of ['editor','recording','permissions','about']) {await click('#settings-tab-'+tab);check(await dialogFits(),'设置 '+tab+' 标签可用且未溢出');await shot('settings-'+tab);}
+  await click('#settings-tab-general');
+  await js(`(() => {const el=document.querySelector('[aria-label="界面外观"]');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(el,'dark');el.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await wait(300);check(await js(`document.documentElement.dataset.theme==='dark'`),'外观设置立即应用');await shot('04-settings-dark');
+  await js(`(() => {const el=document.querySelector('[aria-label="界面外观"]');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(el,'light');el.dispatchEvent(new Event('change',{bubbles:true}));})()`);await wait(250);
+  await click('.settings-dialog .wcs-modal-head button');
+  check(await js(`!document.querySelector('[role=dialog]')&&document.querySelector('.stage-canvas-inner canvas')===window.__designCanvas`),'关闭设置返回原编辑台');
+  await go('export');check(await dialogFits(),'导出弹窗完整显示');
+  check(await js(`!!document.querySelector('.export-preview canvas')&&document.querySelector('.stage-canvas-inner canvas')===window.__designCanvas`),'导出显示真实预览并保留编辑台');
+  await shot('05-export');
+  await click('[aria-label="输出分辨率"] button:nth-child(3)');
+  check(await js(`document.querySelector('.export-summary').textContent.includes('2560')`),'1440p 选项更新实际导出规格');
+  await click('[aria-label="输出帧率"] button:nth-child(3)');
+  check(await js(`document.querySelector('.export-summary').textContent.includes('60 fps')`),'60 FPS 选项更新实际导出规格');
+  await click('[aria-label="导出内容"] button:nth-child(2)');
+  check(await js(`document.querySelector('.export-summary').textContent.includes('M4A')&&!document.querySelector('[aria-label="输出帧率"]')`),'仅音频模式显示 M4A 并收起视频参数');
+  await click('[aria-label="导出内容"] button:nth-child(1)');
+  await click('.export-advanced summary');await shot('06-export-advanced');
+  await click('.export-dialog .wcs-modal-foot .is-primary');
+  await until(`!!document.querySelector('.export-progress-area .is-danger')`);
+  check(await js(`!document.querySelector('.result-head')&&document.querySelector('.export-progress-area').textContent.includes('示例数据模式')`),'无原生导出管线时明确失败，不伪造成功');await shot('06-export-error');
+  await go('editor');
+  await click('.timeline-display-toggle button:nth-child(2)');
+  check(await js(`document.querySelector('.timeline-display-toggle button:nth-child(2)').getAttribute('aria-pressed')==='true'&&document.querySelector('.timeline-row.is-audio')`),'波形模式展开真实音轨');
+  await shot('07-waveform');
+  for(const view of ['home','record','tutorial']) {await go(view);await shot('08-'+view);}
+  win.setSize(1000,700);await wait(300);
+  await go('editor');await shot('09-compact-editor');await go('settings');check(await dialogFits(),'小窗口设置完整显示');await shot('10-compact-settings');await go('export');check(await dialogFits(),'小窗口导出完整显示');await shot('11-compact-export');
+  check(report.errors.length===0,'渲染控制台无错误');report.ok=true;
+ } catch(error) {report.ok=false;report.error=String(error.stack||error);console.error(report.error);}
+ finally {fs.mkdirSync(out,{recursive:true});fs.writeFileSync(path.join(out,'result.json'),JSON.stringify(report,null,2));app.exit(report.ok?0:1);}
+});

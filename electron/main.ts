@@ -46,6 +46,7 @@ import { ticksToSeconds } from '../src/domain/timebase';
 import { readPointerLog } from './pointerLog';
 import { recordedSegmentNames } from './mediaSegments';
 import { SingleInstance } from './singleInstance';
+import { moveFloatingWindow, rememberFloatingSize, resizeFloatingWindow, setFloatingBounds } from './floatingWindowGeometry';
 import { runStudioProbe } from '../scripts/studioProbe';
 import { runStartupProbe } from '../scripts/startupProbe';
 const startupScans = { sources: 0, audio: 0 };
@@ -570,6 +571,9 @@ function createMainWindow(): BrowserWindow {
       backgroundThrottling: false,
     },
   });
+  rememberFloatingSize(win, 620, 96);
+  win.setAlwaysOnTop(true, 'floating');
+  win.setContentProtection(true);
   win.once('ready-to-show', () => win.show());
   win.on('closed', () => {
     const wasMain = mainWindow === win;
@@ -603,10 +607,14 @@ function layoutMain(options: { mode: 'launcher' | 'editor' | 'selection' | 'maxi
     win.setResizable(false); win.setAlwaysOnTop(true, 'screen-saver'); win.setContentProtection(true);
     win.setBounds(bounds);
   } else if (options.mode === 'launcher') {
-    const area = screen.getPrimaryDisplay().workArea;
-    win.setResizable(false); win.setAlwaysOnTop(true, 'floating'); win.setContentProtection(true);
-    win.setBounds({ x: Math.round(area.x + (area.width - 620) / 2), y: area.y + 28, width: 620,
-      height: Math.min(area.height - 56, Math.max(96, Math.round(options.height ?? 96))) });
+    const area = screen.getDisplayMatching(win.getBounds()).workArea;
+    if (mainLayout !== 'launcher') {
+      win.setResizable(false); win.setAlwaysOnTop(true, 'floating'); win.setContentProtection(true);
+    }
+    const height = Math.min(area.height - 56, Math.max(96, Math.round(options.height ?? 96)));
+    const previous = win.getBounds();
+    setFloatingBounds(win, { x: mainLayout === 'launcher' ? Math.max(area.x, Math.min(previous.x, area.x + area.width - 620)) : Math.round(area.x + (area.width - 620) / 2),
+      y: mainLayout === 'launcher' ? Math.max(area.y, Math.min(previous.y, area.y + area.height - height)) : area.y + 28, width: 620, height });
   } else {
     const area = screen.getPrimaryDisplay().workArea;
     win.setAlwaysOnTop(false); win.setContentProtection(false); win.setResizable(true);
@@ -689,6 +697,7 @@ function createOverlayWindow(): BrowserWindow {
   // 用户录制中找不到任何「停止」按钮；closeOverlayWindow 也永远关不到真窗口。
   // （同因：Electron FAQ 里托盘/窗口被 GC 后静默消失的同类问题。）
   overlayWindow = win;
+  rememberFloatingSize(win, width, height);
   win.once('ready-to-show', () => {
     if (overlayWindow !== win || !ACTIVE_CAPTURE_STATES.has(engine.getState())) { win.destroy(); return; }
     win.showInactive();
@@ -2508,8 +2517,8 @@ function registerIpc(): void {
     if (!Number.isFinite(stepX) || !Number.isFinite(stepY)) return null;
     const win = senderRole(event) === 'overlay' ? overlayWindow : mainWindow;
     if (!win || win.isDestroyed()) return null;
-    const bounds = win.getBounds();
-    win.setPosition(bounds.x + Math.round(stepX), bounds.y + Math.round(stepY));
+    if (win === mainWindow && mainLayout !== 'launcher') return null;
+    moveFloatingWindow(win, stepX, stepY);
     return null;
   }));
   // 录制完成卡片「进入编辑」：布局编辑器窗口并通知主窗口渲染进程打开该工程
@@ -2542,8 +2551,7 @@ function registerIpc(): void {
       levels: { mic: number; system: number };
     }>;
     if (typeof update.memoOpen === 'boolean' && overlayWindow && !overlayWindow.isDestroyed()) {
-      const [width] = overlayWindow.getSize();
-      overlayWindow.setSize(width, update.memoOpen ? 196 : 64);
+      resizeFloatingWindow(overlayWindow, 460, update.memoOpen ? 196 : 64);
     }
     const base: CaptureStatus | null = lastStatus ?? (typeof engine === 'undefined' ? null : engine.status());
     if (!base) return null;

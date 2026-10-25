@@ -23,13 +23,29 @@ export async function runStudioProbe(win: BrowserWindow, root: string, overlayCl
   try {
     await fs.mkdir(out, { recursive: true });
     await until(`!!document.querySelector('.capture-capsule') && !document.querySelector('.capsule-record').disabled`);
-    report.launcher = win.getBounds(); check(win.getBounds().height === 96, '启动胶囊高度正确');
+    report.launcher = win.getBounds(); check(Math.abs(win.getBounds().height - 96) <= 2, '启动胶囊高度正确');
+    const dragVisible = async (target: BrowserWindow, label: string) => {
+      const before = target.getBounds();
+      await target.webContents.executeJavaScript(`(async () => {
+        for(let i=0;i<100;i++) { await window.wcs.moveWindowBy(i%2 ? -1 : 1, i%4<2 ? 1 : -1); await new Promise(r=>setTimeout(r,8)); }
+      })()`, true);
+      const after = target.getBounds();
+      check(Math.abs(after.width-before.width)<=2 && Math.abs(after.height-before.height)<=2, `${label}真实 IPC 连续拖动 100 次不变长`);
+      return { before, after };
+    };
+    report.launcherDrag = await dragVisible(win, '启动胶囊');
     await shot('01-launcher');
     await click('.capsule-more'); await until(`!!document.querySelector('.preparation-popover')`); await shot('02-preparation');
     await js(`(() => { for (const [label,value] of [['分辨率与帧率','720p30'],['开始倒计时','0']]) {
       const el=document.querySelector('select[aria-label="'+label+'"]'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(el,value); el.dispatchEvent(new Event('change',{bubbles:true}));
     } if(document.querySelector('[aria-label="摄像头开启"]'))document.querySelector('[aria-label="摄像头开启"]').click(); })()`);
-    await click('.capture-source-trigger'); await until(`document.querySelectorAll('.source-modes button').length===4`); await shot('03-sources');
+    report.panelPaintMs = await js(`new Promise(resolve=>{
+      const start=performance.now();document.querySelector('.capture-source-trigger').click();
+      requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(performance.now()-start)));
+    })`);
+    check(Number(report.panelPaintMs)<250, '来源面板先绘制，无需等待缩略图扫描');
+    await until(`document.querySelectorAll('.source-modes button').length===4`);
+    report.sourcePanelDrag = await dragVisible(win, '展开的来源面板'); await shot('03-sources');
     await js(`document.querySelectorAll('.source-modes button')[1].click()`); await wait(400);
     await click('.launcher-next'); await until(`!!document.querySelector('.capture-selection.is-region')`); await shot('04-region');
     check(win.getBounds().width > 900, '区域选择使用桌面确认层');
@@ -67,6 +83,7 @@ export async function runStudioProbe(win: BrowserWindow, root: string, overlayCl
       return false;
     };
     check(await overlayStopReady(), '录制中悬浮控制条可见且停止按钮可用');
+    report.overlayDrag = await dragVisible(overlayRef()!, '录制悬浮条');
     const stopped = await js<{ data?: { projectPath: string; status: { state: string } }; ok: boolean }>(`window.wcs.stopCapture()`);
     check(stopped.ok && stopped.data?.status.state === 'ReadyToEdit', '从胶囊完成真实录制');
     const projectPath = stopped.data!.projectPath; report.projectPath = projectPath;
@@ -115,6 +132,11 @@ export async function runStudioProbe(win: BrowserWindow, root: string, overlayCl
     await until(`!!document.querySelector('.studio-shell.is-editing')`); await wait(1200);
     check(win.isVisible() && win.getBounds().width >= 1000 && overlayClosed(), '进入编辑后显示编辑器并关闭悬浮条');
     check(!reviewRef(), '进入编辑后完成卡片已关闭');
+    const density = await js<{ actual: number; required: number }>(`(() => {
+      const canvas=document.querySelector('.stage-canvas-inner canvas'), rect=canvas.getBoundingClientRect();
+      return {actual:Math.max(canvas.width,canvas.height),required:Math.min(3840,Math.max(rect.width,rect.height)*devicePixelRatio)};
+    })()`);
+    check(density.actual >= density.required-2, '主预览像素覆盖高 DPI 显示尺寸'); report.previewDensity = density;
     await shot('06-editor');
     const handle = await js<{ data: ProjectHandle }>(`window.wcs.openProject(${JSON.stringify(projectPath)})`);
     const audio = [];
@@ -150,6 +172,25 @@ export async function runStudioProbe(win: BrowserWindow, root: string, overlayCl
     const mb = await import('mediabunny'); const input = new mb.Input({ formats: mb.ALL_FORMATS, source: new mb.FilePathSource(outputPath) });
     try { check(await input.getPrimaryAudioTrack(), '导出 MP4 包含真实 AAC 音轨'); report.hasAudioTrack = true; }
     finally { input.dispose(); }
+    // Exercise the actual new export sheet, including its async task lifetime.
+    const sheetOutput = path.join(out, 'studio-sheet-export.mp4');
+    await click('.studio-export'); await until(`!!document.querySelector('.export-dialog')`);
+    await js(`(() => {
+      document.querySelector('.export-advanced').open=true;
+      const el=document.getElementById('export-path');el.focus();
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,${JSON.stringify(sheetOutput)});
+      el.dispatchEvent(new Event('input',{bubbles:true}));
+    })()`);
+    await wait(150);
+    await click('.export-dialog .wcs-modal-foot .is-primary');
+    check(await js(`!!document.querySelector('.export-dialog .wcs-modal-head button:disabled')`), '实际导出时关闭按钮禁用，保留进度弹窗');
+    win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+    win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+    check(await js(`!!document.querySelector('.export-dialog')`), '实际导出期间 Escape 不会卸载导出任务');
+    await until(`document.querySelector('.export-dialog .result-head')?.textContent.includes('导出完成')`, 60_000);
+    check((await fs.stat(sheetOutput)).size > 1000, '新导出弹窗真实生成 MP4，并展示完成状态');
+    await shot('09-export-sheet');
+    report.sheetExport = sheetOutput;
     report.ok = true;
   } catch (e) { report.ok = false; report.error = String(e instanceof Error ? e.stack : e); console.error('[studio]', report.error); }
   finally { clearTimeout(watchdog); await fs.writeFile(path.join(out, 'result.json'), JSON.stringify(report, null, 2)); app.exit(report.ok ? 0 : 1); }

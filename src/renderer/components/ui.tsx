@@ -26,6 +26,7 @@ import { clamp, cn } from '../lib/format';
 // ---------------------------------------------------------------------------
 
 const ICON_PATHS: Record<string, ReactNode> = {
+  sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" /></>,
   home: (
     <>
       <path d="M3 10.5 12 3l9 7.5" />
@@ -61,8 +62,8 @@ const ICON_PATHS: Record<string, ReactNode> = {
   ),
   settings: (
     <>
-      <circle cx="12" cy="12" r="3.2" />
-      <path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1" />
+      <circle cx="12" cy="11.5" r="3" />
+      <path d="M10 3h4l.5 2.5 1.6.9 2.4-.8 2 3.4-1.9 1.7v1.8l1.9 1.5-2 3.4-2.4-.8-1.6.9L14 20h-4l-.5-2.5-1.6-.9-2.4.8-2-3.4 1.9-1.5v-1.8L3.5 9l2-3.4 2.4.8 1.6-.9z" />
     </>
   ),
   play: <path d="M8 5.2 19 12 8 18.8z" fill="currentColor" stroke="none" />,
@@ -795,6 +796,8 @@ export function Modal({
   onClose,
   width = 520,
   tone = 'default',
+  className,
+  dismissible = true,
 }: {
   title: ReactNode;
   children: ReactNode;
@@ -802,6 +805,8 @@ export function Modal({
   onClose: () => void;
   width?: number;
   tone?: 'default' | 'danger';
+  className?: string;
+  dismissible?: boolean;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const titleId = useId();
@@ -887,7 +892,7 @@ export function Modal({
     >
       <div
         ref={ref}
-        className={cn('wcs-modal', tone === 'danger' && 'is-danger')}
+        className={cn('wcs-modal', tone === 'danger' && 'is-danger', className)}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -895,7 +900,7 @@ export function Modal({
       >
         <header className="wcs-modal-head">
           <h2 id={titleId}>{title}</h2>
-          <IconButton icon="close" label="关闭对话框" size="sm" onClick={() => onCloseRef.current()} />
+          <IconButton icon="close" label="关闭对话框" size="sm" disabled={!dismissible} onClick={() => onCloseRef.current()} />
         </header>
         <div className="wcs-modal-body">{children}</div>
         {footer && <footer className="wcs-modal-foot">{footer}</footer>}

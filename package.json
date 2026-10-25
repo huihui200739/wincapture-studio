@@ -23,6 +23,8 @@
     "verify:capture": "node scripts/probe-grabber.mjs && node scripts/probe-audio.mjs",
     "verify:e2e": "npm run build && node scripts/run-electron.mjs scripts/verify-e2e.cjs",
     "verify:ui": "node scripts/run-electron.mjs scripts/verify-ui.cjs",
+    "verify:design": "node scripts/run-electron.mjs scripts/verify-design.cjs",
+    "verify:zoom-edit": "node scripts/run-electron.mjs scripts/verify-zoom-edit.cjs",
     "verify:studio": "node scripts/verify-studio.mjs",
     "verify:startup": "node scripts/verify-startup.mjs",
     "verify:stage-fit": "node scripts/run-electron.mjs scripts/verify-stage-fit.cjs",

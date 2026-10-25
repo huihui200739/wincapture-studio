@@ -139,7 +139,12 @@ app.whenReady().then(async () => {
 
     // 截图留档
     fs.mkdirSync(OUT, { recursive: true });
-    const shot = await win.webContents.capturePage();
+    // Keep capture inside the client area at fractional Windows DPI; the
+    // unconstrained whole-surface capture can fail with UnknownVizError.
+    win.show(); win.focus(); win.webContents.invalidate();
+    await wait(250);
+    const [captureWidth, captureHeight] = win.getContentSize();
+    const shot = await win.webContents.capturePage({ x: 0, y: 0, width: captureWidth, height: captureHeight });
     const file = path.join(OUT, '11-stage-fit.png');
     fs.writeFileSync(file, shot.toPNG());
     summary.shot = path.relative(ROOT, file);

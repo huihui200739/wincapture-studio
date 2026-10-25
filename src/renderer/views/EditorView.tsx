@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../lib/store';
 import { useShortcuts } from '../lib/hooks';
 import { Badge, Button, Icon, IconButton, Spinner } from '../components/ui';
+import { LineIcon } from '../components/LineIcon';
 import { PreviewCanvas, useSourceToDisplay } from '../components/PreviewCanvas';
 import { Timeline, planClipMove, splittableTick, clipEndTick } from '../components/Timeline';
 import { InspectorPanel, clampPrivacyRect } from '../components/InspectorPanel';
@@ -61,6 +62,7 @@ export function EditorView() {
   const [audioPreviewEnabled, setAudioPreviewEnabled] = useState(true);
   const audioPreviewError = useAudioPreview(project, apiMode === 'mock' ? null : projectPath, tick, playing, audioPreviewEnabled);
   const [timelineCollapsed, setTimelineCollapsed] = useState(false);
+  const [hudMenu, setHudMenu] = useState<'none' | 'add' | 'ratio'>('none');
   const [drag, setDrag] = useState<DragState>({ kind: 'none' });
   const [scene, setScene] = useState<FrameScene | null>(null);
   const [effectClipboard, setEffectClipboard] = useState<Effect | null>(null);
@@ -140,6 +142,11 @@ export function EditorView() {
     // Geometry must follow the project even before the next asynchronous preview draw.
     return aspect && aspect[1] > 0 ? aspect[0] / aspect[1] : 16 / 9;
   }, [project]);
+
+  const activeVariant = useMemo(
+    () => project?.variants.find((v) => v.id === project.settings.activeVariantId) ?? project?.variants[0],
+    [project],
+  );
 
   const stageFit = useMemo(() => {
     const availW = Math.max(0, wrapSize.width);
@@ -471,69 +478,6 @@ export function EditorView() {
   return (
     <div className="editor">
       <section className="editor-stage" aria-label="预览区">
-        <div className="stage-toolbar">
-          <div className="stage-toolbar-group">
-            <IconButton
-              icon="skipBack"
-              label="回到开头（Home）"
-              size="sm"
-              onClick={() => {
-                setPlaying(false);
-                setTick(0);
-              }}
-            />
-            <IconButton
-              icon="stepBack"
-              label="上一帧（←）"
-              size="sm"
-              onClick={() => {
-                setPlaying(false);
-                setTick(Math.max(0, tick - frameStep));
-              }}
-            />
-            <IconButton
-              icon={playing ? 'pause' : 'play'}
-              label={playing ? '暂停（空格）' : '播放（空格）'}
-              variant="secondary"
-              size="md"
-              onClick={togglePlay}
-            />
-            <IconButton
-              icon="stepForward"
-              label="下一帧（→）"
-              size="sm"
-              onClick={() => {
-                setPlaying(false);
-                setTick(Math.min(totalDuration, tick + frameStep));
-              }}
-            />
-            <IconButton
-              icon="skipForward"
-              label="跳到结尾（End）"
-              size="sm"
-              onClick={() => {
-                setPlaying(false);
-                setTick(totalDuration);
-              }}
-            />
-          </div>
-
-          <div className="stage-toolbar-spacer" />
-          <IconButton icon="volume" size="sm" label={audioPreviewEnabled ? '关闭音频试听' : '开启音频试听'}
-            variant={audioPreviewEnabled ? 'secondary' : 'ghost'} onClick={() => setAudioPreviewEnabled(v => !v)} />
-          {audioPreviewError && <Badge tone="warn" title={audioPreviewError}>试听失败</Badge>}
-
-          {/* 剪辑工具（分割/删除）集中在时间线工具栏，这里只保留播放与遮挡提示（§P1） */}
-          <div className="stage-toolbar-group">
-            <IconButton icon="copy" label="复制效果（Ctrl+C）" size="sm" onClick={copySelectedEffect} disabled={!selectedEffectId} />
-            <IconButton icon="paste" label="粘贴效果（Ctrl+V）；Ctrl+Shift+V 只粘贴属性" size="sm" onClick={() => pasteCopiedEffect()} disabled={!effectClipboard} />
-            <Badge tone="muted" title="在预览上拖拽即可框选遮挡区域">
-              <Icon name="shield" size={11} /> 拖拽框选遮挡
-            </Badge>
-            {apiMode === 'mock' && <Badge tone="warn">示例画面</Badge>}
-          </div>
-        </div>
-
         <div className="stage-canvas-wrap" ref={wrapRef}>
           <div
             className="stage-canvas-inner"
@@ -543,7 +487,8 @@ export function EditorView() {
             onPointerUp={onStagePointerUp}
             onPointerCancel={() => setDrag({ kind: 'none' })}
           >
-            <PreviewCanvas project={project} tick={tick} projectPath={projectPath} onScene={setScene} maxWidth={1280} />
+            <PreviewCanvas project={project} tick={tick} projectPath={projectPath} onScene={setScene}
+              maxWidth={Math.min(3840, Math.max(1280, Math.ceil(Math.max(stageFit.width, stageFit.height) * (window.devicePixelRatio || 1) / 64) * 64))} />
             <div className="stage-overlay-layer">
               {/* 已存在的遮挡区域（显示为框，未确认用虚线） */}
               {privacyEffects.map((effect) => {
@@ -597,10 +542,112 @@ export function EditorView() {
           </div>
         </div>
 
-        <div className="transport">
-          <span className="transport-time">
-            {formatDuration(tick)} <span className="is-dim">/ {formatDuration(totalDuration)}</span>
+        {/* 画布下方的悬浮 HUD：画面工具与传输共用一枚材质胶囊。 */}
+        <div className="stage-toolbar">
+          <div style={{ position: 'relative' }}>
+            <button
+              type="button"
+              className="stage-ratio-trigger"
+              aria-label="选择画幅"
+              aria-expanded={hudMenu === 'ratio'}
+              onClick={() => setHudMenu(hudMenu === 'ratio' ? 'none' : 'ratio')}
+            >
+              <LineIcon kind="aspect" size={12} />
+              {activeVariant ? `${activeVariant.aspect[0]}:${activeVariant.aspect[1]}` : '16:9'}
+              <LineIcon kind="chevronDown" size={9} />
+            </button>
+            {hudMenu === 'ratio' && (
+              <>
+                <button type="button" className="hud-scrim" aria-label="关闭画幅选择" onClick={() => setHudMenu('none')} />
+                <div className="stage-hud-popover" role="menu" aria-label="画幅">
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 7 }}>
+                  {project.variants.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={cn('variant-card', project.settings.activeVariantId === item.id && 'is-selected')}
+                      aria-pressed={project.settings.activeVariantId === item.id}
+                      onClick={() => {
+                        execute({ kind: 'SetActiveVariant', variantId: item.id }, '切换画幅');
+                        setHudMenu('none');
+                      }}
+                    >
+                      <span className="variant-shape" style={{ aspectRatio: `${item.aspect[0]}/${item.aspect[1]}`, width: 40, display: 'block', borderRadius: 5, border: '1px solid currentColor', margin: '4px auto' }} />
+                      <span style={{ fontSize: 11 }}>{`${item.aspect[0]}:${item.aspect[1]}`}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              </>
+            )}
+          </div>
+          <div style={{ position: 'relative' }}>
+            <button
+              type="button"
+              className="stage-ratio-trigger"
+              aria-label="添加到画面"
+              aria-expanded={hudMenu === 'add'}
+              onClick={() => setHudMenu(hudMenu === 'add' ? 'none' : 'add')}
+            >
+              <LineIcon kind="plus" size={15} />
+            </button>
+            {hudMenu === 'add' && (
+              <>
+                <button type="button" className="hud-scrim" aria-label="关闭效果菜单" onClick={() => setHudMenu('none')} />
+                <div className="stage-hud-menu" role="menu" aria-label="效果操作">
+                  <button type="button" disabled={!selectedEffectId} onClick={() => { copySelectedEffect(); setHudMenu('none'); }}>
+                    <LineIcon kind="box" size={15} />复制效果
+                  </button>
+                  <button type="button" disabled={!effectClipboard} onClick={() => { pasteCopiedEffect(); setHudMenu('none'); }}>
+                    <LineIcon kind="paste" size={15} />粘贴效果
+                  </button>
+                  <button type="button" disabled={!effectClipboard || !selectedEffectId} onClick={() => { pasteCopiedEffect(true); setHudMenu('none'); }}>
+                    <LineIcon kind="swap" size={15} />只粘贴属性
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="stage-toolbar-spacer" />
+
+          <IconButton
+            icon="stepBack"
+            label="上一帧（←）"
+            size="sm"
+            onClick={() => {
+              setPlaying(false);
+              setTick(Math.max(0, tick - frameStep));
+            }}
+          />
+          <button
+            type="button"
+            className={cn('transport-play', playing && 'is-playing')}
+            aria-label={playing ? '暂停（空格）' : '播放（空格）'}
+            title={playing ? '暂停（空格）' : '播放（空格）'}
+            onClick={togglePlay}
+          >
+            <LineIcon kind="play" size={15} className="icon-play" />
+            <LineIcon kind="pause" size={15} className="icon-pause" />
+          </button>
+          <IconButton
+            icon="stepForward"
+            label="下一帧（→）"
+            size="sm"
+            onClick={() => {
+              setPlaying(false);
+              setTick(Math.min(totalDuration, tick + frameStep));
+            }}
+          />
+          <span className="player-time" title={`${project.settings.fps.num / project.settings.fps.den} fps · 帧 ${ticksToFrameIndex(Math.min(tick, totalDuration), project.settings.fps)}`}>
+            {formatDuration(tick)} <span>/ {formatDuration(totalDuration)}</span>
           </span>
+          <IconButton icon="volume" size="sm" label={audioPreviewEnabled ? '关闭音频试听' : '开启音频试听'}
+            variant="ghost" onClick={() => setAudioPreviewEnabled(v => !v)} />
+          {audioPreviewError && <Badge tone="warn" title={audioPreviewError}>试听失败</Badge>}
+        </div>
+
+        <div className="transport">
           <div className="transport-scrub">
             <input
               type="range"
@@ -616,14 +663,6 @@ export function EditorView() {
               }}
             />
           </div>
-          <span className="transport-badge">
-            {project.settings.fps.num}/{project.settings.fps.den} fps · 帧{' '}
-            {ticksToFrameIndex(Math.min(tick, totalDuration), project.settings.fps)}
-          </span>
-          <span className="transport-badge">{scene ? `${scene.outputWidth}×${scene.outputHeight}` : ''}</span>
-          <Badge tone={playing ? 'ok' : 'muted'} icon={playing ? 'play' : 'pause'}>
-            {playing ? '播放中' : '已暂停'}
-          </Badge>
         </div>
       </section>
 

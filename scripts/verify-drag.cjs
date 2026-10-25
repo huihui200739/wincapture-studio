@@ -17,9 +17,14 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
+const { buildSync } = require('esbuild');
 
 const ROOT = path.resolve(__dirname, '..');
 const OUT = path.join(ROOT, 'dist', 'verify', 'drag-result.json');
+const geometryFile = path.join(ROOT, 'dist', 'verify', 'floating-geometry.cjs');
+buildSync({ entryPoints: [path.join(ROOT, 'electron', 'floatingWindowGeometry.ts')], outfile: geometryFile,
+  bundle: true, platform: 'node', format: 'cjs', external: ['electron'] });
+const { moveFloatingWindow, rememberFloatingSize, resizeFloatingWindow } = require(geometryFile);
 
 app.setPath('userData', path.join(ROOT, '.verify-ui-data'));
 app.commandLine.appendSwitch('disable-gpu-sandbox');
@@ -39,14 +44,15 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
  *  渲染层按 rAF 合并增量：一次拖拽可能到达 1~多次 IPC，断言按累计值。 */
 let movedSum = { dx: 0, dy: 0 };
 let movedCalls = 0;
+ipcMain.handle('capture:status', () => ({ ok: true, data: null }));
+ipcMain.handle('window:update-overlay', () => ({ ok: true, data: null }));
 ipcMain.handle('window:move-by', (_event, dx, dy) => {
   movedSum.dx += Number(dx) || 0;
   movedSum.dy += Number(dy) || 0;
   movedCalls += 1;
   const win = captured;
   if (!win || win.isDestroyed()) return null;
-  const bounds = win.getBounds();
-  win.setPosition(bounds.x + Math.round(Number(dx) || 0), bounds.y + Math.round(Number(dy) || 0));
+  moveFloatingWindow(win, Number(dx) || 0, Number(dy) || 0);
   return null;
 });
 
@@ -70,6 +76,7 @@ async function main() {
     },
   });
   captured = win;
+  rememberFloatingSize(win, 460, 64);
   await win.loadFile(path.join(ROOT, 'dist', 'renderer', 'index.html'), { hash: 'overlay' });
 
   // 等渲染层挂载出真实悬浮条的把手
@@ -124,6 +131,23 @@ async function main() {
   const final = win.getBounds();
   check(final.x - after.x === -30 && final.y - after.y === -10 && Math.round(movedSum.dx) === 90 && Math.round(movedSum.dy) === 44,
     `第二次拖拽同样生效且无重复步进（after ${after.x},${after.y} → final ${final.x},${final.y}，累计 ${JSON.stringify(movedSum)}）`);
+
+  // Hidden windows do not reproduce the Windows 150% DPI growth bug. Exercise
+  // the production helper with visible native windows and odd DIP positions.
+  win.show();
+  for (const [width, height] of [[460,64], [460,196], [620,96], [620,610]]) {
+    resizeFloatingWindow(win, width, height);
+    const samples = [];
+    for (let i = 0; i < 120; i++) {
+      moveFloatingWindow(win, i % 2 ? -1 : 1, i % 4 < 2 ? 1 : -1);
+      await wait(8);
+      samples.push(win.getBounds());
+    }
+    check(samples.every(b => Math.abs(b.width - width) <= 2 && Math.abs(b.height - height) <= 2),
+      `可见窗口 ${width}×${height} 连续移动 120 次尺寸不累计增长`);
+    result.visibleSizes ??= [];
+    result.visibleSizes.push({ requested: { width, height }, final: samples.at(-1) });
+  }
 
   result.ok = true;
 } 

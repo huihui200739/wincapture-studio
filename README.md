@@ -1,6 +1,6 @@
 # WinCapture Studio
 
-Windows 录屏、非破坏性剪辑与图文教程制作工具。参考 [DogSC](https://github.com/laogou717/dogsc) 的工作流，使用 Electron、React、TypeScript 和 Windows 原生采集实现。
+Windows 录屏、非破坏性剪辑与图文教程制作工具。参考 [DogSC](https://github.com/laogou717/dogsc) 的工作流与界面（MIT，声明见 docs/third-party/），主编辑台按其源码一比一对齐，使用 Electron、React、TypeScript 和 Windows 原生采集实现。
 
 启动即显示录制胶囊：选择窗口、区域、设备或显示器，在更多面板完成录前准备，确认桌面录制范围后开始。停止后进入浅色剪辑台；已支持鼠标自动缩放、音轨试听和同步导出。设备模式支持系统识别的摄像头与 USB 采集卡。
 

@@ -27,8 +27,12 @@ export interface PersistedSettings {
   captureDefaults: CaptureDefaults;
   /** 主窗口置顶（重启后恢复） */
   alwaysOnTop: boolean;
-  /** 设置页最近一次选择的目录（仅用于展示/回填，不作为工程路径） */
+  /** 用户选择的录制存储目录；由采集流程在其下创建独立工程。 */
   lastDirectory: string | null;
+  exportDirectory?: string | null;
+  appearance?: 'light' | 'dark' | 'system';
+  motion?: 'system' | 'reduced';
+  exportSound?: boolean;
 }
 
 export const SETTINGS_STORAGE_KEY = 'wcs.renderer.settings.v1';
@@ -50,6 +54,10 @@ export const DEFAULT_SETTINGS: PersistedSettings = {
   captureDefaults: DEFAULT_CAPTURE_DEFAULTS,
   alwaysOnTop: false,
   lastDirectory: null,
+  exportDirectory: null,
+  appearance: 'light',
+  motion: 'system',
+  exportSound: true,
 };
 
 /** 只依赖 getItem/setItem 的最小存储面，便于测试注入。 */
@@ -109,6 +117,10 @@ export function normalizeSettings(raw: unknown): PersistedSettings {
     captureDefaults: normalizeCaptureDefaults(source.captureDefaults),
     alwaysOnTop: boolOr(source.alwaysOnTop, false),
     lastDirectory,
+    exportDirectory: typeof source.exportDirectory === 'string' ? source.exportDirectory : null,
+    appearance: source.appearance === 'dark' || source.appearance === 'system' ? source.appearance : 'light',
+    motion: source.motion === 'reduced' ? 'reduced' : 'system',
+    exportSound: boolOr(source.exportSound, true),
   };
 }
 
@@ -135,10 +147,15 @@ export function saveSettings(
     captureDefaults: normalizeCaptureDefaults({ ...current.captureDefaults, ...(patch.captureDefaults ?? {}) }),
     alwaysOnTop: patch.alwaysOnTop ?? current.alwaysOnTop,
     lastDirectory: patch.lastDirectory === undefined ? current.lastDirectory : patch.lastDirectory,
+    exportDirectory: patch.exportDirectory === undefined ? current.exportDirectory : patch.exportDirectory,
+    appearance: patch.appearance ?? current.appearance,
+    motion: patch.motion ?? current.motion,
+    exportSound: patch.exportSound ?? current.exportSound,
   };
   if (storage) {
     try {
       storage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));
+      if (typeof window !== 'undefined') window.dispatchEvent(new Event('wcs-settings-change'));
     } catch {
       // 存储配额/权限问题不阻塞使用
     }

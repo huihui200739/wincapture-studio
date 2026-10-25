@@ -656,6 +656,15 @@ export function validateProject(project: Project, options: ValidationOptions = {
     }
     if (effect.kind === 'zoom') {
       const motion = effect.parameters as import('./project').ZoomParameters;
+      if (motion.continuation !== undefined) {
+        const continuation = motion.continuation;
+        if (!continuation || typeof continuation.id !== 'string' || !continuation.id ||
+          !Number.isSafeInteger(continuation.offsetTicks) || continuation.offsetTicks < 0 ||
+          !Number.isSafeInteger(continuation.durationTicks) || continuation.durationTicks <= 0 ||
+          continuation.offsetTicks >= continuation.durationTicks) {
+          push({ code: 'effect-parameters-invalid', severity: 'error', message: '分割运镜的动画进度无效。', entity: 'effect', entityId: effect.id, field: 'parameters.continuation' });
+        }
+      }
       if (motion.focusPath !== undefined && (!Array.isArray(motion.focusPath) || motion.focusPath.some((point, index, points) =>
         !point || !Number.isFinite(point.tick) || point.tick < 0 || !Number.isFinite(point.x) || !Number.isFinite(point.y) ||
         point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1 || (index > 0 && point.tick < points[index - 1].tick)))) {

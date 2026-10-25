@@ -61,7 +61,9 @@ async function settle(win, ms = 700) {
 }
 
 async function capture(win, name, label) {
-  const image = await win.webContents.capturePage(undefined, { stayAwake: true });
+  win.show(); win.focus(); win.webContents.invalidate(); await wait(150);
+  const [width,height]=win.getContentSize();
+  const image = await win.webContents.capturePage({x:0,y:0,width,height}, { stayAwake: true });
   if (image.isEmpty()) throw new Error(`截图 ${name} 为空`);
   const png = image.toPNG();
   const file = path.join(OUT, `${name}.png`);
@@ -111,7 +113,7 @@ async function interactions(win) {
       canvasH: canvas ? canvas.height : 0,
       clipCount: document.querySelectorAll('.tl-clip').length,
       rows: document.querySelectorAll('.timeline-row').length,
-      text: document.querySelector('.transport-time') ? document.querySelector('.transport-time').textContent.trim() : '',
+      text: document.querySelector('.player-time') ? document.querySelector('.player-time').textContent.trim() : '',
     };
   })()`);
 
@@ -123,7 +125,7 @@ async function interactions(win) {
   })()`);
   await wait(700);
   const afterPlay = await win.webContents.executeJavaScript(`(() => {
-    const t = document.querySelector('.transport-time');
+    const t = document.querySelector('.player-time');
     const btn = [...document.querySelectorAll('.stage-toolbar button')].find((b) => (b.getAttribute('aria-label') || '').includes('暂停'));
     if (btn) btn.click();
     return t ? t.textContent.trim() : '';
@@ -188,21 +190,18 @@ async function shortcutGuard(win) {
 }
 
 async function verifyNewControls(win) {
-  await goView(win, 'export', '.export-layout');
+  await goView(win, 'export', '.export-sheet-layout');
   await win.webContents.executeJavaScript(`(() => {
-    for (const [id, value] of [['export-resolution', '2160'], ['export-fps', '60'], ['export-quality', 'high']]) {
-      const el = document.getElementById(id);
-      if (!el) throw new Error('缺少导出选择器 ' + id);
-      el.value = value; el.dispatchEvent(new Event('change', { bubbles: true }));
-    }
+    document.querySelector('[aria-label="输出分辨率"] button:nth-child(4)').click();
+    document.querySelector('[aria-label="输出帧率"] button:nth-child(3)').click();
   })()`);
   await settle(win, 200);
   const exportSettings = await win.webContents.executeJavaScript(`(() => ({
-    resolution: document.getElementById('export-resolution').value,
-    fps: document.getElementById('export-fps').value,
-    shows4K: document.querySelector('.export-layout').textContent.includes('3840'),
+    resolution: document.querySelector('[aria-label="输出分辨率"] button:nth-child(4)').getAttribute('aria-pressed'),
+    fps: document.querySelector('[aria-label="输出帧率"] button:nth-child(3)').getAttribute('aria-pressed'),
+    shows4K: document.querySelector('.export-summary').textContent.includes('3840'),
   }))()`);
-  if (exportSettings.resolution !== '2160' || exportSettings.fps !== '60' || !exportSettings.shows4K) throw new Error('导出规格没有应用');
+  if (exportSettings.resolution !== 'true' || exportSettings.fps !== 'true' || !exportSettings.shows4K) throw new Error('导出规格没有应用');
 
   await goView(win, 'editor', '.editor');
   await win.webContents.executeJavaScript(`document.getElementById('inspector-tab-canvas').click()`);
@@ -237,11 +236,11 @@ async function verifyNewControls(win) {
     autoTab:document.getElementById('inspector-tab-privacy').getAttribute('aria-selected') === 'true' })`);
   if (clipboard.count !== before + 1 || !clipboard.unconfirmed || !clipboard.autoTab) throw new Error('效果粘贴或属性面板联动失败');
   await win.webContents.executeJavaScript(`document.dispatchEvent(new KeyboardEvent('keydown', {key:'z', ctrlKey:true, bubbles:true}))`);
-  await goView(win, 'export', '.export-layout');
-  await win.webContents.executeJavaScript(`[...document.querySelectorAll('.kind-card')].find(e => e.textContent.includes('纯音频')).click()`);
+  await goView(win, 'export', '.export-sheet-layout');
+  await win.webContents.executeJavaScript(`document.querySelector('[aria-label="导出内容"] button:nth-child(2)').click()`);
   await settle(win, 150);
   const audio = await win.webContents.executeJavaScript(`({ path: document.getElementById('export-path').value,
-    hidesVideo: !document.getElementById('export-resolution'), audioBitrate: !!document.querySelector('[aria-label="音频码率"]') })`);
+    hidesVideo: !document.querySelector('[aria-label="输出分辨率"]'), audioBitrate: document.querySelector('.export-summary').textContent.includes('M4A') })`);
   if (!audio.path.endsWith('.m4a') || !audio.hidesVideo || !audio.audioBitrate) throw new Error('M4A 设置未正确切换');
   await capture(win, '16-m4a-export', 'M4A 纯音频导出');
   await goView(win, 'editor', '.editor');
@@ -365,7 +364,7 @@ app.whenReady().then(async () => {
     await capture(win, '04-editor-canvas', '编辑器 · 画布属性：画幅 16:9/1:1/9:16、背景、圆角、阴影、摄像头布局');
 
     // ---- 导出 ----
-    await goView(win, 'export', '.export-layout');
+    await goView(win, 'export', '.export-sheet-layout');
     await settle(win, 800);
     summary.checks.export = await win.webContents.executeJavaScript(`(() => ({
       kindCards: document.querySelectorAll('.kind-card').length,
@@ -396,7 +395,7 @@ app.whenReady().then(async () => {
     await capture(win, '06-tutorial', '教程页：步骤列表 / 标题说明编辑 / 截图预览 / 合并拆分');
 
     // ---- 设置 ----
-    await goView(win, 'settings', '.settings-grid');
+    await goView(win, 'settings', '.settings-island');
     await settle(win, 700);
     await capture(win, '07-settings', '设置页：系统信息 / 采集能力 / 快捷键 / 诊断');
 

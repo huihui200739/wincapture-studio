@@ -166,8 +166,7 @@ export function HomeView() {
       <section className="home-hero">
         <h1>录制、剪辑、出教程，一个工程走完</h1>
         <p>
-          选好来源就能开始录制；停止后自动进入编辑器，按标记生成教程步骤草稿。
-          所有遮挡都会在导出前再检查一次，未确认的区域不会被当作「已遮挡」。
+          录制屏幕、整理画面，用自然的运镜讲清每一步。录制完成后，可继续剪辑或整理图文教程。
         </p>
         <div className="home-hero-actions">
           <Button variant="primary" size="lg" icon="record" onClick={() => setView('record')}>

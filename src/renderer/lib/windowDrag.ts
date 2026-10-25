@@ -14,6 +14,7 @@ import type React from 'react';
 export function handleWindowDrag(event: React.PointerEvent<HTMLElement>): void {
   // 只响应主键；触摸/笔也可以拖，但避免与右键菜单冲突
   if (event.button !== 0) return;
+  event.preventDefault();
   const target = event.currentTarget;
   try {
     // 捕获后指针移出窗口（甚至移出屏幕）也能持续收到 move/up
@@ -53,8 +54,11 @@ export function handleWindowDrag(event: React.PointerEvent<HTMLElement>): void {
     target.removeEventListener('pointermove', onMove);
     target.removeEventListener('pointerup', onUp);
     target.removeEventListener('pointercancel', onUp);
+    target.removeEventListener('lostpointercapture', onUp);
+    if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
   };
   target.addEventListener('pointermove', onMove);
   target.addEventListener('pointerup', onUp);
   target.addEventListener('pointercancel', onUp);
+  target.addEventListener('lostpointercapture', onUp);
 }

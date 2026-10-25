@@ -17,6 +17,7 @@ import { App } from './App';
 import { OverlayWindow } from './views/OverlayWindow';
 import { ReviewCard } from './views/ReviewCard';
 import { AppProvider } from './lib/store';
+import { applyAppearance } from './lib/appearance';
 import { ErrorBoundary } from './components/ui';
 // 隐藏窗口的运行时必须在构建期静态引入，否则 Vite 不会把它打进产物，
 // 运行时动态 import 会 404（实测 "Failed to fetch dynamically imported module"）。
@@ -27,6 +28,7 @@ import './cameraRuntime';
 import './desktopRuntime';
 import './styles.css';
 import './studio.css';
+import './design.css';
 
 type Role = 'main' | 'overlay' | 'recorder' | 'exporter' | 'camera' | 'review';
 
@@ -89,6 +91,11 @@ document.documentElement.dataset.role = role;
 if (role === 'recorder' || role === 'exporter' || role === 'camera') {
   document.documentElement.dataset.ready = '1';
 } else {
+  // Main, recorder controls and review cards share the same local preferences.
+  applyAppearance();
+  window.addEventListener('wcs-settings-change', applyAppearance);
+  window.addEventListener('storage', applyAppearance);
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyAppearance);
   const container = document.getElementById('root');
   if (!container) {
     renderBootFailure(null, '缺少 #root 挂载点，界面无法启动。请重新安装应用。');

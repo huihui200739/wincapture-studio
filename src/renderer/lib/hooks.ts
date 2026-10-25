@@ -29,7 +29,7 @@ export interface ShortcutHandler {
   handler: (event: KeyboardEvent) => void;
   /** 允许在输入框内触发（例如 Escape），默认 false */
   allowInInput?: boolean;
-  /** 允许在弹窗打开时触发，默认 true */
+  /** 允许在弹窗打开时触发，默认 false，避免修改被遮住的工作区。 */
   allowInModal?: boolean;
   /**
    * 是否响应键盘长按产生的重复事件，默认 false（方向键例外，见 useShortcuts）。
@@ -80,7 +80,7 @@ export function useShortcuts(handlers: ShortcutHandler[], enabled = true): void 
       for (const item of ref.current) {
         if (item.combo !== combo) continue;
         if (inInput && !item.allowInInput) continue;
-        if (modalOpen && item.allowInModal === false) continue;
+        if (modalOpen && item.allowInModal !== true) continue;
         // 长按重复：方向键用于连续步进（保留），其余动作只执行一次
         const repeatAllowed = item.allowRepeat ?? item.combo.includes('arrow');
         if (event.repeat && !repeatAllowed) continue;

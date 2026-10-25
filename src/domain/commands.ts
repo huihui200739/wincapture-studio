@@ -16,6 +16,7 @@ import { AppError } from '../shared/errors';
 import { planGroupMove, linkedClips } from './clipEditing';
 import { retimeClip } from './retime';
 import { regenerateAutoZoom } from './zoom';
+import { moveClipZooms, splitZoomsAt } from './zoomEditing';
 
 export type CommandKind =
   | 'SplitClip'
@@ -249,6 +250,7 @@ function splitOne(project: Project, tick: Ticks): CommandDiff {
       diff.tracks.push(track.kind);
     }
   }
+  if (diff.tracks.includes('primaryVideo')) diff.entities.push(...splitZoomsAt(project, [tick]));
   return diff;
 }
 
@@ -395,7 +397,7 @@ function deleteRange(project: Project, range: TickRange, ripple: boolean): Comma
       const piece = { ...effect, range: main };
       if (effect.kind === 'zoom') {
         const params = effect.parameters as ZoomParameters;
-        piece.parameters = { ...params, focusPath: params.focusPath?.filter(p => p.tick < range.start || p.tick >= range.end)
+        piece.parameters = { ...params, continuation: undefined, focusPath: params.focusPath?.filter(p => p.tick < range.start || p.tick >= range.end)
           .map(p => ({ ...p, tick: ripple && p.tick >= range.end ? p.tick - length : p.tick })) };
       }
       nextEffects.push(piece);
@@ -637,6 +639,9 @@ export function applyCommand(project: Project, command: ProjectCommand): ApplyRe
       const earliest = Math.min(...group.map((clip) => clip.timelineInTicks));
       const applied = Math.max(delta, -earliest);
       if (applied !== 0) {
+        const mainRanges = next.tracks.filter(track => track.kind === 'primaryVideo').flatMap(track =>
+          track.clips.filter(clip => group.includes(clip)).map(clip => ({ start: clip.timelineInTicks, end: clipEnd(clip) })));
+        diff.entities.push(...moveClipZooms(next, mainRanges, applied));
         for (const track of next.tracks) {
           let touched = false;
           for (const clip of track.clips) {
@@ -693,6 +698,7 @@ export function applyCommand(project: Project, command: ProjectCommand): ApplyRe
         origin: command.effect.origin ?? 'manual',
         locked: command.lock ?? true,
       };
+      if (effect.kind === 'zoom') delete (effect.parameters as ZoomParameters).continuation;
       if (index >= 0) next.effects[index] = effect;
       else next.effects.push(effect);
       if (effect.kind === 'privacy') next.privacyVersion += 1;

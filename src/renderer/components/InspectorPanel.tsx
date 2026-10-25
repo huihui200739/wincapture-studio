@@ -11,7 +11,7 @@
  * 注意文案：这里删除的是「时间线片段」，与「删除源素材」是两件事。
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   CanvasStyle,
   CursorParameters,
@@ -26,22 +26,24 @@ import { findTrack, timelineDuration } from '@domain/project';
 import { formatDuration, parseDuration, secondsToTicks, ticksToSeconds } from '@domain/timebase';
 import { useApp } from '../lib/store';
 import { Badge, Button, Field, Icon, IconButton, InlineNote, Segmented, Slider, TextInput, Toggle } from './ui';
+import { LineIcon, type LineIconKind } from './LineIcon';
 import { cn, clamp } from '../lib/format';
 import { planClipMove, splittableTick, clipEndTick } from './Timeline';
 import { CANVAS_PRESETS } from '@domain/presets';
 import { PreviewCanvas } from './PreviewCanvas';
+import { Dial } from './Dial';
 import { planProjectAutoZoom } from '@domain/zoom';
 import { wcs } from '../lib/wcs';
 import { unwrap } from '../lib/format';
 
 type Tab = 'clip' | 'zoom' | 'privacy' | 'cursor' | 'canvas';
 
-const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: 'canvas', label: '画面', icon: 'image' },
-  { id: 'clip', label: '剪辑', icon: 'layers' },
-  { id: 'zoom', label: '缩放', icon: 'zoomIn' },
-  { id: 'cursor', label: '光标', icon: 'cursor' },
-  { id: 'privacy', label: '遮挡', icon: 'shield' },
+const TABS: { id: Tab; label: string; kind: LineIconKind }[] = [
+  { id: 'canvas', label: '画面', kind: 'scene' },
+  { id: 'clip', label: '剪辑', kind: 'layers' },
+  { id: 'zoom', label: '缩放', kind: 'zoom' },
+  { id: 'cursor', label: '光标', kind: 'cursorMotion' },
+  { id: 'privacy', label: '遮挡', kind: 'shield' },
 ];
 
 const BACKGROUND_SWATCHES = [
@@ -163,6 +165,23 @@ export function InspectorPanel() {
     pushToast,
   } = useApp();
   const [tab, setTab] = useState<Tab>('canvas');
+  const tabRefs = useRef(new Map<Tab, HTMLButtonElement | null>());
+  const [tabThumb, setTabThumb] = useState<{ left: number; width: number } | null>(null);
+
+  // 选中胶囊在标签间滑动（参考实现用 matchedGeometryEffect，这里用测量 + transform）。
+  const measureTabThumb = useCallback(() => {
+    const node = tabRefs.current.get(tab);
+    if (!node) return;
+    setTabThumb({ left: node.offsetLeft, width: node.offsetWidth });
+  }, [tab]);
+  useEffect(() => { measureTabThumb(); }, [measureTabThumb]);
+  useEffect(() => {
+    const parent = tabRefs.current.get(tab)?.parentElement;
+    if (!parent || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => measureTabThumb());
+    observer.observe(parent);
+    return () => observer.disconnect();
+  }, [measureTabThumb, tab]);
 
   const selectedClip = useMemo(() => {
     if (!project || !selectedClipId) return null;
@@ -218,17 +237,22 @@ export function InspectorPanel() {
             aria-controls="inspector-content"
             tabIndex={tab === item.id ? 0 : -1}
             aria-selected={tab === item.id}
+            aria-label={item.label}
+            title={item.label}
+            ref={(node) => { tabRefs.current.set(item.id, node); }}
             className={cn('inspector-tab', tab === item.id && 'is-active')}
             onClick={() => setTab(item.id)}
           >
-            <Icon name={item.icon} size={12} />
-            {item.label}
+            <LineIcon kind={item.kind} size={17} />
+            <span>{item.label}</span>
           </button>
         ))}
+        {tabThumb && <span className="inspector-tab-thumb" style={{ transform: `translateX(${tabThumb.left - 4}px)`, width: tabThumb.width }} aria-hidden="true" />}
       </div>
 
       <div className="inspector-body" id="inspector-content" role="tabpanel" aria-labelledby={`inspector-tab-${tab}`}>
-        <div className="studio-inspector-title"><h2>{TABS.find(t => t.id === tab)?.label}</h2><span>{selectedEffect || selectedClip ? '所选片段' : '全片'}</span></div>
+        <div className="studio-inspector-title"><h2 key={tab}>{TABS.find(t => t.id === tab)?.label}</h2><span>{selectedEffect || selectedClip ? '所选片段' : '全片'}</span></div>
+        <div className="inspector-page" key={`page-${tab}`}>
         {tab === 'clip' && (
           <ClipTab
             project={project}
@@ -271,6 +295,7 @@ export function InspectorPanel() {
         {tab === 'canvas' && (
           <CanvasTab project={project} selectedEffect={selectedEffect} execute={execute} />
         )}
+        </div>
       </div>
     </aside>
   );
@@ -1412,8 +1437,11 @@ function CanvasTab({
 
   return (
     <div className="studio-canvas-controls" data-page={page}>
-      <div className="studio-canvas-tabs" role="tablist" aria-label="画面设置分类">{([['background','背景'],['layout','布局'],['camera','摄像头']] as const).map(([id,label]) => <button key={id} role="tab" aria-selected={page === id} onClick={() => setPage(id)}>{label}</button>)}</div>
-      <div className="studio-canvas-preview"><PreviewCanvas project={project} projectPath={projectPath} tick={tick} maxWidth={320} includeOverlays={false} /></div>
+      <div className="studio-canvas-tabs" role="tablist" aria-label="画面设置分类">
+        {([['background','背景'],['layout','布局'],['camera','摄像头']] as const).map(([id,label]) => <button key={id} role="tab" aria-selected={page === id} onClick={() => setPage(id)}>{label}</button>)}
+        <span className="studio-canvas-tab-thumb" aria-hidden="true" style={{ transform: `translateX(calc(${page === 'background' ? 0 : page === 'layout' ? 1 : 2} * (100% + 2px)))` }} />
+      </div>
+      <div className="studio-canvas-preview"><PreviewCanvas project={project} projectPath={projectPath} tick={tick} maxWidth={640} includeOverlays={false} /></div>
       <div className="inspector-section" data-canvas-group="background">
         <div className="inspector-section-head"><h3>场景预设</h3><Badge tone="muted">一键应用</Badge></div>
         <div className="canvas-presets" role="group" aria-label="场景预设">
@@ -1429,6 +1457,16 @@ function CanvasTab({
           })}
         </div>
       </div>
+      <div className="inspector-section" data-canvas-group="layout">
+        <div className="inspector-section-head"><h3>画面与外观</h3></div>
+        <div className="parameter-dial-group">
+          <Dial label="边距" min={0} max={30} step={0.5} value={canvas.padding*100} format={v => v+'%'} onCommit={next => setCanvas({padding:next/100})} />
+          <Dial label="圆角" min={0} max={48} value={canvas.cornerRadius} format={v => v+' px'} onCommit={next => setCanvas({cornerRadius:next})} />
+          <Dial label="阴影" min={0} max={80} value={canvas.shadowBlur} format={v => v+' px'} onCommit={next => setCanvas({shadowBlur:next})} />
+          <Dial label="浓度" min={0} max={100} value={canvas.shadowOpacity*100} format={v => v+'%'} onCommit={next => setCanvas({shadowOpacity:next/100})} />
+        </div>
+      </div>
+
       <div className="inspector-section" data-canvas-group="layout">
         <div className="inspector-section-head">
           <h3>
@@ -1496,48 +1534,6 @@ function CanvasTab({
         <p className="wcs-field-hint" style={{ marginTop: 6 }}>
           自定义背景色支持 #RGB / #RRGGBB / #RRGGBBAA，回车或失焦生效。
         </p>
-      </div>
-
-      <div className="inspector-section" data-canvas-group="layout">
-        <div className="inspector-section-head">
-          <h3>画面装饰</h3>
-        </div>
-        <Slider
-          label="圆角"
-          min={0}
-          max={48}
-          step={1}
-          value={canvas.cornerRadius}
-          format={(v) => `${v} px`}
-          onCommit={(next) => setCanvas({ cornerRadius: next })}
-        />
-        <Slider
-          label="阴影模糊"
-          min={0}
-          max={80}
-          step={1}
-          value={canvas.shadowBlur}
-          format={(v) => (v === 0 ? '无阴影' : `${v} px`)}
-          onCommit={(next) => setCanvas({ shadowBlur: next })}
-        />
-        <Slider
-          label="阴影不透明度"
-          min={0}
-          max={1}
-          step={0.01}
-          value={canvas.shadowOpacity}
-          format={(v) => `${(v * 100).toFixed(0)}%`}
-          onCommit={(next) => setCanvas({ shadowOpacity: next })}
-        />
-        <Slider
-          label="内边距"
-          min={0}
-          max={0.3}
-          step={0.005}
-          value={canvas.padding}
-          format={(v) => `${(v * 100).toFixed(1)}%`}
-          onCommit={(next) => setCanvas({ padding: next })}
-        />
       </div>
 
       <div className="inspector-section" data-canvas-group="camera">

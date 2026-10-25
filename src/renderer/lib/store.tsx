@@ -77,7 +77,8 @@ export interface ToastItem {
   detail?: string;
 }
 
-const DEFAULT_CONFIG: CaptureConfig = captureConfigFromDefaults(loadSettings().captureDefaults);
+const persistedDefaults = loadSettings();
+const DEFAULT_CONFIG: CaptureConfig = { ...captureConfigFromDefaults(persistedDefaults.captureDefaults), outputDirectory: persistedDefaults.lastDirectory ?? undefined };
 
 function readHashView(): ViewId {
   const hash = typeof location !== 'undefined' ? location.hash.replace(/^#\/?/, '') : '';

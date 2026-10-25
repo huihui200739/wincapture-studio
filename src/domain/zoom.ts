@@ -13,7 +13,8 @@ import type { Effect, Project, ZoomParameters } from './project';
 import type { PointerLog } from './types';
 import { TimeMap } from './timeMap';
 import type { TickRange, Ticks } from './timebase';
-import { clampTicks, rangeLength, secondsToTicks } from './timebase';
+import { rangeLength, secondsToTicks } from './timebase';
+import { zoomEnvelopeWeight } from './zoomEnvelope';
 
 export interface PointerSample {
   /** 会话媒体时间 */
@@ -412,17 +413,12 @@ export function evaluateZoom(
 ): { scale: number; focusX: number; focusY: number } {
   let best: { scale: number; focusX: number; focusY: number } = { scale: 1, focusX: 0.5, focusY: 0.5 };
   let bestId: string | null = null;
-  const ease = (k: number) => k * k * (3 - 2 * k); // smoothstep
   for (const effect of effects) {
     if (effect.kind !== 'zoom') continue;
     if (tick < effect.range.start || tick >= effect.range.end) continue;
     const p = effect.parameters as ZoomParameters;
     const targetScale = Number.isFinite(p.scale) ? Math.max(1, p.scale) : 1;
-    const inT = clampTicks(tick - effect.range.start, 0, Math.max(1, p.easeInTicks));
-    const outT = clampTicks(effect.range.end - tick, 0, Math.max(1, p.easeOutTicks));
-    const inK = p.easeInTicks > 0 ? inT / p.easeInTicks : 1;
-    const outK = p.easeOutTicks > 0 ? outT / p.easeOutTicks : 1;
-    const k = Math.min(ease(inK), ease(outK));
+    const k = zoomEnvelopeWeight(effect, effects, tick);
     const scale = 1 + (targetScale - 1) * k;
     // 多个镜头重叠时取「当前有效放大值」最大的一个，绝不叠加：
     // - 不能比较原始 targetScale，否则强镜头正在进入（k≈0）时会被弱镜头错误覆盖；

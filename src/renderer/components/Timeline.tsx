@@ -11,11 +11,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Clip, PrivacyParameters, Project, TrackKind, ZoomParameters } from '@domain/project';
 import { findTrack, timelineDuration } from '@domain/project';
 import { stepTimelineRange } from '@domain/tutorial';
-import { planGroupMove } from '@domain/clipEditing';
+import { planGroupMove, linkedClips } from '@domain/clipEditing';
+import { moveClipZooms } from '@domain/zoomEditing';
 import { TICKS_PER_SECOND, formatDuration, ticksToSeconds } from '@domain/timebase';
 import type { Ticks } from '@domain/timebase';
 import { cn } from '../lib/format';
-import { Badge, Icon, IconButton } from './ui';
+import { Icon, IconButton } from './ui';
+import { LineIcon, type LineIconKind } from './LineIcon';
 import { AudioWaveform } from './AudioWaveform';
 import { VideoThumbnails } from './VideoThumbnails';
 import { usePreviewMedia } from '../lib/previewSource';
@@ -29,14 +31,18 @@ const TRACK_LABEL: Record<TrackKind, string> = {
 };
 
 /**
- * 轨道配色（§P1）：颜色只表达稳定的轨道类别，不靠渐变抢预览。
- * 片段底色用低饱和中性色，类别色只出现在左侧色条与标签圆点上。
+ * 轨头图标：22×22 圆角块 + 任务色淡染。颜色只表达轨道身份，
+ * 主视频保持石墨黑，彩板留给效果轨与设备轨。
  */
-const TRACK_STYLE: Record<TrackKind, { accent: string; background: string }> = {
-  primaryVideo: { accent: '#77a9ff', background: 'rgba(119, 169, 255, 0.16)' },
-  camera: { accent: '#b39ddb', background: 'rgba(179, 157, 219, 0.16)' },
-  mic: { accent: '#4fc08d', background: 'rgba(79, 192, 141, 0.16)' },
-  system: { accent: '#5fbccd', background: 'rgba(95, 188, 205, 0.16)' },
+const LANE_ICON: Record<string, { kind: LineIconKind; tint: string; ink: string }> = {
+  primaryVideo: { kind: 'film', tint: 'rgba(0,0,0,.07)', ink: 'var(--ds-secondary)' },
+  camera: { kind: 'camera', tint: 'rgba(255,138,92,.2)', ink: '#dd5420' },
+  mic: { kind: 'microphone', tint: 'rgba(0,0,0,.055)', ink: 'var(--ds-secondary)' },
+  system: { kind: 'speaker', tint: 'rgba(0,0,0,.055)', ink: 'var(--ds-secondary)' },
+  zoom: { kind: 'zoom', tint: 'rgba(181,230,85,.3)', ink: '#5a9e1c' },
+  privacy: { kind: 'shield', tint: 'rgba(69,203,184,.26)', ink: '#0f8c7a' },
+  step: { kind: 'pin', tint: 'rgba(242,173,71,.2)', ink: '#9a6d20' },
+  marker: { kind: 'pin', tint: 'rgba(242,173,71,.2)', ink: '#9a6d20' },
 };
 
 export interface TimelineProps {
@@ -254,6 +260,7 @@ export function Timeline({
   const hasZoom = project.effects.some(e => e.kind === 'zoom');
   const [showAdvanced, setShowAdvanced] = useState(hasZoom);
   const [detailTracks, setDetailTracks] = useState(false);
+  const [waveformMode, setWaveformMode] = useState(false);
   useEffect(() => { if (hasZoom) setShowAdvanced(true); }, [project.id, hasZoom]);
   const thumbnailMedia = usePreviewMedia(projectPath ?? null);
   const [snapGuide, setSnapGuide] = useState<number | null>(null);
@@ -450,25 +457,37 @@ export function Timeline({
   }, [onMoveBlocked, onMoveClip, onTrimClip, project, trimPreview]);
 
   // ---- 刻度 ----
+  // 好数步长（1/2/5×10ⁿ）按 128px 目标间距选取；minor 刻度 = major/2，偶数位为 major。
   const ticks = useMemo(() => {
     const secondsVisible = duration / TICKS_PER_SECOND;
-    const targetCount = Math.max(4, Math.floor(contentWidth / 74));
+    const targetCount = Math.max(3, Math.floor(contentWidth / 128));
     const rawStep = secondsVisible / targetCount;
-    const niceSteps = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
-    const step = niceSteps.find((s) => s >= rawStep) ?? 600;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(Math.max(rawStep, 0.01))));
+    const niceSteps = [1, 2, 5, 10].map((m) => m * magnitude);
+    const step = niceSteps.find((s) => s >= rawStep) ?? niceSteps[niceSteps.length - 1];
+    const minorStep = step / 2;
     const out: { tick: number; label: string; major: boolean }[] = [];
-    for (let s = 0; s <= secondsVisible + 0.001; s += step) {
+    for (let s = 0, i = 0; s <= secondsVisible + 0.001; s += minorStep, i++) {
       out.push({
         tick: Math.round(s * TICKS_PER_SECOND),
-        label: step >= 1 ? formatShort(s) : `${s.toFixed(1)}s`,
-        major: Math.abs(s % (step * 2)) < 1e-6,
+        label: formatRuler(s, step < 1),
+        major: i % 2 === 0,
       });
     }
     return out;
   }, [contentWidth, duration]);
 
   const clipsOf = (kind: TrackKind): Clip[] => findTrack(project, kind)?.clips ?? [];
-  const zoomEffects = useMemo(() => project.effects.filter((e) => e.kind === 'zoom'), [project.effects]);
+  const zoomEffects = useMemo(() => {
+    const effects = project.effects.filter(effect => effect.kind === 'zoom');
+    if (!dragPreview || !draggedClipForPreview) return effects;
+    const group = linkedClips(project, draggedClipForPreview);
+    const ranges = project.tracks.filter(track => track.kind === 'primaryVideo').flatMap(track =>
+      track.clips.filter(clip => group.includes(clip)).map(clip => ({ start: clip.timelineInTicks, end: clipEndTick(clip) })));
+    const preview = { ...project, effects: structuredClone(effects) };
+    moveClipZooms(preview, ranges, dragPreview.tick - draggedClipForPreview.timelineInTicks);
+    return preview.effects;
+  }, [project, dragPreview, draggedClipForPreview]);
   const privacyEffects = useMemo(() => project.effects.filter((e) => e.kind === 'privacy'), [project.effects]);
 
   // ---- 音频波形（§10.4）----
@@ -516,15 +535,18 @@ export function Timeline({
           size="sm"
           onClick={onToggleCollapsed}
         />
-        <span style={{ fontSize: 'var(--fs-aux)', color: 'var(--text-muted)', fontWeight: 500 }}>时间线</span>
-        <Badge tone="muted">{`${project.tracks.reduce((acc, t) => acc + t.clips.length, 0)} 片段`}</Badge>
-        <div className="stage-toolbar-divider" />
         <IconButton icon="split" label="在播放头分割（Ctrl+B）" size="sm" onClick={onSplitAtPlayhead} />
         <IconButton icon="trash" label="删除所选时间线片段（Delete，不删除源素材）" size="sm" variant="danger" onClick={onDeleteSelected} />
         <button type="button" className="advanced-tracks-toggle" onClick={() => setShowAdvanced((v) => !v)} aria-pressed={showAdvanced}>
           <Icon name={showAdvanced ? 'chevronDown' : 'chevronRight'} size={11} />
           {showAdvanced ? '隐藏高级轨道' : '显示高级轨道（运镜 / 遮挡 / 步骤）'}
         </button>
+        <div className="timeline-toolbar-spacer" />
+        <div className="timeline-display-toggle" role="group" aria-label="时间线显示">
+          <button aria-pressed={!waveformMode} onClick={() => setWaveformMode(false)}><LineIcon kind="film" size={14} />画面</button>
+          <button aria-pressed={waveformMode} onClick={() => { setWaveformMode(true); setDetailTracks(true); }}><LineIcon kind="waveform" size={14} />波形</button>
+          <span className="timeline-display-toggle-thumb" aria-hidden="true" style={{ transform: waveformMode ? 'translateX(100%)' : 'translateX(0)' }} />
+        </div>
         <div className="timeline-toolbar-spacer" />
         <button className="studio-track-toggle" aria-pressed={detailTracks} onClick={() => setDetailTracks(!detailTracks)}><Icon name="volume" size={13} />{detailTracks ? '收起音频 / 摄像头' : '音频 / 摄像头'}</button>
         <div className="timeline-zoom">
@@ -547,7 +569,7 @@ export function Timeline({
       {!collapsed && (
         <div className="timeline-body">
           <div className="timeline-gutter">
-            <div className="timeline-gutter-head">轨道</div>
+            <div className="timeline-gutter-head" aria-hidden="true" />
             <div className="timeline-gutter-rows">
               {rows.map((row) => {
                 const isAudioRow = row.kind === 'mic' || row.kind === 'system';
@@ -594,23 +616,14 @@ export function Timeline({
                     }
                   >
                     <span
-                      className="row-kind-dot"
-                      style={{
-                        background:
-                          row.kind === 'zoom'
-                            ? '#77a9ff'
-                            : row.kind === 'privacy'
-                              ? '#ff5c69'
-                              : row.kind === 'step'
-                                ? '#4fc08d'
-                                : row.kind === 'marker'
-                                  ? '#4fc08d'
-                                  : TRACK_STYLE[row.kind as TrackKind].accent,
-                      }}
-                    />
+                      className="lane-icon"
+                      aria-hidden="true"
+                      style={{ ['--lane-tint' as string]: LANE_ICON[row.kind]?.tint, ['--lane-ink' as string]: LANE_ICON[row.kind]?.ink }}
+                    >
+                      <LineIcon kind={LANE_ICON[row.kind]?.kind ?? 'film'} size={12} />
+                    </span>
                     <span>{row.label}</span>
                     {isAudioRow && <Icon name={muted ? 'eyeOff' : 'volume'} size={10} />}
-                    {row.advanced && <Badge tone="muted">高级</Badge>}
                   </button>
                 );
               })}
@@ -705,13 +718,10 @@ export function Timeline({
                         return (
                         <div
                           key={step.id}
-                          className="tl-step-band"
+                          className={cn('tl-step-band', selectedStepId === step.id && 'is-selected')}
                           style={{
                             left: tickToX(band.start),
                             width: Math.max(10, tickToX(band.end - band.start)),
-                            ...(selectedStepId === step.id
-                              ? { boxShadow: '0 0 0 1px #4c8dff', background: 'rgba(69,192,138,0.28)' }
-                              : null),
                           }}
                           role="button"
                           tabIndex={0}
@@ -758,8 +768,6 @@ export function Timeline({
                             style={{
                               left: tickToX(leftTick),
                               width,
-                              background: TRACK_STYLE[row.kind as TrackKind].background,
-                              ['--clip-accent' as string]: TRACK_STYLE[row.kind as TrackKind].accent,
                             }}
                             role="button"
                             tabIndex={0}
@@ -795,7 +803,7 @@ export function Timeline({
                             onDoubleClick={() => onSeek(clip.timelineInTicks)}
                           >
                             {/* 音频轨叠加真实波形（§10.4）；读不到就退回纯色块 */}
-                            {!isAudioRow && <VideoThumbnails project={project} clip={clip} width={width} camera={row.kind === 'camera'} media={thumbnailMedia} />}
+                            {!isAudioRow && !waveformMode && <VideoThumbnails project={project} clip={clip} width={width} camera={row.kind === 'camera'} media={thumbnailMedia} />}
                             {isAudioRow && clip.assetId && (
                               <AudioWaveform
                                 assetId={clip.assetId}
@@ -809,7 +817,7 @@ export function Timeline({
                               />
                             )}
                             <span className="tl-clip-label">
-                              {TRACK_LABEL[row.kind as TrackKind]} {formatDuration(clip.sourceDurationTicks)}
+                              {formatClipLength(clipEndTick(clip) - clip.timelineInTicks)}
                             </span>
                             <span className="tl-clip-handle is-left" aria-hidden="true" />
                             <span className="tl-clip-handle is-right" aria-hidden="true" />
@@ -845,11 +853,24 @@ export function Timeline({
   );
 }
 
-function formatShort(seconds: number): string {
+function formatRuler(seconds: number, showCentiseconds: boolean): string {
+  if (showCentiseconds) {
+    const total = Math.round(seconds * 100);
+    const m = Math.floor(total / 6000);
+    const s = Math.floor(total / 100) % 60;
+    const cs = total % 100;
+    return `${m}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+  }
   const total = Math.round(seconds);
   const m = Math.floor(total / 60);
   const s = total % 60;
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/** 片段右下角的短时长徽章：4.7s / 12.6s。 */
+function formatClipLength(ticks: number): string {
+  const seconds = ticks / TICKS_PER_SECOND;
+  return `${seconds >= 100 ? Math.round(seconds) : seconds.toFixed(1)}s`;
 }
 
 function styleText(style: PrivacyParameters['style']): string {

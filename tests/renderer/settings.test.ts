@@ -8,6 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_CAPTURE_DEFAULTS,
+  DEFAULT_SETTINGS,
   SETTINGS_STORAGE_KEY,
   captureConfigFromDefaults,
   loadSettings,
@@ -62,13 +63,18 @@ describe('normalizeCaptureDefaults', () => {
 });
 
 describe('loadSettings', () => {
+  it('旧设置迁移后保留采集选项，并为外观和动效提供默认值', () => {
+    const storage = memoryStorage({ [SETTINGS_STORAGE_KEY]: JSON.stringify({ captureDefaults: { qualityId: '720p30' }, lastDirectory: 'D:\\Recordings' }) });
+    expect(loadSettings(storage)).toMatchObject({ captureDefaults: { qualityId: '720p30' }, lastDirectory: 'D:\\Recordings', appearance: 'light', motion: 'system', exportSound: true });
+  });
+  it('修改外观不会覆盖用户的导出目录与录制默认值', () => {
+    const storage = memoryStorage();
+    saveSettings({ exportDirectory: 'D:\\Exports', captureDefaults: { ...DEFAULT_CAPTURE_DEFAULTS, qualityId: '1080p60' } }, storage);
+    saveSettings({ appearance: 'dark', motion: 'reduced', exportSound: false }, storage);
+    expect(loadSettings(storage)).toMatchObject({ exportDirectory: 'D:\\Exports', captureDefaults: { qualityId: '1080p60' }, appearance: 'dark', motion: 'reduced', exportSound: false });
+  });
   it('没有存储时返回默认设置', () => {
-    expect(loadSettings(null)).toEqual({
-      version: 1,
-      captureDefaults: DEFAULT_CAPTURE_DEFAULTS,
-      alwaysOnTop: false,
-      lastDirectory: null,
-    });
+    expect(loadSettings(null)).toEqual(DEFAULT_SETTINGS);
   });
 
   it('损坏 JSON 不抛异常，回退默认设置', () => {

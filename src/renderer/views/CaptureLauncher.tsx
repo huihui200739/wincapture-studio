@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CaptureSourceInfo, DisplayInfo, AudioDeviceInfo, VideoDeviceInfo } from '@shared/ipc';
 import { QUALITY_PROFILES } from '@shared/ipc';
 import { useApp } from '../lib/store';
@@ -36,6 +36,7 @@ export function CaptureLauncher() {
   const displayRequest = useRef<Promise<DisplayInfo[]> | null>(null);
   const deviceRequest = useRef<Promise<void> | null>(null);
   const sourceGeneration = useRef(0);
+  const sourceFetchedAt = useRef<Partial<Record<Mode, number>>>({});
   const selected = sources.find(s => s.id === config.sourceId);
   const display = displays[Number(config.sourceId.split(':')[1])] ?? displays[0];
   const deviceName = devices.find(d => `device:${d.deviceId}` === config.sourceId)?.label ?? '视频设备';
@@ -79,19 +80,30 @@ export function CaptureLauncher() {
     try {
       if (mode === 'device') await refreshDevices();
       else {
+        // Paint metadata before asking Windows for thumbnails. Desktop capture
+        // can briefly occupy the main thread on the first enumeration.
+        const kind = mode === 'window' ? 'window' : 'screen';
+        const metadata = unwrap(await wcs().listSources({ kind, thumbnails: false }));
+        if (generation !== sourceGeneration.current) return;
+        setSources(previous => [...previous.filter(s => s.kind !== kind), ...metadata]);
+        await new Promise(resolve => window.setTimeout(resolve, 120));
+        if (generation !== sourceGeneration.current) return;
         const available = unwrap(await wcs().listSources({ kind: mode === 'window' ? 'window' : 'screen' }));
         if (generation === sourceGeneration.current) setSources(previous => [...previous.filter(s => s.kind !== (mode === 'window' ? 'window' : 'screen')), ...available]);
       }
+      if (generation === sourceGeneration.current) sourceFetchedAt.current[mode] = Date.now();
     } catch (e) { if (generation === sourceGeneration.current) setError(e instanceof Error ? e.message : String(e)); }
     finally { if (generation === sourceGeneration.current) setLoading(false); }
   }, [mode, refreshDevices]);
   useEffect(() => {
-    if (panel === 'sources') void refresh();
-    else if (panel === 'more') void refreshDevices().catch(e => setError(String(e)));
-    return () => { sourceGeneration.current++; };
-  }, [panel, refresh, refreshDevices]);
+    // Resize and paint the panel first; reuse recent results when reopening.
+    const timer = panel === 'sources' && Date.now() - (sourceFetchedAt.current[mode] ?? 0) > 15_000
+      ? window.setTimeout(() => void refresh(), 180) : undefined;
+    if (panel === 'more') void refreshDevices().catch(e => setError(String(e)));
+    return () => { window.clearTimeout(timer); sourceGeneration.current++; setLoading(false); };
+  }, [panel, mode, refresh, refreshDevices]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (confirming) return;
     void wcs().windowLayout({ mode: 'launcher', height: panel === 'sources' ? 610 : panel === 'more' ? 740 : error ? 170 : 96 });
   }, [panel, confirming, error]);
@@ -179,7 +191,7 @@ export function CaptureLauncher() {
 
   return <div className="launcher-root">
     <div className="capture-capsule" role="toolbar" aria-label="录制胶囊">
-      <button className={cn('capture-source-trigger', panel === 'sources' && 'active')} onClick={() => setPanel(panel === 'sources' ? null : 'sources')} title={sourceName}>
+      <button className={cn('capture-source-trigger', panel === 'sources' && 'active')} aria-expanded={panel === 'sources'} onClick={() => setPanel(panel === 'sources' ? null : 'sources')} title={sourceName}>
         <Icon name={modeInfo.icon} size={20} /><span>{modeInfo.label}</span><Icon name="chevronDown" size={13} />
       </button><span className="capsule-separator" />
       {([

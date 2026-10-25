@@ -1,5 +1,6 @@
 import type { Effect, ZoomParameters } from './project';
 import type { FrameScene } from './scene';
+import { zoomEnvelopeWeight } from './zoomEnvelope';
 
 export interface ScreenMotion { rotateX: number; rotateY: number; rotateZ: number; perspective: number }
 export interface Point { x: number; y: number }
@@ -14,9 +15,7 @@ export function evaluateMotion(effects: readonly Effect[], tick: number): Screen
   for (const effect of effects) {
     if (effect.kind !== 'zoom' || tick < effect.range.start || tick >= effect.range.end) continue;
     const p = effect.parameters as ZoomParameters;
-    const smooth = (v: number) => { const k = clamp(v, 0, 1); return k * k * (3 - 2 * k); };
-    const k = Math.min(smooth(p.easeInTicks > 0 ? (tick - effect.range.start) / p.easeInTicks : 1),
-      smooth(p.easeOutTicks > 0 ? (effect.range.end - tick) / p.easeOutTicks : 1));
+    const k = zoomEnvelopeWeight(effect, effects, tick);
     const current = 1 + (Math.max(1, safe(p.scale, 1)) - 1) * k;
     if (current > scale + 1e-9 || (Math.abs(current - scale) <= 1e-9 && (!winner || effect.id < winner.id))) {
       winner = effect; scale = current; weight = k;

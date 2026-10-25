@@ -67,6 +67,8 @@ export type EffectKind = 'zoom' | 'privacy' | 'cursor' | 'annotation';
 export type EffectOrigin = 'automatic' | 'manual';
 
 export interface ZoomParameters {
+  /** Phase of the original shot after a clip split; independent of timeline position. */
+  continuation?: { id: string; offsetTicks: Ticks; durationTicks: Ticks };
   /** 3D screen rotation in degrees; older projects default to a flat screen. */
   rotateX?: number;
   rotateY?: number;

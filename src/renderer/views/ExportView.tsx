@@ -12,7 +12,7 @@ import type { ExportProgress, ExportProfile } from '@shared/ipc';
 import type { ExportBundleResult } from '@shared/api';
 import type { ErrorCode } from '@shared/errors';
 import { useApp } from '../lib/store';
-import { Badge, Button, EmptyState, Field, Icon, InlineNote, Panel, ProgressBar, Spinner, TextInput } from '../components/ui';
+import { Badge, Button, EmptyState, Field, Icon, InlineNote, Panel, ProgressBar, Spinner, TextInput, Modal } from '../components/ui';
 import {
   bytesPerSecond,
   cn,
@@ -24,6 +24,9 @@ import {
   type PresentedError,
 } from '../lib/format';
 import { wcs } from '../lib/wcs';
+import { PreviewCanvas } from '../components/PreviewCanvas';
+import { loadSettings } from '../lib/settings';
+import { playExportSound } from '../lib/appearance';
 import { timelineDuration } from '@domain/project';
 import { TICKS_PER_SECOND } from '@domain/timebase';
 import { createExportProfile, type ExportResolution, type ExportFrameRate, type ExportQuality } from '../lib/exportSettings';
@@ -55,8 +58,8 @@ const VARIANTS = [
   { id: 'portrait', label: '9:16 竖屏', w: 17, h: 30 },
 ];
 
-export function ExportView() {
-  const { project, systemInfo, pushToast, pushError, apiMode, setView, selectEffect } = useApp();
+export function ExportView({ onClose }: { onClose?: () => void }) {
+  const { project, projectPath, tick, systemInfo, pushToast, pushError, apiMode, setView, selectEffect } = useApp();
 
   const [kind, setKind] = useState<Kind>('video');
   const extension = kind === 'audio' ? 'm4a' : 'mp4';
@@ -112,7 +115,7 @@ export function ExportView() {
    */
   useEffect(() => {
     if (pathTouched) return;
-    const derived = deriveDefaultOutputPath(systemInfo?.videosPath, project?.name);
+    const derived = deriveDefaultOutputPath(loadSettings().exportDirectory || systemInfo?.videosPath, project?.name);
     if (derived) setOutputPath(derived.replace(/\.mp4$/i, `.${extension}`));
   }, [pathTouched, project?.name, systemInfo?.videosPath, extension]);
 
@@ -305,209 +308,42 @@ export function ExportView() {
     setWarnings([]);
   };
 
-  if (!project) {
-    return (
-      <div className="view">
-        <div className="view-head">
-          <div>
-            <h1>导出</h1>
-            <p>先打开或创建一个工程。</p>
-          </div>
-        </div>
-        <EmptyState
-          icon="export"
-          title="没有可导出的工程"
-          description="录制一段或打开已有工程后，再回到这里选择产物与画幅。"
-          actions={
-            <>
-              <Button variant="primary" icon="record" onClick={() => setView('record')}>
-                去录制
-              </Button>
-              <Button icon="home" onClick={() => setView('home')}>
-                回首页
-              </Button>
-            </>
-          }
-        />
-      </div>
-    );
-  }
-
+  const close = onClose ?? (() => setView('editor'));
   const running = status === 'running';
-
-  return (
-    <div className="view">
-      <div className="view-head">
-        <div>
-          <h1>导出</h1>
-          <p>选择产物类型与画幅，确认输出路径后开始导出；导出不修改工程。</p>
-        </div>
-        <div className="view-actions">
-          {running ? (
-            <Button variant="danger" icon="close" onClick={() => void cancelExport()} loading={cancelling} disabled={cancelling}>
-              {cancelling ? '正在取消…' : '取消导出'}
-            </Button>
-          ) : (
-            <Button
-              variant="primary"
-              icon="export"
-              onClick={() => void startExport()}
-              disabled={!pathCheck.ok}
-              title={pathCheck.ok ? undefined : pathCheck.reason}
-            >
-              {status === 'failed' ? '重试导出' : status === 'done' ? '再导出一份' : '开始导出'}
-            </Button>
-          )}
-        </div>
+  if (!project) return <Modal title="导出作品" onClose={close}><EmptyState icon="editor" title="先打开一个工程" description="录制或打开工程后，即可导出作品。" actions={<Button onClick={() => setView('home')}>打开工程</Button>} /></Modal>;
+  const fileName = outputPath.split(/[\\/]/).at(-1) ?? '';
+  const directory = outputPath.slice(0, Math.max(0, outputPath.length-fileName.length)).replace(/[\\/]+$/, '');
+  const previewProject = { ...project, settings: { ...project.settings, activeVariantId: variantId } };
+  return <Modal title={<span className="export-dialog-title">导出作品 <small>{project.name}</small></span>} className="export-dialog" width={860}
+    dismissible={!running} onClose={() => { if (!runningRef.current) close(); }}
+    footer={<><span className="export-estimate">预计大小 · 约 {formatBytes(estimatedBytes)}</span><Button variant="ghost" onClick={() => running ? void cancelExport() : close()} loading={cancelling}>{running ? '取消导出' : '取消'}</Button>{!running && <Button variant="primary" icon="export" onClick={() => void startExport()} disabled={!pathCheck.ok}>{status === 'done' ? '再导出一份' : status === 'failed' ? '重试导出' : kind === 'audio' ? '开始导出音频' : '开始导出视频'}</Button>}</>}>
+    <div className="export-sheet-layout">
+      <div className="export-options">
+        <h3 className="section-caption">文件</h3><div className="export-file-card">
+          <TextInput aria-label="导出文件名" value={fileName} disabled={running} onChange={event => { setOutputPath((directory ? directory + String.fromCharCode(92) : '') + event.target.value); setPathTouchedFor(projectId); }} onBlur={() => setOutputPath(previous => normalizeOutputPath(previous,extension))} />
+          <button className="export-directory" disabled={running || picking} onClick={() => void pickPath()} title={directory}><Icon name="folder" size={15} /><span>{directory || '选择保存位置'}</span><Icon name="chevronRight" size={13} /></button>
+        </div>{!pathCheck.ok && <p className="settings-hint is-error">{pathCheck.reason}</p>}
+        <h3 className="section-caption">导出内容</h3><div className="sheet-segmented" role="group" aria-label="导出内容">{[{id:'video',label:'视频成片',icon:'editor'},{id:'audio',label:'仅音频',icon:'volume'}].map(item => <button key={item.id} aria-pressed={kind===item.id} disabled={running} onClick={() => {setKind(item.id as Kind);resetToIdle();}}><Icon name={item.icon} size={15} />{item.label}</button>)}</div>
+        {kind !== 'audio' && <><h3 className="section-caption">规格</h3><div className="export-spec-card">
+          <span className="export-field-label">分辨率</span><div className="sheet-segmented" role="group" aria-label="输出分辨率">{[{id:'source',label:'原始素材'},{id:'1080',label:'1080p'},{id:'1440',label:'1440p'},{id:'2160',label:'4K'}].map(item => <button key={item.id} aria-pressed={resolution===item.id} disabled={running} onClick={() => setResolution(item.id as ExportResolution)}>{item.label}</button>)}</div>
+          <span className="export-field-label">帧率</span><div className="sheet-segmented" role="group" aria-label="输出帧率">{[{id:'project',label:'跟随工程'},{id:'30',label:'30 FPS'},{id:'60',label:'60 FPS'}].map(item => <button key={item.id} aria-pressed={outputFps===item.id} disabled={running} onClick={() => setOutputFps(item.id as ExportFrameRate)}>{item.label}</button>)}</div>
+        </div></>}
+        <details className="export-advanced"><summary>更多选项<Icon name="chevronDown" size={13} /></summary><div>
+          <Field label="产物类型"><select className="wcs-select" aria-label="产物类型" value={kind} disabled={running} onChange={event => {setKind(event.target.value as Kind);resetToIdle();}}><option value="video">视频成片</option><option value="audio">仅音频</option><option value="tutorial">图文教程</option><option value="both">视频 + 教程</option></select></Field>
+          {kind !== 'audio' && <><Field label="画幅"><div className="sheet-segmented">{VARIANTS.map(item => <button key={item.id} aria-pressed={variantId===item.id} disabled={running} onClick={() => setVariantId(item.id)}>{item.label}</button>)}</div></Field>
+          <Field label="画质"><select className="wcs-select" aria-label="输出画质" value={quality} disabled={running} onChange={event => setQuality(event.target.value as ExportQuality)}><option value="compact">小体积</option><option value="balanced">均衡</option><option value="high">高画质</option></select></Field>
+          <Field label="分辨率"><select className="wcs-select" aria-label="输出分辨率详细选项" value={resolution} disabled={running} onChange={event => setResolution(event.target.value as ExportResolution)}><option value="source">原始素材</option><option value="720">720p</option><option value="1080">1080p</option><option value="1440">1440p</option><option value="2160">4K</option></select></Field></>}
+          <Field label="完整输出路径"><TextInput id="export-path" value={outputPath} disabled={running} onChange={event => {setOutputPath(event.target.value);setPathTouchedFor(projectId);}} onBlur={() => setOutputPath(previous => normalizeOutputPath(previous,extension))} /></Field>
+        </div></details>
       </div>
-
-      {kind !== 'audio' && unconfirmedPrivacy.length > 0 && (
-        <div style={{ marginBottom: 12 }}>
-          <InlineNote tone="warn">
-            <strong>{unconfirmedPrivacy.length} 处遮挡未确认。</strong> 这些区域不会被遮挡，导出后仍可能暴露敏感信息。
-            <div style={{ marginTop: 6, display: 'flex', gap: 6 }}>
-              <Button
-                size="sm"
-                onClick={() => {
-                  selectEffect(unconfirmedPrivacy[0].id);
-                  setView('editor');
-                }}
-              >
-                去编辑器确认
-              </Button>
-              <Button size="sm" variant="ghost" onClick={() => setView('editor')}>
-                打开编辑器
-              </Button>
-            </div>
-          </InlineNote>
-        </div>
-      )}
-
-      <div className="export-layout">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14, minWidth: 0 }}>
-          <Panel title="产物类型" icon="export" subtitle="视频与教程可以同时导出">
-            <div className="kind-cards">
-              {[
-                { id: 'video' as Kind, icon: 'editor', title: '视频', desc: 'MP4 · H.264 + AAC，含运镜、遮挡与画布样式' },
-                { id: 'audio' as Kind, icon: 'volume', title: '纯音频', desc: 'M4A · AAC，按剪辑、变速、音量和静音设置混合' },
-                { id: 'tutorial' as Kind, icon: 'book', title: '图文教程', desc: '静态 HTML + Markdown + 步骤截图' },
-                { id: 'both' as Kind, icon: 'layers', title: '视频 + 教程', desc: '同时生成，共享同一份遮挡确认结果' },
-              ].map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  className={cn('kind-card', kind === item.id && 'is-selected')}
-                  aria-pressed={kind === item.id}
-                  onClick={() => { setKind(item.id); resetToIdle(); }}
-                >
-                  <span className="kind-icon">
-                    <Icon name={item.icon} size={16} />
-                  </span>
-                  <span>
-                    <span className="kind-title">{item.title}</span>
-                    <span className="kind-desc" style={{ display: 'block', marginTop: 2 }}>
-                      {item.desc}
-                    </span>
-                  </span>
-                </button>
-              ))}
-            </div>
-          </Panel>
-
-          <Panel title="输出设置" icon="settings">
-            <Field
-              label="输出路径"
-              htmlFor="export-path"
-              hint={
-                pathCheck.ok
-                  ? '导出前会检查目录可写与磁盘余量。'
-                  : pathCheck.reason ?? '导出前会检查目录可写与磁盘余量。'
-              }
-            >
-              <div className="path-row">
-                <TextInput
-                  id="export-path"
-                  value={outputPath}
-                  onChange={(event) => {
-                    setOutputPath(event.target.value);
-                    setPathTouchedFor(projectId);
-                  }}
-                  onBlur={() => {
-                    // 用户手输路径时补全 .mp4，避免主进程写出没有扩展名的文件
-                    if (outputPath.trim()) setOutputPath(normalizeOutputPath(outputPath, extension));
-                  }}
-                  placeholder={`选择 .${extension} 输出路径`}
-                  disabled={running}
-                  aria-invalid={!pathCheck.ok}
-                />
-                <Button size="sm" icon="folder" loading={picking} onClick={() => void pickPath()} disabled={running}>
-                  浏览
-                </Button>
-              </div>
-            </Field>
-
-            {kind !== 'audio' && <>
-            <Field label="画幅">
-              <div className="variant-row">
-                {VARIANTS.map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    className={cn('variant-card', variantId === item.id && 'is-selected')}
-                    aria-pressed={variantId === item.id}
-                    onClick={() => setVariantId(item.id)}
-                    disabled={running}
-                  >
-                    <span className="variant-shape" style={{ width: item.w, height: item.h }} />
-                    <span className="variant-label">{item.label}</span>
-                  </button>
-                ))}
-              </div>
-            </Field>
-
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 16px' }}>
-              <Field label="分辨率" htmlFor="export-resolution" hint={profile ? `${profile.width} × ${profile.height} 像素；放大输出不会增加源素材细节。` : undefined}>
-                <select id="export-resolution" className="wcs-select" value={resolution} disabled={running}
-                  aria-label="输出分辨率" onChange={(e) => setResolution(e.target.value as ExportResolution)}>
-                  <option value="source">原始素材尺寸</option>
-                  <option value="720">720p · 轻量分享</option>
-                  <option value="1080">1080p · 全高清</option>
-                  <option value="1440">1440p · 2K</option>
-                  <option value="2160">2160p · 4K</option>
-                </select>
-              </Field>
-              <Field label="帧率" htmlFor="export-fps">
-                <select id="export-fps" className="wcs-select" value={outputFps} disabled={running}
-                  aria-label="输出帧率" onChange={(e) => setOutputFps(e.target.value as ExportFrameRate)}>
-                  <option value="project">跟随工程 · {project.settings.fps.num / project.settings.fps.den} FPS</option>
-                  <option value="30">30 FPS</option><option value="60">60 FPS</option>
-                </select>
-              </Field>
-              <Field label="画质" htmlFor="export-quality">
-                <select id="export-quality" className="wcs-select" value={quality} disabled={running}
-                  aria-label="输出画质" onChange={(e) => setQuality(e.target.value as ExportQuality)}>
-                  <option value="compact">小体积</option><option value="balanced">均衡（推荐）</option><option value="high">高画质</option>
-                </select>
-              </Field>
-              <Field label="视频码率">
-                <TextInput value={profile ? formatBitrate(profile.videoBitrate) : '—'} readOnly aria-label="视频码率" />
-              </Field>
-            </div>
-            </>}
-            <div>
-              <Field label="音频码率" hint={kind === 'audio' ? 'AAC · 48 kHz 双声道；使用时间线的音量、静音与变速设置。' : undefined}>
-                <TextInput value={profile ? formatBitrate(profile.audioBitrate) : '—'} readOnly aria-label="音频码率" />
-              </Field>
-            </div>
-          </Panel>
-
-          <Panel title="导出进度" icon="clock" subtitle={status === 'idle' ? '尚未开始' : undefined}>
-            {status === 'idle' && (
-              <div className="wcs-empty" style={{ padding: '18px 12px' }}>
-                <Icon name="export" size={20} />
-                <p>点右上角「开始导出」后，这里会显示阶段、帧数与已写字节。</p>
-              </div>
-            )}
+      <aside className="export-summary">
+        <div className="export-preview"><PreviewCanvas project={previewProject} projectPath={projectPath} tick={tick} maxWidth={800} includeOverlays={false} /></div>
+        <dl><div><dt>格式</dt><dd>{kind === 'audio' ? 'M4A' : kind === 'tutorial' ? 'HTML + Markdown' : 'MP4'}</dd></div>{kind !== 'audio' && <><div><dt>分辨率</dt><dd>{profile?.width} × {profile?.height}</dd></div><div><dt>帧率</dt><dd>{profile ? profile.fps.num/profile.fps.den : 0} fps</dd></div></>}<div><dt>时长</dt><dd>{formatClock(duration)}</dd></div><div><dt>预计大小</dt><dd>{formatBytes(estimatedBytes)}</dd></div></dl>
+        {kind !== 'audio' && unconfirmedPrivacy.length > 0 && <InlineNote tone="warn"><strong>{unconfirmedPrivacy.length} 处遮挡未确认</strong><p>这些区域不会被遮挡。</p><Button size="sm" variant="ghost" onClick={() => {selectEffect(unconfirmedPrivacy[0].id);setView('editor');}}>去确认遮挡</Button></InlineNote>}
+        {apiMode === 'mock' && <p className="settings-hint">示例工程 · 未连接录制进程，无法导出文件</p>}
+      </aside>
+    </div>
+    {status !== 'idle' && <div className="export-progress-area"><Panel title="导出进度" icon="clock">
 
             {(status === 'running' || status === 'cancelled') && (
               <div className="progress-card">
@@ -636,89 +472,6 @@ export function ExportView() {
                 </div>
               </div>
             )}
-          </Panel>
-        </div>
-
-        <div className="side-stack">
-          <Panel title="导出前检查" icon="shield">
-            <div className="kv-list">
-              <div className="kv-row">
-                <span className="kv-key">工程</span>
-                <span className="kv-value" style={{ fontFamily: 'inherit' }}>{project.name}</span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">时长</span>
-                <span className="kv-value">{formatClock(duration)}</span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">预计体积</span>
-                <span className="kv-value">{formatBytes(estimatedBytes)}</span>
-              </div>
-              {kind !== 'audio' && <><div className="kv-row">
-                <span className="kv-key">遮挡确认</span>
-                <span className="kv-value">
-                  {unconfirmedPrivacy.length === 0 ? (
-                    <Badge tone="ok" icon="check">全部已确认</Badge>
-                  ) : (
-                    <Badge tone="warn" icon="warning">{unconfirmedPrivacy.length} 处未确认</Badge>
-                  )}
-                </span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">教程步骤</span>
-                <span className="kv-value">{project.steps.length}</span>
-              </div></>}
-              <div className="kv-row">
-                <span className="kv-key">输出路径</span>
-                <span className="kv-value">
-                  {pathCheck.ok ? (
-                    <Badge tone="ok" icon="check">可用于导出</Badge>
-                  ) : (
-                    <Badge tone="warn" icon="warning">{pathCheck.reason ?? '待填写'}</Badge>
-                  )}
-                </span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">磁盘可写</span>
-                <span className="kv-value">{systemInfo ? '导出时由主进程检查' : '读取中…'}</span>
-              </div>
-            </div>
-            {kind !== 'audio' && <div style={{ marginTop: 10 }}>
-              <InlineNote tone={unconfirmedPrivacy.length > 0 ? 'warn' : 'ok'}>
-                {unconfirmedPrivacy.length > 0
-                  ? '未确认的遮挡不会生效。建议先在编辑器里核对并确认，再导出。'
-                  : '遮挡全部确认，教程截图与视频会使用同一份遮挡结果。'}
-              </InlineNote>
-            </div>}
-          </Panel>
-
-          <Panel title="产物说明" icon="info">
-            <div className="kv-list">
-              <div className="kv-row">
-                <span className="kv-key">{kind === 'audio' ? '音频' : '视频'}</span>
-                <span className="kv-value">{kind === 'audio' ? 'M4A / AAC / 48 kHz' : 'MP4 / H.264 / AAC'}</span>
-              </div>
-              {kind !== 'audio' && <><div className="kv-row">
-                <span className="kv-key">教程</span>
-                <span className="kv-value">HTML + Markdown + PNG</span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-key">预览一致</span>
-                <span className="kv-value">与预览同一 drawScene</span>
-              </div></>}
-            </div>
-            <p className="wcs-field-hint" style={{ marginTop: 8 }}>
-              导出使用工程快照，不阻塞继续编辑；导出过程中修改工程不会影响本次产物。
-            </p>
-          </Panel>
-
-          {apiMode === 'mock' && (
-            <InlineNote tone="warn">
-              <strong>示例数据模式：</strong> 导出流程会模拟进度与结果，不会真正写出媒体文件。
-            </InlineNote>
-          )}
-        </div>
-      </div>
-    </div>
-  );
+          </Panel></div>}
+  </Modal>;
 }

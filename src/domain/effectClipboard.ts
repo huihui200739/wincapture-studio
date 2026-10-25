@@ -13,6 +13,7 @@ export function pasteEffect(source: Effect, project: Project, tick: number, id: 
   result.parameters = structuredClone(source.parameters);
   if (result.kind === 'zoom') {
     const p = result.parameters as import('./project').ZoomParameters;
+    delete p.continuation;
     p.focusPath = p.focusPath?.map(point => ({ ...point, tick: Math.max(0, point.tick + result.range.start - source.range.start) }));
   }
   if (result.kind === 'privacy') {
