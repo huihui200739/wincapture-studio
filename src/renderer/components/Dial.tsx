@@ -1,19 +1,53 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { normalizeParameterValue, parseParameterDraft } from '../lib/parameterValue';
+
+const valueText = (value: number) => String(Number(value.toFixed(3)));
+const RANGE_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown']);
 
 /** A pointer gesture commits one command; arrow keys and numeric entry also work. */
-export function Dial({ label, value, min, max, step = 1, format, onCommit }: {
+export function Dial({ label, value, min, max, step = 1, unit, format, onCommit }: {
   label: string; value: number; min: number; max: number; step?: number;
+  unit?: string;
   format?: (value: number) => string; onCommit: (value: number) => void;
 }) {
   const id = useId();
   const [local, setLocal] = useState(value);
+  const [draft, setDraft] = useState(() => valueText(value));
   const current = useRef(value);
   const committed = useRef(value);
-  const gesture = useRef<{ x: number; y: number; value: number } | null>(null);
-  const normalize = (next: number) => Math.min(max, Math.max(min, Math.round(next / step) * step));
-  useEffect(() => { if (!gesture.current) { current.current = value; committed.current = value; setLocal(value); } }, [value]);
-  const update = (next: number) => { const rounded = normalize(next); current.current = rounded; setLocal(rounded); };
-  const commit = () => { gesture.current = null; if (current.current !== committed.current) { committed.current = current.current; onCommit(current.current); } };
+  const editing = useRef(false);
+  const gesture = useRef<{ pointerId: number; x: number; y: number; value: number } | null>(null);
+  const bounds = { min, max, step };
+  useEffect(() => {
+    committed.current = value;
+    if (!gesture.current && !editing.current) {
+      current.current = value;
+      setLocal(value);
+      setDraft(valueText(value));
+    }
+  }, [value]);
+  const showValue = (next: number) => {
+    current.current = next;
+    setLocal(next);
+    setDraft(valueText(next));
+  };
+  const update = (next: number) => {
+    const rounded = normalizeParameterValue(next, bounds);
+    if (rounded !== null) showValue(rounded);
+  };
+  const cancel = () => {
+    gesture.current = null;
+    editing.current = false;
+    showValue(committed.current);
+  };
+  const commit = (next = current.current) => {
+    gesture.current = null;
+    showValue(next);
+    if (current.current !== committed.current) {
+      committed.current = current.current;
+      onCommit(current.current);
+    }
+  };
   const fraction = (local - min) / (max - min);
   return <div className="parameter-dial">
     <div className="dial-face">
@@ -21,13 +55,60 @@ export function Dial({ label, value, min, max, step = 1, format, onCommit }: {
         <circle className="dial-fill" cx="32" cy="32" r="25" strokeDasharray={`${fraction * 117.81} 157.08`} transform="rotate(135 32 32)" />
         <circle className="dial-disc" cx="32" cy="32" r="20" /><path className="dial-needle" d="M32 17v6" transform={`rotate(${-135 + fraction * 270} 32 32)`} /></svg>
       <input id={id} type="range" min={min} max={max} step={step} value={local} aria-label={label} aria-valuetext={format?.(local)}
-        onPointerDown={event => { event.preventDefault(); gesture.current = { x: event.clientX, y: event.clientY, value: local }; event.currentTarget.setPointerCapture(event.pointerId); }}
-        onPointerMove={event => { const start = gesture.current; if (start) update(start.value + (event.clientX - start.x - event.clientY + start.y) / 180 * (max - min)); }}
-        onPointerUp={commit} onPointerCancel={() => { gesture.current = null; update(value); }} onLostPointerCapture={() => { if (gesture.current) commit(); }}
-        onChange={event => update(Number(event.target.value))} onKeyUp={commit} onBlur={commit} />
+        data-keys="arrowleft arrowright arrowup arrowdown home end escape" title="拖动调节，方向键微调，Esc 取消"
+        onPointerDown={event => {
+          if (event.button !== 0 || gesture.current) return;
+          event.preventDefault();
+          event.currentTarget.focus();
+          gesture.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, value: current.current };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={event => {
+          const start = gesture.current;
+          if (start?.pointerId === event.pointerId) update(start.value + (event.clientX - start.x - event.clientY + start.y) / 180 * (max - min));
+        }}
+        onPointerUp={event => {
+          if (gesture.current?.pointerId !== event.pointerId) return;
+          commit();
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onPointerCancel={cancel} onLostPointerCapture={() => { if (gesture.current) cancel(); }}
+        onChange={event => update(Number(event.target.value))}
+        onKeyDown={event => {
+          if (event.key !== 'Escape') return;
+          event.preventDefault();
+          const pointerId = gesture.current?.pointerId;
+          cancel();
+          if (pointerId !== undefined && event.currentTarget.hasPointerCapture(pointerId)) event.currentTarget.releasePointerCapture(pointerId);
+        }}
+        onKeyUp={event => { if (RANGE_KEYS.has(event.key)) commit(); }}
+        onBlur={() => { if (gesture.current) cancel(); else commit(); }} />
     </div>
-    <input className="dial-value" type="number" aria-label={`${label}数值`} min={min} max={max} step={step} value={Number(local.toFixed(3))}
-      onChange={event => { if (event.target.value !== '') update(Number(event.target.value)); }} onBlur={commit} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} />
-    <label htmlFor={id}>{label}{format && <span className="dial-unit">{format(local)}</span>}</label>
+    <div className="dial-value-field">
+      <input className="dial-value" type="number" aria-label={`${label}数值${unit ? `（${unit}）` : ''}`} min={min} max={max} step={step} value={draft}
+        data-keys="escape" title="输入数值，Enter 确认，Esc 取消"
+        onFocus={event => { editing.current = true; event.currentTarget.select(); }}
+        onChange={event => setDraft(event.target.value)}
+        onBlur={() => {
+          if (!editing.current) return;
+          editing.current = false;
+          if (draft === valueText(committed.current)) { cancel(); return; }
+          const next = parseParameterDraft(draft, bounds);
+          if (next === null) cancel();
+          else commit(next);
+        }}
+        onKeyDown={event => {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            cancel();
+            event.currentTarget.blur();
+          } else if (event.key === 'Enter') {
+            event.preventDefault();
+            event.currentTarget.blur();
+          }
+        }} />
+      {unit && <span className="dial-unit" aria-hidden="true">{unit}</span>}
+    </div>
+    <label htmlFor={id}>{label}</label>
   </div>;
 }

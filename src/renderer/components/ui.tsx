@@ -141,6 +141,7 @@ const ICON_PATHS: Record<string, ReactNode> = {
   chevronRight: <path d="M9.5 6l6 6-6 6" />,
   chevronLeft: <path d="M14.5 6l-6 6 6 6" />,
   minimize: <path d="M5 18h14" />,
+  target: <><circle cx="12" cy="12" r="7" /><circle cx="12" cy="12" r="2" /><path d="M12 2v4m0 12v4M2 12h4m12 0h4" /></>,
   camera: (
     <>
       <rect x="3" y="6" width="13" height="12" rx="2.5" />

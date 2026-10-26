@@ -7,8 +7,8 @@
  * - 删除时间线片段 ≠ 删除源素材：这里只做前者，文案也明确区分。
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Clip, PrivacyParameters, Project, TrackKind, ZoomParameters } from '@domain/project';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { Clip, Effect, PrivacyParameters, Project, TrackKind, ZoomParameters } from '@domain/project';
 import { findTrack, timelineDuration } from '@domain/project';
 import { stepTimelineRange } from '@domain/tutorial';
 import { planGroupMove, linkedClips } from '@domain/clipEditing';
@@ -16,12 +16,15 @@ import { moveClipZooms } from '@domain/zoomEditing';
 import { TICKS_PER_SECOND, formatDuration, ticksToSeconds } from '@domain/timebase';
 import type { Ticks } from '@domain/timebase';
 import { cn } from '../lib/format';
+import { normalizeShortcutEvent } from '../lib/hooks';
 import { Icon, IconButton } from './ui';
 import { LineIcon, type LineIconKind } from './LineIcon';
+import { ContextMenu, type ContextMenuItem } from './ContextMenu';
 import { AudioWaveform } from './AudioWaveform';
 import { VideoThumbnails } from './VideoThumbnails';
 import { usePreviewMedia } from '../lib/previewSource';
 import { timelineSnapTargets, snapPosition } from '@domain/snapping';
+import { anchoredTimelineScroll, clampTimelineZoom, MAX_TIMELINE_ZOOM, MIN_TIMELINE_ZOOM, timelineZoomAnchor, type TimelineZoomAnchor } from '../lib/timelineViewport';
 
 const TRACK_LABEL: Record<TrackKind, string> = {
   primaryVideo: '主视频',
@@ -57,6 +60,9 @@ export interface TimelineProps {
   onSelectStep: (id: string | null) => void;
   onSplitAtPlayhead: () => void;
   onDeleteSelected: () => void;
+  effectClipboardKind: Effect['kind'] | null;
+  onCopyEffect: () => void;
+  onPasteEffect: (attributesOnly?: boolean) => void;
   onToggleTrackMute: (kind: TrackKind) => void;
   /** 拖动片段到新位置（R08 重排）；调用方负责提交 MoveClip 命令 */
   onMoveClip: (clipId: string, timelineInTicks: number) => void;
@@ -89,6 +95,17 @@ interface RowDef {
   kind: TrackKind | 'zoom' | 'privacy' | 'step' | 'marker';
   advanced: boolean;
 }
+
+interface TimelineContext {
+  x: number;
+  y: number;
+  kind: 'clip' | 'effect' | 'step' | 'empty';
+  id: string | null;
+  origin: HTMLElement;
+}
+
+const CLIP_KEYS = 'arrowleft arrowright shift+arrowleft shift+arrowright enter space shift+f10 contextmenu';
+const GESTURE_KEYS = `${CLIP_KEYS} escape delete backspace ctrl+b ctrl+z ctrl+y ctrl+shift+z ctrl+s ctrl+c ctrl+v ctrl+shift+v home end f f1`;
 
 const ROWS: RowDef[] = [
   { key: 'primaryVideo', label: '主视频', kind: 'primaryVideo', advanced: false },
@@ -247,6 +264,9 @@ export function Timeline({
   onSelectStep,
   onSplitAtPlayhead,
   onDeleteSelected,
+  effectClipboardKind,
+  onCopyEffect,
+  onPasteEffect,
   onToggleTrackMute,
   onMoveClip,
   onMoveBlocked,
@@ -261,10 +281,38 @@ export function Timeline({
   const [showAdvanced, setShowAdvanced] = useState(hasZoom);
   const [detailTracks, setDetailTracks] = useState(false);
   const [waveformMode, setWaveformMode] = useState(false);
+  const [snappingEnabled, setSnappingEnabled] = useState(true);
+  const [contextMenu, setContextMenu] = useState<TimelineContext | null>(null);
+  const timelineRef = useRef<HTMLElement>(null);
+  const [customHeight, setCustomHeight] = useState<number | null>(null);
+  const [layoutHeight, setLayoutHeight] = useState({ timeline: 220, editor: 600 });
+  const resizing = useRef<{ y: number; height: number; previous: number | null } | null>(null);
+  useEffect(() => {
+    const timeline = timelineRef.current;
+    const editor = timeline?.parentElement;
+    if (!timeline || !editor) return;
+    const measure = () => {
+      const next = { timeline: Math.round(timeline.getBoundingClientRect().height), editor: editor.clientHeight };
+      setLayoutHeight(previous => previous.timeline === next.timeline && previous.editor === next.editor ? previous : next);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(timeline);
+    observer.observe(editor);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+  // 至少给预览区留下 40% 的空间；重置时继续使用原有的响应式默认高度。
+  const maxHeight = Math.max(120, Math.min(600, Math.floor(layoutHeight.editor * 0.6)));
+  const minHeight = Math.min(150, maxHeight);
+  const clampHeight = (height: number) => Math.max(minHeight, Math.min(maxHeight, Math.round(height)));
   useEffect(() => { if (hasZoom) setShowAdvanced(true); }, [project.id, hasZoom]);
   const thumbnailMedia = usePreviewMedia(projectPath ?? null);
   const [snapGuide, setSnapGuide] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const gutterRowsRef = useRef<HTMLDivElement | null>(null);
+  const viewport = useRef({ left: 0, top: 0 });
+  const restoredScrollNode = useRef<HTMLDivElement | null>(null);
+  const zoomAnchor = useRef<TimelineZoomAnchor | null>(null);
   const [viewportWidth, setViewportWidth] = useState(900);
   useEffect(() => {
     const node = scrollRef.current; if (!node) return;
@@ -281,9 +329,71 @@ export function Timeline({
   );
 
   const duration = useMemo(() => Math.max(timelineDuration(project), TICKS_PER_SECOND), [project]);
+  const canSplit = useMemo(() => splittableTick(project, tick), [project, tick]);
+  // Match the command's effect → step → clip priority, including stale selections.
+  const canDelete = selectedEffectId
+    ? project.effects.some(effect => effect.id === selectedEffectId)
+    : selectedStepId
+      ? project.steps.some(step => step.id === selectedStepId)
+      : project.tracks.some(track => track.clips.some(clip => clip.id === selectedClipId));
+  const deleteLabel = selectedEffectId ? '删除所选效果（Delete）'
+    : selectedStepId ? '删除所选教程步骤（Delete）'
+      : '删除所选时间线片段（Delete，不删除源素材）';
   const fitPixelsPerSecond = Math.max(1, (viewportWidth - 55) / (duration / TICKS_PER_SECOND));
-  const pxPerTick = (fitPixelsPerSecond * zoom) / TICKS_PER_SECOND;
-  const contentWidth = Math.max(viewportWidth, (duration / TICKS_PER_SECOND) * fitPixelsPerSecond * zoom + 55);
+  const effectiveZoom = clampTimelineZoom(zoom);
+  const pxPerTick = (fitPixelsPerSecond * effectiveZoom) / TICKS_PER_SECOND;
+  const contentWidth = Math.max(viewportWidth, (duration / TICKS_PER_SECOND) * fitPixelsPerSecond * effectiveZoom + 55);
+
+  const syncViewport = useCallback(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    viewport.current = { left: node.scrollLeft, top: node.scrollTop };
+    const gutter = gutterRowsRef.current;
+    if (gutter) {
+      // Both viewports need the same usable height when a horizontal scrollbar appears.
+      gutter.style.marginBottom = `${node.offsetHeight - node.clientHeight}px`;
+      if (gutter.scrollTop !== node.scrollTop) gutter.scrollTop = node.scrollTop;
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    viewport.current = { left: 0, top: 0 };
+    zoomAnchor.current = null;
+    if (scrollRef.current) { scrollRef.current.scrollLeft = 0; scrollRef.current.scrollTop = 0; }
+  }, [project.id]);
+
+  useLayoutEffect(() => {
+    const node = scrollRef.current;
+    if (!node) { restoredScrollNode.current = null; return; }
+    if (restoredScrollNode.current !== node) {
+      node.scrollLeft = viewport.current.left;
+      node.scrollTop = viewport.current.top;
+      restoredScrollNode.current = node;
+    }
+    if (zoomAnchor.current) {
+      node.scrollLeft = anchoredTimelineScroll(zoomAnchor.current, pxPerTick, contentWidth, node.clientWidth);
+      zoomAnchor.current = null;
+    }
+    syncViewport();
+  }, [collapsed, contentWidth, pxPerTick, layoutHeight.timeline, syncViewport]);
+
+  const changeZoom = (requested: number) => {
+    const next = clampTimelineZoom(requested);
+    if (next === effectiveZoom) return;
+    const node = scrollRef.current;
+    zoomAnchor.current = timelineZoomAnchor(node?.scrollLeft ?? viewport.current.left, node?.clientWidth ?? viewportWidth, pxPerTick, tick);
+    onZoomChange(next);
+  };
+  const fitTimeline = () => {
+    zoomAnchor.current = null;
+    viewport.current.left = 0;
+    if (scrollRef.current) scrollRef.current.scrollLeft = 0;
+    onZoomChange(MIN_TIMELINE_ZOOM);
+  };
+  const revealPlayhead = () => {
+    const node = scrollRef.current;
+    if (node) node.scrollLeft = Math.max(0, tick * pxPerTick - node.clientWidth / 2);
+  };
 
   const rows = useMemo(() => ROWS.filter(row => (showAdvanced || !row.advanced) &&
     (detailTracks || row.key === 'primaryVideo' || row.key === 'zoom' ||
@@ -345,12 +455,51 @@ export function Timeline({
   // 拖动边缘走的是「整段移动」逻辑，用户以为在裁剪、实际改了位置。
   const trimRef = useRef<{ clipId: string; edge: 'left' | 'right'; startX: number } | null>(null);
   const [trimPreview, setTrimPreview] = useState<ClipTrimPlan | null>(null);
+  const trimPlanRef = useRef<ClipTrimPlan | null>(null);
+  const capturedPointer = useRef<{ element: HTMLElement; id: number } | null>(null);
+  const [clipGestureActive, setClipGestureActive] = useState(false);
+  const releaseClipPointer = useCallback(() => {
+    const capture = capturedPointer.current;
+    capturedPointer.current = null;
+    if (capture?.element.hasPointerCapture(capture.id)) capture.element.releasePointerCapture(capture.id);
+  }, []);
+  const cancelClipGesture = useCallback(() => {
+    dragRef.current = null;
+    trimRef.current = null;
+    trimPlanRef.current = null;
+    setDragPreview(null);
+    setTrimPreview(null);
+    setSnapGuide(null);
+    setClipGestureActive(false);
+    releaseClipPointer();
+  }, [releaseClipPointer]);
+  useEffect(() => {
+    if (!clipGestureActive) return;
+    const onVisibility = () => { if (document.hidden) cancelClipGesture(); };
+    window.addEventListener('blur', cancelClipGesture);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('blur', cancelClipGesture);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [cancelClipGesture, clipGestureActive]);
+  useEffect(() => {
+    cancelClipGesture();
+    // A global command such as Ctrl+Z can change the project while a menu is open.
+    if (contextMenu) (contextMenu.origin.isConnected ? contextMenu.origin : timelineRef.current)?.focus({ preventScroll: true });
+    setContextMenu(null);
+  }, [project, collapsed, cancelClipGesture]);
 
   const onClipPointerDown = useCallback(
-    (event: React.PointerEvent, clip: Clip) => {
+    (event: React.PointerEvent<HTMLElement>, clip: Clip) => {
       if (event.button !== 0) return;
+      if (capturedPointer.current) return;
       event.stopPropagation();
+      setContextMenu(null);
+      event.currentTarget.focus({ preventScroll: true });
       onSelectClip(clip.id);
+      capturedPointer.current = { element: event.currentTarget, id: event.pointerId };
+      setClipGestureActive(true);
       const handle = (event.target as HTMLElement).closest('.tl-clip-handle');
       if (handle && onTrimClip) {
         const edge = handle.classList.contains('is-left') ? 'left' : 'right';
@@ -371,18 +520,20 @@ export function Timeline({
   );
 
   const onClipPointerMove = useCallback(
-    (event: React.PointerEvent) => {
+    (event: React.PointerEvent<HTMLElement>) => {
+      if (capturedPointer.current?.id !== event.pointerId) return;
       const trim = trimRef.current;
       if (trim) {
         const deltaTicks = Math.round((event.clientX - trim.startX) / pxPerTick);
         // 吸附到 10ms 网格，与移动保持同一手感
         const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === trim.clipId)!;
         const edge = trim.edge === 'left' ? clip.timelineInTicks : clipEndTick(clip);
-        const snap = event.altKey ? { value: edge + deltaTicks, guide: null } : snapPosition(edge + deltaTicks, timelineSnapTargets(project, trim.clipId, tick), 8 / pxPerTick);
+        const snap = !snappingEnabled || event.altKey ? { value: edge + deltaTicks, guide: null } : snapPosition(edge + deltaTicks, timelineSnapTargets(project, trim.clipId, tick), 8 / pxPerTick);
         const plan = planClipTrim(project, trim.clipId, trim.edge, snap.value - edge);
         const actualEdge = plan ? plan.timelineInTicks + (trim.edge === 'right' ? plan.spanTicks : 0) : null;
         setSnapGuide(actualEdge !== null && Math.abs(actualEdge - snap.value) <= 1 ? snap.guide : null);
-        if (plan) setTrimPreview(plan);
+        trimPlanRef.current = plan;
+        setTrimPreview(plan);
         return;
       }
       const drag = dragRef.current;
@@ -390,7 +541,7 @@ export function Timeline({
       const deltaTicks = Math.round((event.clientX - drag.startX) / pxPerTick);
       // 吸附到 10ms 网格，避免拖出无法复现的零头
       const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === drag.clipId)!;
-      const snap = event.altKey ? { value: drag.originTick + deltaTicks, guide: null } : snapPosition(drag.originTick + deltaTicks,
+      const snap = !snappingEnabled || event.altKey ? { value: drag.originTick + deltaTicks, guide: null } : snapPosition(drag.originTick + deltaTicks,
         timelineSnapTargets(project, drag.clipId, tick), 8 / pxPerTick, [0, clipEndTick(clip) - clip.timelineInTicks]);
       const desired = Math.max(0, snap.value);
       const plan = planClipMove(project, drag.clipId, desired);
@@ -401,7 +552,7 @@ export function Timeline({
       drag.currentTick = next;
       setDragPreview({ clipId: drag.clipId, tick: next });
     },
-    [project, pxPerTick, tick],
+    [project, pxPerTick, snappingEnabled, tick],
   );
 
   /** 正在拖动的片段（用于关联组预览：同组片段一起偏移） */
@@ -413,13 +564,17 @@ export function Timeline({
     [dragPreview, project],
   );
 
-  const onClipPointerUp = useCallback(() => {
+  const onClipPointerUp = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    if (capturedPointer.current?.id !== event.pointerId) return;
+    setClipGestureActive(false);
+    releaseClipPointer();
     setSnapGuide(null);
     // 裁剪优先：手柄拖拽松手时提交一次 TrimClip（只进一次撤销栈）
     const trim = trimRef.current;
     trimRef.current = null;
     if (trim) {
-      const plan = trimPreview;
+      const plan = trimPlanRef.current;
+      trimPlanRef.current = null;
       setTrimPreview(null);
       if (!plan || !onTrimClip) return;
       const clip = project.tracks.flatMap((track) => track.clips).find((item) => item.id === trim.clipId);
@@ -454,7 +609,54 @@ export function Timeline({
     }
     if (plan.tick === plan.originTick) return;
     onMoveClip(drag.clipId, plan.tick);
-  }, [onMoveBlocked, onMoveClip, onTrimClip, project, trimPreview]);
+  }, [onMoveBlocked, onMoveClip, onTrimClip, project, releaseClipPointer]);
+
+  const closeContextMenu = (restoreFocus: boolean) => {
+    if (restoreFocus) (contextMenu?.origin.isConnected ? contextMenu.origin : timelineRef.current)?.focus({ preventScroll: true });
+    setContextMenu(null);
+  };
+  const openContextMenu = (target: HTMLElement, x: number, y: number) => {
+    if (collapsed || (!target.closest('.timeline-inner') && target !== timelineRef.current)) return;
+    cancelClipGesture();
+    const item = target.closest<HTMLElement>('[data-timeline-kind]');
+    const kind = item?.dataset.timelineKind;
+    const id = item?.dataset.timelineId ?? null;
+    const origin = item ?? timelineRef.current!;
+    origin.focus({ preventScroll: true });
+    if (kind === 'clip') onSelectClip(id);
+    else if (kind === 'effect') onSelectEffect(id);
+    else if (kind === 'step') onSelectStep(id);
+    else { onSelectClip(null); onSelectEffect(null); onSelectStep(null); }
+    setContextMenu({ x, y, id, origin, kind: kind === 'clip' || kind === 'effect' || kind === 'step' ? kind : 'empty' });
+  };
+  const selectContextAction = (item: ContextMenuItem) => {
+    if (item.disabled) return;
+    const origin = contextMenu?.origin;
+    setContextMenu(null);
+    item.onSelect();
+    requestAnimationFrame(() => {
+      const selected = timelineRef.current?.querySelector<HTMLElement>('.tl-clip.is-selected,.tl-effect.is-selected,.tl-step-band.is-selected');
+      (selected ?? (origin?.isConnected ? origin : timelineRef.current))?.focus({ preventScroll: true });
+    });
+  };
+  const contextKind = contextMenu?.kind ?? 'empty';
+  const contextEffect = project.effects.find(effect => effect.id === contextMenu?.id);
+  const contextStart = contextKind === 'clip'
+    ? project.tracks.flatMap(track => track.clips).find(clip => clip.id === contextMenu?.id)?.timelineInTicks
+    : contextKind === 'effect' ? contextEffect?.range.start
+      : contextKind === 'step' ? (() => { const step = project.steps.find(step => step.id === contextMenu?.id); return step ? stepTimelineRange(project, step)?.start : undefined; })() : undefined;
+  const contextLabel = contextKind === 'clip' ? '时间线片段' : contextKind === 'effect' ? '效果' : contextKind === 'step' ? '教程步骤' : '时间线';
+  const contextItems: ContextMenuItem[] = [];
+  if (contextStart !== undefined) contextItems.push({ id: 'seek', label: `定位到${contextKind === 'clip' ? '片段' : contextLabel}开头`, icon: 'stepBack', onSelect: () => onSeek(contextStart) });
+  if (contextKind === 'clip' || contextKind === 'empty') contextItems.push({ id: 'split', label: '在播放头分割', icon: 'split', shortcut: 'Ctrl+B', keys: ['ctrl+b'], disabled: !canSplit, onSelect: onSplitAtPlayhead });
+  if (contextKind === 'effect') contextItems.push({ id: 'copy', label: '复制效果', icon: 'copy', shortcut: 'Ctrl+C', keys: ['ctrl+c'], disabled: !contextEffect, onSelect: onCopyEffect });
+  contextItems.push({ id: 'paste', label: '粘贴效果', icon: 'paste', shortcut: 'Ctrl+V', keys: ['ctrl+v'], disabled: !effectClipboardKind, onSelect: () => onPasteEffect() });
+  if (contextKind === 'effect') contextItems.push({ id: 'paste-attributes', label: '只粘贴属性', icon: 'paste', shortcut: 'Ctrl+Shift+V', keys: ['ctrl+shift+v'], disabled: !contextEffect || contextEffect.kind !== effectClipboardKind, onSelect: () => onPasteEffect(true) });
+  if (contextKind === 'empty') contextItems.push(
+    { id: 'reveal', label: '定位播放头', icon: 'target', onSelect: revealPlayhead },
+    { id: 'fit', label: '适应整个时间线', icon: 'zoomOut', onSelect: fitTimeline },
+  );
+  else contextItems.push({ id: 'delete', label: contextKind === 'clip' ? '删除时间线片段' : contextKind === 'effect' ? '删除效果' : '删除教程步骤', icon: 'trash', shortcut: 'Delete', keys: ['delete', 'backspace'], danger: true, separator: true, disabled: !canDelete, onSelect: onDeleteSelected });
 
   // ---- 刻度 ----
   // 好数步长（1/2/5×10ⁿ）按 128px 目标间距选取；minor 刻度 = major/2，偶数位为 major。
@@ -527,7 +729,61 @@ export function Timeline({
   );
 
   return (
-    <section className={cn('editor-timeline', collapsed && 'is-collapsed')} aria-label="时间线">
+    <section ref={timelineRef} className={cn('editor-timeline', collapsed && 'is-collapsed')} aria-label="时间线" tabIndex={-1}
+      data-keys="shift+f10 contextmenu"
+      onContextMenu={event => {
+        const target = event.target as HTMLElement;
+        if (!target.closest('.timeline-inner')) return;
+        event.preventDefault(); event.stopPropagation();
+        openContextMenu(target, event.clientX, event.clientY);
+      }}
+      onKeyDown={event => {
+        if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return;
+        const target = event.target as HTMLElement;
+        if (!target.closest('.timeline-inner') && target !== event.currentTarget) return;
+        event.preventDefault(); event.stopPropagation();
+        const box = target.getBoundingClientRect();
+        openContextMenu(target, Math.max(8, box.left + 12), Math.max(8, box.top + Math.min(box.height, 36)));
+      }}
+      style={{ height: !collapsed && customHeight !== null ? clampHeight(customHeight) : undefined }}>
+      {!collapsed && <div className="timeline-resize-handle" role="separator" tabIndex={0}
+        aria-label="调整时间线高度" aria-orientation="horizontal"
+        aria-valuemin={minHeight} aria-valuemax={maxHeight} aria-valuenow={layoutHeight.timeline}
+        aria-valuetext={`${layoutHeight.timeline} 像素`}
+        title="拖动调整时间线高度，双击恢复默认；方向键微调"
+        data-keys="arrowup arrowdown shift+arrowup shift+arrowdown home end escape"
+        onPointerDown={event => {
+          if (event.button !== 0) return;
+          event.preventDefault();
+          event.currentTarget.focus();
+          resizing.current = { y: event.clientY, height: layoutHeight.timeline, previous: customHeight };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={event => {
+          if (resizing.current) setCustomHeight(clampHeight(resizing.current.height + resizing.current.y - event.clientY));
+        }}
+        onPointerUp={event => {
+          resizing.current = null;
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onPointerCancel={() => {
+          if (resizing.current) setCustomHeight(resizing.current.previous);
+          resizing.current = null;
+        }}
+        onLostPointerCapture={() => { resizing.current = null; }}
+        onDoubleClick={() => setCustomHeight(null)}
+        onKeyDown={event => {
+          const step = event.shiftKey ? 40 : 10;
+          if (event.key === 'ArrowUp') setCustomHeight(previous => clampHeight(clampHeight(previous ?? layoutHeight.timeline) + step));
+          else if (event.key === 'ArrowDown') setCustomHeight(previous => clampHeight(clampHeight(previous ?? layoutHeight.timeline) - step));
+          else if (event.key === 'Home') setCustomHeight(minHeight);
+          else if (event.key === 'End') setCustomHeight(maxHeight);
+          else if (event.key === 'Escape' && resizing.current) {
+            setCustomHeight(resizing.current.previous);
+            resizing.current = null;
+          } else return;
+          event.preventDefault();
+        }}><span aria-hidden="true" /></div>}
       <div className="timeline-toolbar">
         <IconButton
           icon={collapsed ? 'chevronRight' : 'chevronDown'}
@@ -535,8 +791,10 @@ export function Timeline({
           size="sm"
           onClick={onToggleCollapsed}
         />
-        <IconButton icon="split" label="在播放头分割（Ctrl+B）" size="sm" onClick={onSplitAtPlayhead} />
-        <IconButton icon="trash" label="删除所选时间线片段（Delete，不删除源素材）" size="sm" variant="danger" onClick={onDeleteSelected} />
+        <IconButton icon="split" label="在播放头分割（Ctrl+B）" size="sm" disabled={!canSplit}
+          title={canSplit ? '在播放头分割（Ctrl+B）' : '将播放头移到片段内部后分割'} onClick={onSplitAtPlayhead} />
+        <IconButton icon="trash" label={deleteLabel} size="sm" variant="danger" disabled={!canDelete}
+          title={canDelete ? deleteLabel : '先选择一个时间线片段、效果或教程步骤'} onClick={onDeleteSelected} />
         <button type="button" className="advanced-tracks-toggle" onClick={() => setShowAdvanced((v) => !v)} aria-pressed={showAdvanced}>
           <Icon name={showAdvanced ? 'chevronDown' : 'chevronRight'} size={11} />
           {showAdvanced ? '隐藏高级轨道' : '显示高级轨道（运镜 / 遮挡 / 步骤）'}
@@ -548,29 +806,52 @@ export function Timeline({
           <span className="timeline-display-toggle-thumb" aria-hidden="true" style={{ transform: waveformMode ? 'translateX(100%)' : 'translateX(0)' }} />
         </div>
         <div className="timeline-toolbar-spacer" />
-        <button className="studio-track-toggle" aria-pressed={detailTracks} onClick={() => setDetailTracks(!detailTracks)}><Icon name="volume" size={13} />{detailTracks ? '收起音频 / 摄像头' : '音频 / 摄像头'}</button>
+        <button type="button" className="studio-track-toggle timeline-snap-toggle" aria-label="时间线吸附" aria-pressed={snappingEnabled}
+          title={snappingEnabled ? '吸附已开启：靠近片段边界或播放头时对齐；Alt 临时跳过' : '吸附已关闭：点击开启边界对齐'}
+          onClick={() => { setSnappingEnabled(enabled => !enabled); setSnapGuide(null); }}>
+          <LineIcon kind="magnet" size={14} /><span>{snappingEnabled ? '吸附' : '吸附已关'}</span>
+        </button>
+        <button type="button" className="studio-track-toggle timeline-device-toggle" aria-label={detailTracks ? '收起音频 / 摄像头' : '音频 / 摄像头'}
+          title={detailTracks ? '收起音频与摄像头轨道' : '显示音频与摄像头轨道'} aria-pressed={detailTracks} onClick={() => setDetailTracks(!detailTracks)}>
+          <Icon name="volume" size={13} /><span>{detailTracks ? '收起音频 / 摄像头' : '音频 / 摄像头'}</span>
+        </button>
+        <IconButton icon="target" label="定位播放头" title={collapsed ? '展开时间线后定位播放头' : '将播放头移回可见区域，不改变播放位置'} size="sm" disabled={collapsed} onClick={revealPlayhead} />
         <div className="timeline-zoom">
-          <button className="studio-track-toggle" aria-label="适应整个时间线" onClick={() => onZoomChange(1)}>适应</button>
-          <Icon name="zoomOut" size={12} />
+          <button type="button" className="studio-track-toggle" aria-label="适应整个时间线" title="显示完整时间线" onClick={fitTimeline}>适应</button>
+          <IconButton icon="zoomOut" label="缩小时间线" size="sm" disabled={effectiveZoom <= MIN_TIMELINE_ZOOM} onClick={() => changeZoom(effectiveZoom / 1.5)} />
           <input
             type="range"
-            min={0.4}
-            max={5}
+            min={MIN_TIMELINE_ZOOM}
+            max={MAX_TIMELINE_ZOOM}
             step={0.1}
-            value={zoom}
+            value={effectiveZoom}
             aria-label="时间线缩放"
-            onChange={(event) => onZoomChange(Number(event.target.value))}
+            aria-valuetext={`${Math.round(effectiveZoom * 100)}%`}
+            title="放大查看细节；缩放时保留播放头或视区中心的位置"
+            onChange={(event) => changeZoom(Number(event.target.value))}
           />
-          <Icon name="zoomIn" size={12} />
-          <span style={{ fontFamily: 'var(--font-mono)', minWidth: 34, textAlign: 'right' }}>{zoom.toFixed(1)}×</span>
+          <IconButton icon="zoomIn" label="放大时间线" size="sm" disabled={effectiveZoom >= MAX_TIMELINE_ZOOM} onClick={() => changeZoom(effectiveZoom * 1.5)} />
+          <span style={{ fontFamily: 'var(--font-mono)', minWidth: 34, textAlign: 'right' }}>{effectiveZoom.toFixed(1)}×</span>
         </div>
       </div>
+
+      {contextMenu && <ContextMenu anchor={contextMenu} label={contextLabel} items={contextItems}
+        hint={contextKind === 'clip' ? '只删除时间线片段，源素材文件保留。' : undefined}
+        onClose={closeContextMenu} onSelect={selectContextAction} />}
 
       {!collapsed && (
         <div className="timeline-body">
           <div className="timeline-gutter">
             <div className="timeline-gutter-head" aria-hidden="true" />
-            <div className="timeline-gutter-rows">
+            <div className="timeline-gutter-rows" ref={gutterRowsRef}
+              onScroll={event => { if (scrollRef.current && scrollRef.current.scrollTop !== event.currentTarget.scrollTop) scrollRef.current.scrollTop = event.currentTarget.scrollTop; }}
+              onWheel={event => {
+                const node = scrollRef.current;
+                if (!node || event.ctrlKey || event.metaKey) return;
+                const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? node.clientHeight : 1;
+                node.scrollTop += event.deltaY * unit;
+                node.scrollLeft += event.deltaX * unit;
+              }}>
               {rows.map((row) => {
                 const isAudioRow = row.kind === 'mic' || row.kind === 'system';
                 const muted = isAudioRow ? muteOf(row.kind as TrackKind) : false;
@@ -630,7 +911,7 @@ export function Timeline({
             </div>
           </div>
 
-          <div className="timeline-scroll" ref={scrollRef}>
+          <div className="timeline-scroll" ref={scrollRef} onScroll={syncViewport}>
             <div
               className="timeline-inner"
               style={{ width: contentWidth }}
@@ -670,9 +951,11 @@ export function Timeline({
                             }}
                             role="button"
                             tabIndex={0}
+                            data-timeline-kind="effect" data-timeline-id={effect.id}
+                            data-keys="enter space shift+f10 contextmenu"
                             aria-label={`运镜 ${params.scale.toFixed(2)} 倍，${formatDuration(effect.range.start)} 到 ${formatDuration(effect.range.end)}`}
                             onClick={() => onSelectEffect(effect.id)}
-                            onKeyDown={(event) => event.key === 'Enter' && onSelectEffect(effect.id)}
+                            onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelectEffect(effect.id); } }}
                             title={`运镜 ${params.scale.toFixed(2)}× · ${effect.locked ? '已锁定' : '未锁定'} · ${effect.origin === 'automatic' ? '自动生成' : '手动'}`}
                           >
                             {effect.locked && <Icon name="lock" size={9} />}
@@ -699,9 +982,11 @@ export function Timeline({
                             }}
                             role="button"
                             tabIndex={0}
+                            data-timeline-kind="effect" data-timeline-id={effect.id}
+                            data-keys="enter space shift+f10 contextmenu"
                             aria-label={`遮挡区域，${params.confirmed ? '已确认' : '未确认（未遮挡）'}，样式 ${styleText(params.style)}`}
                             onClick={() => onSelectEffect(effect.id)}
-                            onKeyDown={(event) => event.key === 'Enter' && onSelectEffect(effect.id)}
+                            onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelectEffect(effect.id); } }}
                             title={`${params.confirmed ? '已确认遮挡' : '未确认，导出时不会视为已遮挡'} · ${styleText(params.style)}`}
                           >
                             {params.confirmed ? <Icon name="shield" size={9} /> : <Icon name="warning" size={9} />}
@@ -725,9 +1010,11 @@ export function Timeline({
                           }}
                           role="button"
                           tabIndex={0}
+                          data-timeline-kind="step" data-timeline-id={step.id}
+                          data-keys="enter space shift+f10 contextmenu"
                           aria-label={`步骤 ${index + 1} ${step.title}`}
                           onClick={() => onSelectStep(step.id)}
-                          onKeyDown={(event) => event.key === 'Enter' && onSelectStep(step.id)}
+                          onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelectStep(step.id); } }}
                           title={`步骤 ${index + 1}：${step.title}`}
                         >
                           {index + 1}. {step.title}
@@ -771,8 +1058,9 @@ export function Timeline({
                             }}
                             role="button"
                             tabIndex={0}
+                            data-timeline-kind="clip" data-timeline-id={clip.id}
                             // 声明本元素自己处理方向键：全局快捷键先查这个属性并让路
-                            data-keys="arrowleft arrowright enter"
+                            data-keys={clipGestureActive ? GESTURE_KEYS : CLIP_KEYS}
                             aria-label={`${TRACK_LABEL[row.kind as TrackKind]} 片段，${formatDuration(leftTick)} 到 ${formatDuration(leftTick + (clipEndTick(clip) - clip.timelineInTicks))}${dragging ? '，正在拖动' : ''}`}
                             onClick={(event) => {
                               event.stopPropagation();
@@ -781,9 +1069,18 @@ export function Timeline({
                             onPointerDown={(event) => onClipPointerDown(event, clip)}
                             onPointerMove={onClipPointerMove}
                             onPointerUp={onClipPointerUp}
-                            onPointerCancel={onClipPointerUp}
+                            onPointerCancel={cancelClipGesture}
+                            onLostPointerCapture={() => { if (capturedPointer.current) cancelClipGesture(); }}
                             onKeyDown={(event) => {
-                              if (event.key === 'Enter') {
+                              if (dragRef.current || trimRef.current) {
+                                if (event.key === 'Escape') cancelClipGesture();
+                                if (GESTURE_KEYS.split(' ').includes(normalizeShortcutEvent(event.nativeEvent))) {
+                                  event.preventDefault(); event.stopPropagation();
+                                }
+                                return;
+                              }
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault();
                                 onSelectClip(clip.id);
                                 return;
                               }

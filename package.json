@@ -13,6 +13,7 @@
     "build": "npm run build:native && npm run build:main && npm run build:renderer",
     "start": "npm run build && node scripts/run-electron.mjs .",
     "dev": "npm run build:native && npm run build:main && node scripts/vite-run.mjs dev",
+    "dev:ui": "node scripts/vite-run.mjs dev --host 127.0.0.1",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

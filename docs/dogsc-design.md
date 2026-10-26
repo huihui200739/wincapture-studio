@@ -34,6 +34,18 @@ Layout dials edit existing canvas properties and commit once per gesture.
 Timeline waveform mode opens actual audio tracks. Export preview renders the
 selected output variant with the same compositor as the editor.
 
+Timeline navigation was also compared with `EditorTimelineLayout.swift`,
+`EditorTimelineZoomTransport.swift` and `EditorTimelineMagneticSnap.swift` at the
+same reference commit. The React timeline exposes a snapping toggle and usable
+zoom buttons, preserves a visible playhead (or the viewport centre) while zooming,
+and synchronizes the lane labels with vertical scrolling. Snapping remains on by
+default, with Alt bypass, to preserve this project's existing editing behaviour.
+These view controls do not change the project or add undo entries.
+
+The grouped shortcut reference follows `EditorShortcutCheatsheet.swift` at the
+same commit, adapted to the Windows bindings actually implemented here (Ctrl,
+Delete, Shift+F10 and F1). Unsupported reference gestures are not advertised.
+
 Run `npm run verify:design` after building. It captures the editor, settings
 sections, light/dark appearance, export states, waveform mode, library, recording,
 tutorial and compact dialogs into `dist/verify/design/`. It also checks workspace

@@ -100,6 +100,7 @@ const BASE_PATHS: Record<string, string> = {
   info:
     circle(9, 9, 7) + circle(9, 5, 0.35) +
     'M8 8H9V13M7.7 13H10.3',
+  keyboard: rounded(1.5, 4, 15, 10, 2) + 'M4.5 7H4.6M7.5 7H7.6M10.5 7H10.6M13.5 7H13.6M4.5 10H4.6M7.5 10H7.6M10.5 10H10.6M13.5 10H13.6M6 12H12',
   shapeCircle: circle(9, 9, 6.5),
   shapeRounded: rounded(2.5, 2.5, 13, 13, 4),
   shapeWide: rounded(1.5, 4.5, 15, 9, 2.5),

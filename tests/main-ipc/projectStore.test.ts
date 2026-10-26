@@ -60,29 +60,34 @@ afterEach(() => {
 });
 
 describe('ProjectStore.resolveInside / isPathInside', () => {
+  // 文件系统路径按运行测试的系统构造，避免 Mac 将 Windows 盘符当作普通目录名。
+  const projectRoot = path.join(os.tmpdir(), 'wcs-path-checks', 'a.wcaproj');
+
   it('允许工程内相对路径', () => {
-    const resolved = ProjectStore.resolveInside('C:\\projects\\a.wcaproj', 'media/screen/seg-000001.mp4');
-    expect(resolved.toLowerCase()).toBe('c:\\projects\\a.wcaproj\\media\\screen\\seg-000001.mp4');
+    const resolved = ProjectStore.resolveInside(projectRoot, 'media/screen/seg-000001.mp4');
+    expect(resolved).toBe(path.join(projectRoot, 'media', 'screen', 'seg-000001.mp4'));
   });
 
   it.each(['../secret.txt', 'media/../../secret.txt', 'C:\\Windows\\win.ini', '\\\\server\\share\\x', 'media/\0evil'])(
     '拒绝越界/绝对/非法路径：%s',
     (bad) => {
-      expect(() => ProjectStore.resolveInside('C:\\projects\\a.wcaproj', bad)).toThrow();
+      expect(() => ProjectStore.resolveInside(projectRoot, bad)).toThrow();
     },
   );
 
   it('拒绝空路径与指向工程根本身', () => {
-    expect(() => ProjectStore.resolveInside('C:\\p\\a.wcaproj', '')).toThrow();
-    expect(() => ProjectStore.resolveInside('C:\\p\\a.wcaproj', '.')).toThrow();
+    expect(() => ProjectStore.resolveInside(projectRoot, '')).toThrow();
+    expect(() => ProjectStore.resolveInside(projectRoot, '.')).toThrow();
   });
 
   it('isPathInside 处理前缀同名目录与大小写', () => {
-    expect(isPathInside('C:\\a\\b', 'C:\\a\\b\\c.txt')).toBe(true);
-    expect(isPathInside('C:\\a\\b', 'C:\\A\\B\\C.TXT')).toBe(true);
-    expect(isPathInside('C:\\a\\b', 'C:\\a\\bc\\c.txt')).toBe(false);
-    expect(isPathInside('C:\\a\\b', 'C:\\a\\b')).toBe(true);
-    expect(isPathInside('C:\\', 'D:\\x')).toBe(false);
+    const root = path.join(os.tmpdir(), 'wcs-path-checks', 'b');
+    expect(isPathInside(root, path.join(root, 'c.txt'))).toBe(true);
+    expect(isPathInside(root, path.join(root, 'c.txt').toUpperCase())).toBe(true);
+    expect(isPathInside(root, path.join(path.dirname(root), 'bc', 'c.txt'))).toBe(false);
+    expect(isPathInside(root, root)).toBe(true);
+    expect(isPathInside(root, path.join(os.tmpdir(), 'wcs-other-root', 'x'))).toBe(false);
+    if (process.platform === 'win32') expect(isPathInside('C:\\', 'D:\\x')).toBe(false);
   });
 });
 

@@ -98,6 +98,11 @@ describe('normalizeShortcutEvent', () => {
     expect(normalizeShortcutEvent(event('s', { ctrlKey: true }))).toBe('ctrl+s');
   });
 
+  it('保留 Meta 修饰键，避免 Mac 系统组合键误触播放器', () => {
+    expect(normalizeShortcutEvent(event('ArrowRight', { metaKey: true }))).toBe('meta+arrowright');
+    expect(normalizeShortcutEvent(event(' ', { metaKey: true }))).toBe('meta+space');
+  });
+
   it('Escape 兼容 esc 写法', () => {
     expect(normalizeShortcutEvent(event('Escape'))).toBe('escape');
     expect(normalizeShortcutEvent(event('Esc'))).toBe('escape');

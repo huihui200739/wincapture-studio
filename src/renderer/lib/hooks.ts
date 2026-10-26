@@ -47,6 +47,7 @@ export interface ShortcutHandler {
 export function normalizeShortcutEvent(event: KeyboardEvent): string {
   const parts: string[] = [];
   if (event.ctrlKey) parts.push('ctrl');
+  if (event.metaKey) parts.push('meta');
   if (event.altKey) parts.push('alt');
   if (event.shiftKey) parts.push('shift');
   const raw = event.key;
@@ -75,6 +76,9 @@ export function useShortcuts(handlers: ShortcutHandler[], enabled = true): void 
         const declared = (localOwner.getAttribute('data-keys') ?? '').split(/\s+/).filter(Boolean);
         if (declared.includes(combo)) return;
       }
+      // 原生按钮、链接和 disclosure 用空格/回车操作自己，而不是播放背景视频。
+      if ((combo === 'space' || combo === 'enter') &&
+          (event.target as HTMLElement | null)?.closest?.('button, a[href], summary')) return;
       const inInput = isTextEntryTarget(event.target);
       const modalOpen = typeof document !== 'undefined' && !!document.querySelector('.wcs-modal-backdrop');
       for (const item of ref.current) {

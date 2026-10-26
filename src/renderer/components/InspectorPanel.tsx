@@ -153,7 +153,7 @@ export function clampCameraRect(camera: CanvasStyle['camera']): CanvasStyle['cam
   };
 }
 
-export function InspectorPanel() {
+export function InspectorPanel({ hidden = false }: { hidden?: boolean }) {
   const {
     project,
     execute,
@@ -205,7 +205,7 @@ export function InspectorPanel() {
 
   if (!project) {
     return (
-      <aside className="editor-inspector" aria-label="属性面板">
+      <aside id="editor-inspector" className="editor-inspector" aria-label="属性面板" hidden={hidden}>
         <div className="inspector-body">
           <div className="wcs-empty">
             <p>还没有打开的工程。</p>
@@ -218,8 +218,8 @@ export function InspectorPanel() {
   const duration = timelineDuration(project);
 
   return (
-    <aside className="editor-inspector" aria-label="属性面板">
-      <div className="inspector-tabs" role="tablist" aria-label="属性分类" onKeyDown={(event) => {
+    <aside id="editor-inspector" className="editor-inspector" aria-label="属性面板" hidden={hidden}>
+      <div className="inspector-tabs" role="tablist" aria-label="属性分类" data-keys="arrowleft arrowright home end" onKeyDown={(event) => {
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
         event.preventDefault();
         const index = TABS.findIndex((item) => item.id === tab);
@@ -1437,8 +1437,17 @@ function CanvasTab({
 
   return (
     <div className="studio-canvas-controls" data-page={page}>
-      <div className="studio-canvas-tabs" role="tablist" aria-label="画面设置分类">
-        {([['background','背景'],['layout','布局'],['camera','摄像头']] as const).map(([id,label]) => <button key={id} role="tab" aria-selected={page === id} onClick={() => setPage(id)}>{label}</button>)}
+      <div className="studio-canvas-tabs" role="tablist" aria-label="画面设置分类" data-keys="arrowleft arrowright home end" onKeyDown={event => {
+        const pages = ['background', 'layout', 'camera'] as const;
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const index = pages.indexOf(page);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? pages.length - 1
+          : (index + (event.key === 'ArrowRight' ? 1 : -1) + pages.length) % pages.length;
+        setPage(pages[next]);
+        event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
+      }}>
+        {([['background','背景'],['layout','布局'],['camera','摄像头']] as const).map(([id,label]) => <button key={id} type="button" role="tab" tabIndex={page === id ? 0 : -1} aria-selected={page === id} onClick={() => setPage(id)}>{label}</button>)}
         <span className="studio-canvas-tab-thumb" aria-hidden="true" style={{ transform: `translateX(calc(${page === 'background' ? 0 : page === 'layout' ? 1 : 2} * (100% + 2px)))` }} />
       </div>
       <div className="studio-canvas-preview"><PreviewCanvas project={project} projectPath={projectPath} tick={tick} maxWidth={640} includeOverlays={false} /></div>
@@ -1460,11 +1469,12 @@ function CanvasTab({
       <div className="inspector-section" data-canvas-group="layout">
         <div className="inspector-section-head"><h3>画面与外观</h3></div>
         <div className="parameter-dial-group">
-          <Dial label="边距" min={0} max={30} step={0.5} value={canvas.padding*100} format={v => v+'%'} onCommit={next => setCanvas({padding:next/100})} />
-          <Dial label="圆角" min={0} max={48} value={canvas.cornerRadius} format={v => v+' px'} onCommit={next => setCanvas({cornerRadius:next})} />
-          <Dial label="阴影" min={0} max={80} value={canvas.shadowBlur} format={v => v+' px'} onCommit={next => setCanvas({shadowBlur:next})} />
-          <Dial label="浓度" min={0} max={100} value={canvas.shadowOpacity*100} format={v => v+'%'} onCommit={next => setCanvas({shadowOpacity:next/100})} />
+          <Dial label="边距" min={0} max={30} step={0.5} unit="%" value={canvas.padding*100} format={v => v+'%'} onCommit={next => setCanvas({padding:next/100})} />
+          <Dial label="圆角" min={0} max={48} unit="px" value={canvas.cornerRadius} format={v => v+' px'} onCommit={next => setCanvas({cornerRadius:next})} />
+          <Dial label="阴影" min={0} max={80} unit="px" value={canvas.shadowBlur} format={v => v+' px'} onCommit={next => setCanvas({shadowBlur:next})} />
+          <Dial label="浓度" min={0} max={100} unit="%" value={canvas.shadowOpacity*100} format={v => v+'%'} onCommit={next => setCanvas({shadowOpacity:next/100})} />
         </div>
+        <p className="parameter-dial-hint">拖动旋钮调节，或点击数值输入</p>
       </div>
 
       <div className="inspector-section" data-canvas-group="layout">

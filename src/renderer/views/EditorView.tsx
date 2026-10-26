@@ -6,6 +6,7 @@
  * 键盘：
  * - 空格播放/暂停，←/→ 逐帧，Shift+←/→ 逐秒
  * - Ctrl+B 分割，Delete 删除所选片段，Ctrl+Z 撤销，Ctrl+Y 重做，Ctrl+S 保存
+ * - F 切换专注预览，Esc 优先退出专注预览并保留选择
  * - 输入框获得焦点时，上述剪辑快捷键不抢文字输入（见 lib/hooks.ts isTextEntryTarget）
  *
  * 隐私遮挡：在预览上拖拽框选矩形 → 创建未确认遮挡 → 在属性面板设时间区间与样式 → 确认。
@@ -14,6 +15,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../lib/store';
 import { useShortcuts } from '../lib/hooks';
+import { POPOVER_MENU_KEYS, usePopoverMenu } from '../lib/usePopoverMenu';
 import { Badge, Button, Icon, IconButton, Spinner } from '../components/ui';
 import { LineIcon } from '../components/LineIcon';
 import { PreviewCanvas, useSourceToDisplay } from '../components/PreviewCanvas';
@@ -62,12 +64,23 @@ export function EditorView() {
   const [audioPreviewEnabled, setAudioPreviewEnabled] = useState(true);
   const audioPreviewError = useAudioPreview(project, apiMode === 'mock' ? null : projectPath, tick, playing, audioPreviewEnabled);
   const [timelineCollapsed, setTimelineCollapsed] = useState(false);
+  const [previewFocused, setPreviewFocused] = useState(false);
+  const previewFocusTrigger = useRef<HTMLButtonElement>(null);
   const [hudMenu, setHudMenu] = useState<'none' | 'add' | 'ratio'>('none');
+  const ratioMenu = usePopoverMenu({ open: hudMenu === 'ratio', onOpen: () => setHudMenu('ratio'), onClose: () => setHudMenu('none') });
+  const effectMenu = usePopoverMenu({ open: hudMenu === 'add', onOpen: () => setHudMenu('add'), onClose: () => setHudMenu('none') });
   const [drag, setDrag] = useState<DragState>({ kind: 'none' });
   const [scene, setScene] = useState<FrameScene | null>(null);
   const [effectClipboard, setEffectClipboard] = useState<Effect | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [wrapSize, setWrapSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
+  const togglePreviewFocus = useCallback(() => {
+    // Move focus before hiding the inspector so keyboard focus stays visible.
+    previewFocusTrigger.current?.focus();
+    setHudMenu('none');
+    setDrag({ kind: 'none' });
+    setPreviewFocused(focused => !focused);
+  }, []);
 
   const { toDisplayRect, toSourceRect, scene: previewScene } = useSourceToDisplay(
     project ?? emptyProjectFallback,
@@ -189,6 +202,7 @@ export function EditorView() {
   // 键盘快捷键
   useShortcuts(
     [
+      { combo: 'f', handler: togglePreviewFocus },
       { combo: 'ctrl+c', handler: copySelectedEffect },
       { combo: 'ctrl+v', handler: () => pasteCopiedEffect() },
       { combo: 'ctrl+shift+v', handler: () => pasteCopiedEffect(true) },
@@ -260,6 +274,11 @@ export function EditorView() {
         combo: 'escape',
         allowInInput: true,
         handler: () => {
+          if (previewFocused) {
+            setPreviewFocused(false);
+            previewFocusTrigger.current?.focus();
+            return;
+          }
           setPlaying(false);
           // 拖拽框选途中按 Escape：取消临时框，避免松手时才「突然」创建遮挡
           setDrag({ kind: 'none' });
@@ -476,7 +495,7 @@ export function EditorView() {
   const frameStep = (project.settings.fps.den * TICKS_PER_SECOND) / project.settings.fps.num;
 
   return (
-    <div className="editor">
+    <div className={cn('editor', previewFocused && 'is-preview-focused')}>
       <section className="editor-stage" aria-label="预览区">
         <div className="stage-canvas-wrap" ref={wrapRef}>
           <div
@@ -549,6 +568,12 @@ export function EditorView() {
               type="button"
               className="stage-ratio-trigger"
               aria-label="选择画幅"
+              title="切换输出画幅"
+              ref={ratioMenu.triggerRef}
+              aria-haspopup="menu"
+              aria-controls={hudMenu === 'ratio' ? ratioMenu.id : undefined}
+              data-keys={ratioMenu.triggerKeys}
+              onKeyDown={ratioMenu.onTriggerKeyDown}
               aria-expanded={hudMenu === 'ratio'}
               onClick={() => setHudMenu(hudMenu === 'ratio' ? 'none' : 'ratio')}
             >
@@ -558,18 +583,21 @@ export function EditorView() {
             </button>
             {hudMenu === 'ratio' && (
               <>
-                <button type="button" className="hud-scrim" aria-label="关闭画幅选择" onClick={() => setHudMenu('none')} />
-                <div className="stage-hud-popover" role="menu" aria-label="画幅">
+                <button type="button" tabIndex={-1} className="hud-scrim" aria-label="关闭画幅选择" onClick={() => ratioMenu.close()} />
+                <div id={ratioMenu.id} ref={ratioMenu.menuRef} className="stage-hud-popover" role="menu" aria-label="画幅" tabIndex={-1} data-keys={POPOVER_MENU_KEYS} onKeyDown={ratioMenu.onMenuKeyDown}>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 7 }}>
                   {project.variants.map((item) => (
                     <button
                       key={item.id}
                       type="button"
+                      role="menuitemradio"
+                      tabIndex={-1}
                       className={cn('variant-card', project.settings.activeVariantId === item.id && 'is-selected')}
-                      aria-pressed={project.settings.activeVariantId === item.id}
+                      aria-checked={project.settings.activeVariantId === item.id}
+                      aria-label={`${item.aspect[0]}:${item.aspect[1]}`}
                       onClick={() => {
                         execute({ kind: 'SetActiveVariant', variantId: item.id }, '切换画幅');
-                        setHudMenu('none');
+                        ratioMenu.close();
                       }}
                     >
                       <span className="variant-shape" style={{ aspectRatio: `${item.aspect[0]}/${item.aspect[1]}`, width: 40, display: 'block', borderRadius: 5, border: '1px solid currentColor', margin: '4px auto' }} />
@@ -585,23 +613,30 @@ export function EditorView() {
             <button
               type="button"
               className="stage-ratio-trigger"
-              aria-label="添加到画面"
+              aria-label="效果操作"
+              title="复制与粘贴效果"
+              ref={effectMenu.triggerRef}
+              aria-haspopup="menu"
+              aria-controls={hudMenu === 'add' ? effectMenu.id : undefined}
+              data-keys={effectMenu.triggerKeys}
+              onKeyDown={effectMenu.onTriggerKeyDown}
               aria-expanded={hudMenu === 'add'}
               onClick={() => setHudMenu(hudMenu === 'add' ? 'none' : 'add')}
             >
-              <LineIcon kind="plus" size={15} />
+              <LineIcon kind="layers" size={15} />
             </button>
             {hudMenu === 'add' && (
               <>
-                <button type="button" className="hud-scrim" aria-label="关闭效果菜单" onClick={() => setHudMenu('none')} />
-                <div className="stage-hud-menu" role="menu" aria-label="效果操作">
-                  <button type="button" disabled={!selectedEffectId} onClick={() => { copySelectedEffect(); setHudMenu('none'); }}>
+                <button type="button" tabIndex={-1} className="hud-scrim" aria-label="关闭效果菜单" onClick={() => effectMenu.close()} />
+                <div id={effectMenu.id} ref={effectMenu.menuRef} className="stage-hud-menu" role="menu" aria-label="效果操作" tabIndex={-1} data-keys={POPOVER_MENU_KEYS} onKeyDown={effectMenu.onMenuKeyDown}>
+                  {!selectedEffectId && !effectClipboard && <p className="hud-menu-hint">先在时间线选择一个效果，即可复制并在其他位置粘贴。</p>}
+                  <button type="button" role="menuitem" tabIndex={-1} disabled={!selectedEffectId} onClick={() => { copySelectedEffect(); effectMenu.close(); }}>
                     <LineIcon kind="box" size={15} />复制效果
                   </button>
-                  <button type="button" disabled={!effectClipboard} onClick={() => { pasteCopiedEffect(); setHudMenu('none'); }}>
+                  <button type="button" role="menuitem" tabIndex={-1} disabled={!effectClipboard} onClick={() => { pasteCopiedEffect(); effectMenu.close(); }}>
                     <LineIcon kind="paste" size={15} />粘贴效果
                   </button>
-                  <button type="button" disabled={!effectClipboard || !selectedEffectId} onClick={() => { pasteCopiedEffect(true); setHudMenu('none'); }}>
+                  <button type="button" role="menuitem" tabIndex={-1} disabled={!effectClipboard || !selectedEffectId} onClick={() => { pasteCopiedEffect(true); effectMenu.close(); }}>
                     <LineIcon kind="swap" size={15} />只粘贴属性
                   </button>
                 </div>
@@ -615,6 +650,8 @@ export function EditorView() {
             icon="stepBack"
             label="上一帧（←）"
             size="sm"
+            disabled={tick <= 0}
+            title={tick <= 0 ? '已经在开头' : '上一帧（←）'}
             onClick={() => {
               setPlaying(false);
               setTick(Math.max(0, tick - frameStep));
@@ -634,6 +671,8 @@ export function EditorView() {
             icon="stepForward"
             label="下一帧（→）"
             size="sm"
+            disabled={tick >= totalDuration}
+            title={tick >= totalDuration ? '已经在结尾' : '下一帧（→）'}
             onClick={() => {
               setPlaying(false);
               setTick(Math.min(totalDuration, tick + frameStep));
@@ -645,6 +684,22 @@ export function EditorView() {
           <IconButton icon="volume" size="sm" label={audioPreviewEnabled ? '关闭音频试听' : '开启音频试听'}
             variant="ghost" onClick={() => setAudioPreviewEnabled(v => !v)} />
           {audioPreviewError && <Badge tone="warn" title={audioPreviewError}>试听失败</Badge>}
+          <div className="stage-toolbar-spacer" />
+          <button
+            type="button"
+            ref={previewFocusTrigger}
+            className="stage-preview-toggle"
+            aria-label={previewFocused ? '退出专注预览（F / Esc）' : '专注预览（F）'}
+            aria-pressed={previewFocused}
+            aria-controls="editor-inspector"
+            aria-keyshortcuts={previewFocused ? 'f Escape' : 'f'}
+            title={previewFocused ? '返回编辑，恢复原布局（F / Esc）' : '收起属性面板与时间线轨道（F）'}
+            onClick={togglePreviewFocus}
+          >
+            <LineIcon kind={previewFocused ? 'layout' : 'expand'} size={14} />
+            <span>{previewFocused ? '返回编辑' : '专注预览'}</span>
+            <kbd aria-hidden="true">F</kbd>
+          </button>
         </div>
 
         <div className="transport">
@@ -666,7 +721,7 @@ export function EditorView() {
         </div>
       </section>
 
-      <InspectorPanel />
+      <InspectorPanel hidden={previewFocused} />
 
       <Timeline
         project={project}
@@ -683,6 +738,9 @@ export function EditorView() {
         onSelectStep={selectStep}
         onSplitAtPlayhead={splitAtPlayhead}
         onDeleteSelected={deleteSelection}
+        effectClipboardKind={effectClipboard?.kind ?? null}
+        onCopyEffect={copySelectedEffect}
+        onPasteEffect={pasteCopiedEffect}
         onToggleTrackMute={(kind) => {
           const track = project.tracks.find((t) => t.kind === kind);
           if (!track) return;
@@ -690,8 +748,13 @@ export function EditorView() {
         }}
         zoom={zoom}
         onZoomChange={setZoom}
-        collapsed={timelineCollapsed}
-        onToggleCollapsed={() => setTimelineCollapsed((v) => !v)}
+        collapsed={previewFocused || timelineCollapsed}
+        onToggleCollapsed={() => {
+          if (previewFocused) {
+            setPreviewFocused(false);
+            setTimelineCollapsed(false);
+          } else setTimelineCollapsed(collapsed => !collapsed);
+        }}
         projectPath={projectPath}
         onMoveClip={(clipId, timelineInTicks) => {
           const plan = planClipMove(project, clipId, timelineInTicks);

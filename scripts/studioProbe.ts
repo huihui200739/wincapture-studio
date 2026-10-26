@@ -146,7 +146,9 @@ export async function runStudioProbe(win: BrowserWindow, root: string, overlayCl
     }
     check(audio.length === 2, '两条音轨均进入正式工程'); report.audio = audio;
     if (process.env.WCS_STUDIO_DEVICE === '1') {
-      await click('.studio-text-action'); await until(`!!document.querySelector('.capture-capsule') && !document.querySelector('.capsule-record').disabled`);
+      await click('[aria-label="项目菜单"]');
+      await js(`Array.from(document.querySelectorAll('.studio-dropdown button')).find(button => button.textContent?.includes('新建录制'))?.click()`);
+      await until(`!!document.querySelector('.capture-capsule') && !document.querySelector('.capsule-record').disabled`);
       await click('.capture-source-trigger'); await js(`document.querySelectorAll('.source-modes button')[2].click()`); await wait(700);
       await shot('07-devices');
       check(await js(`document.querySelectorAll('.source-choice').length > 0`), '真实视频设备可选');
