@@ -42,6 +42,40 @@ and synchronizes the lane labels with vertical scrolling. Snapping remains on by
 default, with Alt bypass, to preserve this project's existing editing behaviour.
 These view controls do not change the project or add undo entries.
 
+Shared controls were additionally compared with `EditorInspectorTabBar.swift`,
+`EditorControls.swift`, `AppSettingsComponents.swift`, `AppChoiceFeedback.swift`
+and `EditorDesignTokens.swift` at the pinned commit:
+
+| Control | React/CSS implementation |
+| --- | --- |
+| Inspector task tabs | 60px bar, 44px targets, 17px icons; only the active label appears, with 14/16px horizontal insets and a measured sliding capsule. Measurement follows font loading and resizing. |
+| Primary / quiet / toolbar buttons | 32px normal actions, 30px compact actions; theme-aware hover/press washes, .96/.97 press scales and distinct disabled opacities. Large recorder actions retain their larger targets. |
+| Choice feedback | `ChoiceButton.tsx` holds visual feedback for at least 100ms without delaying activation. The previously selected choice scales its foreground to .96; other choices scale only their icon to .90. Pointer exit, blur and cancellation release feedback. |
+| Segmented choices | Recessed capsule with 3px inset and a measured raised thumb; shared by inspector fields and export options. Left/Right, Home/End move focus and selection. Export locks the whole group while running. |
+| Editor toggles | 38×22px track, 18px knob stretched to 22px on press. The label, description and empty row area activate the native switch once; the capsule keeps its size. Light and dark on/off states remain distinct. |
+| Linear sliders | 32px target, 3px filled rail, 14px thumb with 7px inset, hover/drag scales 1.10/1.22 and a floating readout. Near-thumb drags are relative; rail clicks are absolute. |
+| Type and surfaces | 15px panel headings, 13px controls, 12px field labels, 11px supporting toggle text; shared paper/wash surfaces, hairlines, shadows, 14px panel insets and 30px close buttons. |
+
+Slider drafts commit once on pointer release or the end of a repeated key
+gesture. Escape, pointer cancellation/capture loss, blur, resize and hiding the
+document restore the last committed value. Keyboard increments are at least the
+declared parameter step and normally 1% of the range; Shift/Page keys use 10%.
+Native accessibility changes commit immediately. The native range input keeps
+its label, value text and keyboard focus; control-owned keys do not seek the
+timeline. Reduced motion removes spatial feedback.
+
+The choice feedback is used by both levels of inspector tabs, settings
+navigation, timeline display choices and the shared segmented control. If an
+advanced export value (for example 720p) has no quick-choice counterpart, the
+quick group shows no selected thumb and remains reachable by keyboard.
+
+This is a source-guided Windows adaptation. The inspector keeps its five
+implemented groups (camera is under canvas, audio under clips), and the Windows
+Ctrl/Delete/context-menu bindings and recording/export pipeline remain in use.
+The Mac browser's “界面预览” badge identifies mock data and is hidden in the
+native app. Specialized reference controls such as `EditorBarSlider` and macOS
+system pickers are not represented as newly implemented features.
+
 The grouped shortcut reference follows `EditorShortcutCheatsheet.swift` at the
 same commit, adapted to the Windows bindings actually implemented here (Ctrl,
 Delete, Shift+F10 and F1). Unsupported reference gestures are not advertised.

@@ -328,8 +328,11 @@ describe('回归：未来版本只读读取的结构规整', () => {
     expect((result.project as unknown as { futureFeature?: unknown }).futureFeature).toEqual({ a: 1 });
   });
 
-  it('对同一输入读取两次结果一致（幂等）', () => {
+  it('规整后的工程再次读取保持一致（幂等）', () => {
     const raw = { schemaVersion: PROJECT_SCHEMA_VERSION + 1, id: 'future', name: 'x' };
-    expect(readProject(raw).project).toEqual(readProject(raw).project);
+    // 缺少日期的输入会补当前时间；幂等应比较 f(f(x)) 和 f(x)，
+    // 避免把两次独立补时恰好落在同一毫秒当作前提。
+    const normalized = readProject(raw).project;
+    expect(readProject(normalized).project).toEqual(normalized);
   });
 });

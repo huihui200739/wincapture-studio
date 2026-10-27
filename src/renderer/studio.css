@@ -140,7 +140,7 @@ html[data-role="overlay"] .rec-bar { width:100%; min-width:0; overflow:hidden; }
 .studio-shell .inspector-tab { padding:10px; height:36px; min-width:36px; justify-content:center; font-size:12px; }
 .studio-shell .inspector-tab.is-active { padding:10px 13px; }
 .studio-shell .inspector-tab svg { width:15px; height:15px; flex:none; }
-.studio-shell .inspector-tab:not(.is-active)>span { display:none; }
+.studio-shell .inspector-tab:not(.is-active) .inspector-tab-label { display:none; }
 .studio-shell .inspector-body { padding:6px 22px 24px; }
 .studio-inspector-title { padding:2px 0 20px; }
 .studio-inspector-title h2 { font-size:30px; letter-spacing:-1px; }

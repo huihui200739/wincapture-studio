@@ -11,6 +11,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -20,6 +21,8 @@ import {
   type ReactNode,
 } from 'react';
 import { clamp, cn } from '../lib/format';
+import { normalizeParameterValue } from '../lib/parameterValue';
+import { ChoiceButton } from './ChoiceButton';
 
 // ---------------------------------------------------------------------------
 // 图标
@@ -476,23 +479,25 @@ export function Toggle({
 }) {
   const id = useId();
   const descId = `${id}-desc`;
+  const labelId = `${id}-label`;
   return (
-    <div className={cn('wcs-toggle-row', disabled && 'is-disabled')}>
-      <div className="wcs-toggle-text">
-        <label htmlFor={id} className="wcs-toggle-label">
+    <label htmlFor={id} className={cn('wcs-toggle-row', disabled && 'is-disabled')}>
+      <span className="wcs-toggle-text">
+        <span id={labelId} className="wcs-toggle-label">
           {label}
-        </label>
+        </span>
         {description && (
-          <p className="wcs-toggle-desc" id={descId}>
+          <span className="wcs-toggle-desc" id={descId}>
             {description}
-          </p>
+          </span>
         )}
-      </div>
+      </span>
       <button
         id={id}
         type="button"
         role="switch"
         aria-checked={checked}
+        aria-labelledby={labelId}
         aria-label={typeof label === 'string' ? label : undefined}
         aria-describedby={description ? descId : undefined}
         className={cn('wcs-switch', checked && 'is-on')}
@@ -501,7 +506,7 @@ export function Toggle({
       >
         <span className="wcs-switch-knob" />
       </button>
-    </div>
+    </label>
   );
 }
 
@@ -511,36 +516,65 @@ export function Segmented<T extends string>({
   onChange,
   ariaLabel,
   size = 'md',
+  disabled = false,
+  className,
 }: {
   options: { value: T; label: ReactNode; icon?: IconName | string; title?: string }[];
   value: T;
   onChange: (next: T) => void;
   ariaLabel: string;
   size?: 'sm' | 'md';
+  disabled?: boolean;
+  className?: string;
 }) {
+  const root = useRef<HTMLDivElement>(null);
+  const [thumb, setThumb] = useState<{ left: number; width: number } | null>(null);
+  const measure = useCallback(() => {
+    const selected = root.current?.querySelector<HTMLButtonElement>('[aria-pressed="true"]');
+    if (!selected) { setThumb(null); return; }
+    const next = { left: selected.offsetLeft, width: selected.offsetWidth };
+    setThumb(previous => previous?.left === next.left && previous.width === next.width ? previous : next);
+  }, []);
+  useLayoutEffect(measure, [measure, value, options.length]);
+  useEffect(() => {
+    if (!root.current) return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(root.current);
+    root.current.querySelectorAll('button').forEach(button => observer.observe(button));
+    return () => observer.disconnect();
+  }, [measure, options.length]);
   return (
-    <div className={cn('wcs-segmented', `is-${size}`)} role="group" aria-label={ariaLabel}>
-      {options.map((option) => (
-        <button
+    <div ref={root} className={cn('wcs-segmented', `is-${size}`, className)} role="group" aria-label={ariaLabel} aria-disabled={disabled || undefined}
+      data-keys="arrowleft arrowright home end"
+      onKeyDown={event => {
+        if (disabled || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key) || !options.length) return;
+        event.preventDefault(); event.stopPropagation();
+        const index = Math.max(0, options.findIndex(option => option.value === value));
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + options.length) % options.length;
+        onChange(options[next].value);
+        root.current?.querySelectorAll<HTMLButtonElement>('button')[next]?.focus();
+      }}>
+      {options.map((option, index) => (
+        <ChoiceButton selected={value === option.value}
           key={option.value}
           type="button"
           className={cn('wcs-segmented-item', value === option.value && 'is-active')}
           aria-pressed={value === option.value}
+          disabled={disabled}
+          tabIndex={index === Math.max(0, options.findIndex(item => item.value === value)) ? 0 : -1}
           title={option.title}
           onClick={() => onChange(option.value)}
         >
           {option.icon && <Icon name={option.icon} size={13} />}
           {option.label}
-        </button>
+        </ChoiceButton>
       ))}
+      {thumb && <span className="wcs-segmented-thumb" aria-hidden="true" style={{ width: thumb.width, transform: `translateX(${thumb.left - 3}px)` }} />}
     </div>
   );
 }
 
-/**
- * 滑杆：拖动时只更新本地显示，松手（pointerup / keyup / blur）才提交，
- * 避免一次拖动产生几十条撤销记录。
- */
+/** Reference slider geometry and feedback, with one project command per gesture. */
 export function Slider({
   label,
   value,
@@ -563,28 +597,74 @@ export function Slider({
   hint?: ReactNode;
 }) {
   const [local, setLocal] = useState(value);
-  const [dragging, setDragging] = useState(false);
+  const [interaction, setInteraction] = useState<'pointer' | 'keyboard' | null>(null);
   const id = useId();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const current = useRef(value);
+  const committed = useRef(value);
+  const editing = useRef(false);
+  const pointer = useRef<{ id: number; startX: number; startFraction: number | null; left: number; travel: number } | null>(null);
+  const releasePointer = useCallback(() => {
+    const active = pointer.current;
+    pointer.current = null;
+    if (active && inputRef.current?.hasPointerCapture(active.id)) inputRef.current.releasePointerCapture(active.id);
+  }, []);
+  const cancel = useCallback(() => {
+    editing.current = false;
+    current.current = committed.current;
+    setLocal(committed.current);
+    setInteraction(null);
+    releasePointer();
+  }, [releasePointer]);
   useEffect(() => {
-    if (!dragging) setLocal(value);
-  }, [value, dragging]);
-
-  const commit = useCallback(
-    (next: number) => {
-      setDragging(false);
-      setLocal(next);
-      if (next !== value) onCommit(next);
-    },
-    [onCommit, value],
-  );
+    committed.current = value;
+    if (editing.current) cancel();
+    else { current.current = value; setLocal(value); }
+  }, [value, min, max, step, disabled, cancel]);
+  useEffect(() => {
+    if (!interaction) return;
+    const onVisibility = () => { if (document.hidden) cancel(); };
+    window.addEventListener('blur', cancel);
+    window.addEventListener('resize', cancel);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('blur', cancel);
+      window.removeEventListener('resize', cancel);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [cancel, interaction]);
+  const update = (next: number) => {
+    const normalized = normalizeParameterValue(next, { min, max, step });
+    if (normalized === null) return;
+    current.current = normalized;
+    setLocal(normalized);
+  };
+  const commit = () => {
+    if (!editing.current) return;
+    editing.current = false;
+    setInteraction(null);
+    releasePointer();
+    if (current.current !== committed.current) {
+      committed.current = current.current;
+      onCommit(current.current);
+    }
+  };
+  const fraction = max > min ? clamp((local - min) / (max - min), 0, 1) : 0;
+  const rangeKeys = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'];
+  const readout = format ? format(local) : String(local);
 
   return (
     <div className={cn('wcs-slider', disabled && 'is-disabled')}>
       <div className="wcs-slider-head">
         <label htmlFor={id}>{label}</label>
-        <output htmlFor={id}>{format ? format(local) : String(local)}</output>
+        <output htmlFor={id}>{readout}</output>
       </div>
+      <div className={cn('wcs-slider-control', interaction === 'pointer' && 'is-dragging')}
+        style={{ '--slider-fraction': fraction } as CSSProperties}>
+        <div className="wcs-slider-rail" aria-hidden="true"><span className="wcs-slider-fill" /><span className="wcs-slider-thumb" /></div>
+        {interaction === 'pointer' && <span className="wcs-slider-tooltip" aria-hidden="true">{readout}</span>}
       <input
+        ref={inputRef}
         id={id}
         type="range"
         min={min}
@@ -592,15 +672,54 @@ export function Slider({
         step={step}
         value={local}
         disabled={disabled}
-        aria-valuetext={format ? format(local) : String(local)}
-        onChange={(event) => {
-          setDragging(true);
-          setLocal(Number(event.target.value));
+        aria-valuetext={readout}
+        data-keys="arrowleft arrowright arrowup arrowdown shift+arrowleft shift+arrowright shift+arrowup shift+arrowdown home end pageup pagedown escape"
+        onPointerDown={event => {
+          if (disabled || event.button !== 0 || pointer.current) return;
+          event.preventDefault();
+          event.currentTarget.focus({ preventScroll: true });
+          const box = event.currentTarget.getBoundingClientRect();
+          const travel = Math.max(1, box.width - 14);
+          const centre = box.left + 7 + fraction * travel;
+          pointer.current = { id: event.pointerId, startX: event.clientX, startFraction: Math.abs(event.clientX - centre) <= 12 ? fraction : null, left: box.left, travel };
+          editing.current = true;
+          setInteraction('pointer');
+          event.currentTarget.setPointerCapture(event.pointerId);
+          if (pointer.current.startFraction === null) update(min + (event.clientX - box.left - 7) / travel * (max - min));
         }}
-        onPointerUp={(event) => commit(Number((event.target as HTMLInputElement).value))}
-        onKeyUp={(event) => commit(Number((event.target as HTMLInputElement).value))}
-        onBlur={(event) => commit(Number((event.target as HTMLInputElement).value))}
+        onPointerMove={event => {
+          const start = pointer.current;
+          if (!start || start.id !== event.pointerId) return;
+          const next = start.startFraction === null ? (event.clientX - start.left - 7) / start.travel : start.startFraction + (event.clientX - start.startX) / start.travel;
+          update(min + next * (max - min));
+        }}
+        onPointerUp={event => { if (pointer.current?.id === event.pointerId) commit(); }}
+        onPointerCancel={cancel}
+        onLostPointerCapture={() => { if (pointer.current) cancel(); }}
+        onChange={(event) => {
+          editing.current = true;
+          update(Number(event.target.value));
+          // Native/assistive changes may not send keyup or blur. Our pointer
+          // and keyboard gestures own their drafts; other changes commit now.
+          if (!pointer.current) commit();
+        }}
+        onKeyDown={event => {
+          if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancel(); return; }
+          if (!rangeKeys.includes(event.key) || event.ctrlKey || event.altKey || event.metaKey) return;
+          event.preventDefault(); event.stopPropagation();
+          if (pointer.current) return;
+          editing.current = true;
+          setInteraction('keyboard');
+          const coarse = event.shiftKey || event.key.startsWith('Page');
+          const increment = Math.max(step, (max - min) / (coarse ? 10 : 100));
+          if (event.key === 'Home') update(min);
+          else if (event.key === 'End') update(max);
+          else update(current.current + (['ArrowLeft', 'ArrowDown', 'PageDown'].includes(event.key) ? -increment : increment));
+        }}
+        onKeyUp={event => { if (rangeKeys.includes(event.key) && !pointer.current) commit(); }}
+        onBlur={() => { if (pointer.current) cancel(); else commit(); }}
       />
+      </div>
       {hint && <p className="wcs-field-hint">{hint}</p>}
     </div>
   );

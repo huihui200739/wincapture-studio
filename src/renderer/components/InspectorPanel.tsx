@@ -11,7 +11,7 @@
  * 注意文案：这里删除的是「时间线片段」，与「删除源素材」是两件事。
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   CanvasStyle,
   CursorParameters,
@@ -32,6 +32,7 @@ import { planClipMove, splittableTick, clipEndTick } from './Timeline';
 import { CANVAS_PRESETS } from '@domain/presets';
 import { PreviewCanvas } from './PreviewCanvas';
 import { Dial } from './Dial';
+import { ChoiceButton } from './ChoiceButton';
 import { planProjectAutoZoom } from '@domain/zoom';
 import { wcs } from '../lib/wcs';
 import { unwrap } from '../lib/format';
@@ -172,14 +173,16 @@ export function InspectorPanel({ hidden = false }: { hidden?: boolean }) {
   const measureTabThumb = useCallback(() => {
     const node = tabRefs.current.get(tab);
     if (!node) return;
-    setTabThumb({ left: node.offsetLeft, width: node.offsetWidth });
+    const next = { left: node.offsetLeft, width: node.offsetWidth };
+    setTabThumb(previous => previous?.left === next.left && previous.width === next.width ? previous : next);
   }, [tab]);
-  useEffect(() => { measureTabThumb(); }, [measureTabThumb]);
+  useLayoutEffect(() => { measureTabThumb(); }, [measureTabThumb]);
   useEffect(() => {
     const parent = tabRefs.current.get(tab)?.parentElement;
     if (!parent || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => measureTabThumb());
     observer.observe(parent);
+    tabRefs.current.forEach(node => { if (node) observer.observe(node); });
     return () => observer.disconnect();
   }, [measureTabThumb, tab]);
 
@@ -229,7 +232,7 @@ export function InspectorPanel({ hidden = false }: { hidden?: boolean }) {
         event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
       }}>
         {TABS.map((item) => (
-          <button
+          <ChoiceButton selected={tab === item.id}
             key={item.id}
             type="button"
             role="tab"
@@ -244,8 +247,8 @@ export function InspectorPanel({ hidden = false }: { hidden?: boolean }) {
             onClick={() => setTab(item.id)}
           >
             <LineIcon kind={item.kind} size={17} />
-            <span>{item.label}</span>
-          </button>
+            <span className="inspector-tab-label">{item.label}</span>
+          </ChoiceButton>
         ))}
         {tabThumb && <span className="inspector-tab-thumb" style={{ transform: `translateX(${tabThumb.left - 4}px)`, width: tabThumb.width }} aria-hidden="true" />}
       </div>
@@ -1447,7 +1450,7 @@ function CanvasTab({
         setPage(pages[next]);
         event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
       }}>
-        {([['background','背景'],['layout','布局'],['camera','摄像头']] as const).map(([id,label]) => <button key={id} type="button" role="tab" tabIndex={page === id ? 0 : -1} aria-selected={page === id} onClick={() => setPage(id)}>{label}</button>)}
+        {([['background','背景'],['layout','布局'],['camera','摄像头']] as const).map(([id,label]) => <ChoiceButton key={id} selected={page === id} type="button" role="tab" tabIndex={page === id ? 0 : -1} aria-selected={page === id} onClick={() => setPage(id)}>{label}</ChoiceButton>)}
         <span className="studio-canvas-tab-thumb" aria-hidden="true" style={{ transform: `translateX(calc(${page === 'background' ? 0 : page === 'layout' ? 1 : 2} * (100% + 2px)))` }} />
       </div>
       <div className="studio-canvas-preview"><PreviewCanvas project={project} projectPath={projectPath} tick={tick} maxWidth={640} includeOverlays={false} /></div>

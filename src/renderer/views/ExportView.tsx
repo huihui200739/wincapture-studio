@@ -12,7 +12,7 @@ import type { ExportProgress, ExportProfile } from '@shared/ipc';
 import type { ExportBundleResult } from '@shared/api';
 import type { ErrorCode } from '@shared/errors';
 import { useApp } from '../lib/store';
-import { Badge, Button, EmptyState, Field, Icon, InlineNote, Panel, ProgressBar, Spinner, TextInput, Modal } from '../components/ui';
+import { Badge, Button, EmptyState, Field, Icon, InlineNote, Panel, ProgressBar, Spinner, TextInput, Modal, Segmented } from '../components/ui';
 import {
   bytesPerSecond,
   cn,
@@ -323,14 +323,14 @@ export function ExportView({ onClose }: { onClose?: () => void }) {
           <TextInput aria-label="导出文件名" value={fileName} disabled={running} onChange={event => { setOutputPath((directory ? directory + String.fromCharCode(92) : '') + event.target.value); setPathTouchedFor(projectId); }} onBlur={() => setOutputPath(previous => normalizeOutputPath(previous,extension))} />
           <button className="export-directory" disabled={running || picking} onClick={() => void pickPath()} title={directory}><Icon name="folder" size={15} /><span>{directory || '选择保存位置'}</span><Icon name="chevronRight" size={13} /></button>
         </div>{!pathCheck.ok && <p className="settings-hint is-error">{pathCheck.reason}</p>}
-        <h3 className="section-caption">导出内容</h3><div className="sheet-segmented" role="group" aria-label="导出内容">{[{id:'video',label:'视频成片',icon:'editor'},{id:'audio',label:'仅音频',icon:'volume'}].map(item => <button key={item.id} aria-pressed={kind===item.id} disabled={running} onClick={() => {setKind(item.id as Kind);resetToIdle();}}><Icon name={item.icon} size={15} />{item.label}</button>)}</div>
+        <h3 className="section-caption">导出内容</h3><Segmented className="sheet-segmented" ariaLabel="导出内容" options={[{value:'video',label:'视频成片',icon:'editor'},{value:'audio',label:'仅音频',icon:'volume'}]} value={kind} disabled={running} onChange={next => {setKind(next as Kind);resetToIdle();}} />
         {kind !== 'audio' && <><h3 className="section-caption">规格</h3><div className="export-spec-card">
-          <span className="export-field-label">分辨率</span><div className="sheet-segmented" role="group" aria-label="输出分辨率">{[{id:'source',label:'原始素材'},{id:'1080',label:'1080p'},{id:'1440',label:'1440p'},{id:'2160',label:'4K'}].map(item => <button key={item.id} aria-pressed={resolution===item.id} disabled={running} onClick={() => setResolution(item.id as ExportResolution)}>{item.label}</button>)}</div>
-          <span className="export-field-label">帧率</span><div className="sheet-segmented" role="group" aria-label="输出帧率">{[{id:'project',label:'跟随工程'},{id:'30',label:'30 FPS'},{id:'60',label:'60 FPS'}].map(item => <button key={item.id} aria-pressed={outputFps===item.id} disabled={running} onClick={() => setOutputFps(item.id as ExportFrameRate)}>{item.label}</button>)}</div>
+          <span className="export-field-label">分辨率</span><Segmented className="sheet-segmented" ariaLabel="输出分辨率" options={[{value:'source',label:'原始素材'},{value:'1080',label:'1080p'},{value:'1440',label:'1440p'},{value:'2160',label:'4K'}]} value={resolution} disabled={running} onChange={next => setResolution(next as ExportResolution)} />
+          <span className="export-field-label">帧率</span><Segmented className="sheet-segmented" ariaLabel="输出帧率" options={[{value:'project',label:'跟随工程'},{value:'30',label:'30 FPS'},{value:'60',label:'60 FPS'}]} value={outputFps} disabled={running} onChange={next => setOutputFps(next as ExportFrameRate)} />
         </div></>}
         <details className="export-advanced"><summary>更多选项<Icon name="chevronDown" size={13} /></summary><div>
           <Field label="产物类型"><select className="wcs-select" aria-label="产物类型" value={kind} disabled={running} onChange={event => {setKind(event.target.value as Kind);resetToIdle();}}><option value="video">视频成片</option><option value="audio">仅音频</option><option value="tutorial">图文教程</option><option value="both">视频 + 教程</option></select></Field>
-          {kind !== 'audio' && <><Field label="画幅"><div className="sheet-segmented">{VARIANTS.map(item => <button key={item.id} aria-pressed={variantId===item.id} disabled={running} onClick={() => setVariantId(item.id)}>{item.label}</button>)}</div></Field>
+          {kind !== 'audio' && <><Field label="画幅"><Segmented className="sheet-segmented" ariaLabel="导出画幅" options={VARIANTS.map(item => ({value:item.id,label:item.label}))} value={variantId} disabled={running} onChange={setVariantId} /></Field>
           <Field label="画质"><select className="wcs-select" aria-label="输出画质" value={quality} disabled={running} onChange={event => setQuality(event.target.value as ExportQuality)}><option value="compact">小体积</option><option value="balanced">均衡</option><option value="high">高画质</option></select></Field>
           <Field label="分辨率"><select className="wcs-select" aria-label="输出分辨率详细选项" value={resolution} disabled={running} onChange={event => setResolution(event.target.value as ExportResolution)}><option value="source">原始素材</option><option value="720">720p</option><option value="1080">1080p</option><option value="1440">1440p</option><option value="2160">4K</option></select></Field></>}
           <Field label="完整输出路径"><TextInput id="export-path" value={outputPath} disabled={running} onChange={event => {setOutputPath(event.target.value);setPathTouchedFor(projectId);}} onBlur={() => setOutputPath(previous => normalizeOutputPath(previous,extension))} /></Field>

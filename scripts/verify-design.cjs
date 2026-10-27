@@ -23,6 +23,10 @@ app.whenReady().then(async () => {
   await win.loadFile(path.join(root,'dist','renderer','index.html'));
   await until(`document.documentElement.dataset.ready==='1'`);
   await go('editor'); await until(`!!document.querySelector('.stage-canvas-inner canvas')`);
+  check(await js(`(() => {const bar=document.querySelector('.inspector-tabs');return bar.getBoundingClientRect().height===60&&[...bar.querySelectorAll('[aria-selected=false]')].every(el=>{const r=el.getBoundingClientRect(),icon=el.querySelector('svg').getBoundingClientRect();return r.width===44&&r.height===44&&icon.width===17&&icon.height===17;});})()`),'属性栏 60px、未选标签 44px 且图标可见');
+  await click('#inspector-tab-clip');
+  check(await js(`(() => {const tab=document.querySelector('#inspector-tab-clip').getBoundingClientRect(),thumb=document.querySelector('.inspector-tab-thumb').getBoundingClientRect();return Math.abs(tab.x-thumb.x)<1&&Math.abs(tab.width-thumb.width)<1&&tab.width>44;})()`),'属性胶囊随选中文字宽度对齐');
+  await click('#inspector-tab-canvas');
   await shot('01-editor');
   await js(`window.__designCanvas=document.querySelector('.stage-canvas-inner canvas')`);
   await click('[aria-label="快捷键速查（F1）"]');
@@ -67,6 +71,7 @@ app.whenReady().then(async () => {
   await shot('05-export');
   await click('[aria-label="输出分辨率"] button:nth-child(3)');
   check(await js(`document.querySelector('.export-summary').textContent.includes('2560')`),'1440p 选项更新实际导出规格');
+  check(await js(`(() => {const group=document.querySelector('[aria-label="输出分辨率"]'),button=group.querySelector('[aria-pressed=true]').getBoundingClientRect(),thumb=group.querySelector('.wcs-segmented-thumb').getBoundingClientRect();return Math.abs(button.x-thumb.x)<1&&Math.abs(button.width-thumb.width)<1;})()`),'导出分段控件共用浮动胶囊并与实际选项对齐');
   await click('[aria-label="输出帧率"] button:nth-child(3)');
   check(await js(`document.querySelector('.export-summary').textContent.includes('60 fps')`),'60 FPS 选项更新实际导出规格');
   await click('[aria-label="导出内容"] button:nth-child(2)');

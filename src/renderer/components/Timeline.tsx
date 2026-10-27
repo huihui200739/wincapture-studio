@@ -20,6 +20,7 @@ import { normalizeShortcutEvent } from '../lib/hooks';
 import { Icon, IconButton } from './ui';
 import { LineIcon, type LineIconKind } from './LineIcon';
 import { ContextMenu, type ContextMenuItem } from './ContextMenu';
+import { ChoiceButton } from './ChoiceButton';
 import { AudioWaveform } from './AudioWaveform';
 import { VideoThumbnails } from './VideoThumbnails';
 import { usePreviewMedia } from '../lib/previewSource';
@@ -801,9 +802,9 @@ export function Timeline({
         </button>
         <div className="timeline-toolbar-spacer" />
         <div className="timeline-display-toggle" role="group" aria-label="时间线显示">
-          <button aria-pressed={!waveformMode} onClick={() => setWaveformMode(false)}><LineIcon kind="film" size={14} />画面</button>
-          <button aria-pressed={waveformMode} onClick={() => { setWaveformMode(true); setDetailTracks(true); }}><LineIcon kind="waveform" size={14} />波形</button>
-          <span className="timeline-display-toggle-thumb" aria-hidden="true" style={{ transform: waveformMode ? 'translateX(100%)' : 'translateX(0)' }} />
+          <ChoiceButton selected={!waveformMode} aria-pressed={!waveformMode} onClick={() => setWaveformMode(false)}><LineIcon kind="film" size={14} />画面</ChoiceButton>
+          <ChoiceButton selected={waveformMode} aria-pressed={waveformMode} onClick={() => { setWaveformMode(true); setDetailTracks(true); }}><LineIcon kind="waveform" size={14} />波形</ChoiceButton>
+          <span className="timeline-display-toggle-thumb" aria-hidden="true" style={{ transform: waveformMode ? 'translateX(calc(100% + 2px))' : 'translateX(0)' }} />
         </div>
         <div className="timeline-toolbar-spacer" />
         <button type="button" className="studio-track-toggle timeline-snap-toggle" aria-label="时间线吸附" aria-pressed={snappingEnabled}

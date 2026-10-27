@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useApp } from '../lib/store';
 import { Badge, Button, Field, Icon, Kbd, Modal, Select, Toggle } from '../components/ui';
+import { ChoiceButton } from '../components/ChoiceButton';
 import { formatBytes, unwrap } from '../lib/format';
 import { wcs, withTimeout, IPC_TIMEOUT } from '../lib/wcs';
 import { loadSettings, saveSettings, type PersistedSettings } from '../lib/settings';
@@ -60,9 +61,9 @@ export function SettingsView({ onClose }: { onClose?: () => void }) {
       const next = event.key === 'Home' ? 0 : event.key === 'End' ? PAGES.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + PAGES.length) % PAGES.length;
       setPage(PAGES[next].id); event.currentTarget.querySelectorAll<HTMLButtonElement>('[role=tab]')[next]?.focus();
     }}>
-      {PAGES.map(item => <button key={item.id} role="tab" id={`settings-tab-${item.id}`} aria-controls="settings-page" aria-selected={page === item.id} aria-label={item.label} title={item.label} tabIndex={page === item.id ? 0 : -1} onClick={() => setPage(item.id)}>
-        <Icon name={item.icon} size={18} /><span>{item.label}</span>
-      </button>)}
+      {PAGES.map(item => <ChoiceButton selected={page === item.id} key={item.id} role="tab" id={`settings-tab-${item.id}`} aria-controls="settings-page" aria-selected={page === item.id} aria-label={item.label} title={item.label} tabIndex={page === item.id ? 0 : -1} onClick={() => setPage(item.id)}>
+        <Icon name={item.icon} size={18} /><span className="settings-tab-label">{item.label}</span>
+      </ChoiceButton>)}
     </nav>
     <div className="settings-island" id="settings-page" role="tabpanel" aria-labelledby={`settings-tab-${page}`}>
       <div className="settings-page" key={page}>
