@@ -88,6 +88,18 @@ describe('SegmentSet 段定位', () => {
 // ---------------------------------------------------------------------------
 
 describe('VideoFrameSource 取帧', () => {
+  it('retains a decoded future frame across gaps instead of dropping every other camera frame', async () => {
+    const { src, stats } = source({ gaps: { videoFrames: [
+      { timestamp: 0, duration: 0.02 }, { timestamp: 0.04, duration: 0.02 },
+      { timestamp: 0.08, duration: 0.02 }, { timestamp: 0.12, duration: 0.02 },
+    ] } }, [seg('gaps.mp4', 'gaps', 0, S)]);
+    await src.open();
+    for (const [time, expected] of [[0, 0], [0.03, 0], [0.045, 0.04], [0.07, 0.04], [0.085, 0.08]]) {
+      await src.getFrameAt(time * S);
+      expect(stats.lastDrawnTimestamp).toBe(expected);
+    }
+    src.close();
+  });
   const frames = [
     { timestamp: 0, duration: 0.5 },
     { timestamp: 0.5, duration: 0.5 },

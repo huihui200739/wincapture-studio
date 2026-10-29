@@ -135,7 +135,7 @@ export class SegmentEncoder {
     // 视频编码器：优先硬件，失败降级软件（§11.3）
     const attempts: HardwareAcceleration[] = hardwarePreferred
       ? ['prefer-hardware', 'no-preference', 'prefer-software']
-      : ['no-preference', 'prefer-software'];
+      : ['prefer-software', 'no-preference'];
     let chosen: { codec: 'avc' | 'vp9'; hw: HardwareAcceleration } | null = null;
     for (const codec of ['avc', 'vp9'] as const) {
       for (const hw of attempts) {

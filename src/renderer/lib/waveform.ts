@@ -142,12 +142,12 @@ export function buildWaveform(
     let min = 0;
     let max = 0;
     for (let f = start; f < end; f++) {
-      // 多声道取平均，避免单声道偏小的声音被另一声道掩盖
-      let sum = 0;
-      for (let c = 0; c < channels; c++) sum += samples[f * channels + c];
-      const v = sum / channels;
-      if (v < min) min = v;
-      if (v > max) max = v;
+      // 保留各声道峰值，避免左右声道反相时相互抵消成一条假静音线。
+      for (let c = 0; c < channels; c++) {
+        const v = samples[f * channels + c];
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
     }
     l0.push({ min, max });
   }

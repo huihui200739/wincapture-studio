@@ -2,7 +2,7 @@
  * 摄像头采集运行时（R04）
  *
  * 为什么放在渲染进程：摄像头只能通过 `navigator.mediaDevices.getUserMedia` 拿到，
- * 主进程没有等价 API；拿到 MediaStream 后用 WebCodecs + mediabunny 编成分段 MP4，
+ * 主进程没有等价 API；实时采样后将自有帧转交独立 Worker，用 WebCodecs + mediabunny 编成分段 MP4，
  * 和屏幕录制走完全相同的编码路径（src/media/encode.ts 的 SegmentEncoder）。
  *
  * 产物与屏幕段对齐：
@@ -15,7 +15,6 @@
  * - 绝不假装成功，也绝不因为摄像头失败而中断整场录制
  */
 
-import { SegmentEncoder } from '../media/encode';
 import { CameraFrameBuffer, type CameraMediaClock } from '../media/cameraBuffer';
 import { cameraCandidates, cameraStreamWithTimeout } from '../media/cameraDevices';
 
@@ -42,6 +41,7 @@ export interface CameraSegmentResult {
   bytes?: number;
   encoder?: string;
   error?: string;
+  diagnostics?: { sampledFrames: number; uniqueFrames: number; longestHoldMs: number; encodeMs: number; samplingMode: string; maxSourceGapMs?: number; sourceGapAtMs?: number };
 }
 
 export interface CameraDeviceInfo {
@@ -60,15 +60,118 @@ let mediaClock: CameraMediaClock | null = null;
 let frameCallback = 0;
 let lastFrameTick = -Infinity;
 let sampleCanvas: OffscreenCanvas | null = null;
+let frameReader: ReadableStreamDefaultReader<VideoFrame> | null = null;
+let samplingGeneration = 0;
+let samplingMode = 'video-callback';
+let encoderWorker: Worker | null = null;
+let encodeSequence = 0;
+let pendingEncode: { id: number; resolve: (result: CameraSegmentResult) => void; reject: (error: Error) => void } | null = null;
+
+function ensureEncoderWorker(): Worker {
+  if (encoderWorker) return encoderWorker;
+  const worker = new Worker(new URL('./cameraEncoderWorker.ts', import.meta.url), { type: 'module' });
+  worker.onmessage = (event: MessageEvent<{ id: number; result: CameraSegmentResult }>) => {
+    if (pendingEncode?.id !== event.data.id) return;
+    const pending = pendingEncode; pendingEncode = null;
+    pending.resolve(event.data.result);
+  };
+  worker.onerror = event => {
+    pendingEncode?.reject(new Error(event.message || '摄像头编码线程失败'));
+    pendingEncode = null;
+    worker.terminate();
+    if (encoderWorker === worker) encoderWorker = null;
+  };
+  encoderWorker = worker;
+  return worker;
+}
+
+function encodeInWorker(request: CameraSegmentRequest, frames: { tick: number; frame: VideoFrame }[]): Promise<CameraSegmentResult> {
+  const worker = ensureEncoderWorker();
+  return new Promise((resolve, reject) => {
+    const id = ++encodeSequence;
+    pendingEncode = { id, resolve, reject };
+    try { worker.postMessage({ id, request, frames }, frames.map(item => item.frame)); }
+    catch (error) { pendingEncode = null; reject(error); }
+  });
+}
+const samplingStats = { received: 0, retained: 0, lastArrivalMs: 0, maxArrivalGapMs: 0, lastTick: 0, lastSourceTimestamp: 0 };
+
+/** Retain actual camera frames independently of hidden-window compositor paints. */
+async function retainFrame(frame: VideoFrame): Promise<void> {
+  const arrival = performance.now();
+  if (samplingStats.lastArrivalMs) samplingStats.maxArrivalGapMs = Math.max(samplingStats.maxArrivalGapMs, arrival - samplingStats.lastArrivalMs);
+  samplingStats.lastArrivalMs = arrival; samplingStats.received++; samplingStats.lastSourceTimestamp = frame.timestamp;
+  let owned: VideoFrame | null = frame;
+  try {
+    if (mediaClock?.state !== 'recording') return;
+    const clock = mediaClock;
+    const tick = Math.round(mediaClock.mediaTick + (performance.timeOrigin + performance.now() - mediaClock.wallTimeMs) * 10_000);
+    if (tick < 0 || tick - lastFrameTick < 250_000) return;
+    if (frame.displayWidth <= 1280 && frame.displayHeight <= 720 && frame.format) {
+      // Preserve the camera's native CPU pixel format. Canvas readback shares
+      // the GPU queue with screen encoding and can stall at every segment cut.
+      const pixels = new Uint8Array(frame.allocationSize());
+      const layout = await frame.copyTo(pixels);
+      if (mediaClock !== clock) return;
+      owned = new VideoFrame(pixels, { format: frame.format, codedWidth: frame.codedWidth, codedHeight: frame.codedHeight,
+        displayWidth: frame.displayWidth, displayHeight: frame.displayHeight, visibleRect: frame.visibleRect ?? undefined,
+        layout, colorSpace: frame.colorSpace, timestamp: Math.round(tick / 10) });
+      frame.close();
+    } else {
+      // Camera drivers often have only 2–3 native capture surfaces. Keeping a
+      // borrowed camera VideoFrame alive exhausts that pool and freezes capture
+      // until the next segment closes it. Copy, then release the native surface.
+      const scale = Math.min(1, 1280 / frame.displayWidth, 720 / frame.displayHeight);
+      const width = Math.max(2, Math.floor(frame.displayWidth * scale / 2) * 2);
+      const height = Math.max(2, Math.floor(frame.displayHeight * scale / 2) * 2);
+      sampleCanvas ??= new OffscreenCanvas(width, height);
+      if (sampleCanvas.width !== width || sampleCanvas.height !== height) { sampleCanvas.width = width; sampleCanvas.height = height; }
+      const context = sampleCanvas.getContext('2d', { willReadFrequently: true })!;
+      context.drawImage(frame, 0, 0, width, height);
+      const pixels = context.getImageData(0, 0, width, height);
+      owned = new VideoFrame(pixels.data, { format: 'RGBA', codedWidth: width, codedHeight: height, timestamp: Math.round(tick / 10) });
+      frame.close();
+    }
+    frameBuffer.push(tick, owned);
+    samplingStats.retained++; samplingStats.lastTick = tick;
+    owned = null;
+    lastFrameTick = tick;
+  } finally { owned?.close(); }
+}
 
 function setClock(clock: CameraMediaClock): void {
-  if (clock.state === 'recording' && clock.mediaTick === 0) { frameBuffer.clear(); lastFrameTick = -Infinity; }
+  if (clock.state === 'recording' && clock.mediaTick === 0) {
+    frameBuffer.clear(); lastFrameTick = -Infinity;
+    Object.assign(samplingStats, { received: 0, retained: 0, lastArrivalMs: 0, maxArrivalGapMs: 0, lastTick: 0, lastSourceTimestamp: 0 });
+  }
   if (clock.state !== 'recording') { frameBuffer.trimFrom(clock.mediaTick); lastFrameTick = Math.min(lastFrameTick, clock.mediaTick - 250_000); }
   mediaClock = clock;
 }
 
 function startFrameSampling(): void {
   if (!video) return;
+  const Processor = (globalThis as unknown as { MediaStreamTrackProcessor?: new (options: { track: MediaStreamTrack; maxBufferSize: number }) => { readable: ReadableStream<VideoFrame> } }).MediaStreamTrackProcessor;
+  const track = stream?.getVideoTracks()[0];
+  if (Processor && track) {
+    const reader = new Processor({ track, maxBufferSize: 2 }).readable.getReader();
+    frameReader = reader;
+    samplingMode = 'track-processor';
+    const generation = ++samplingGeneration;
+    void (async () => {
+      try {
+        while (generation === samplingGeneration) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (generation !== samplingGeneration) { value.close(); break; }
+          try { await retainFrame(value); }
+          catch (error) { console.warn('[camera] 单帧复制失败，继续采集', error); }
+        }
+      } catch (error) { if (generation === samplingGeneration) console.error('[camera] 帧流采集失败', error); }
+      finally { reader.releaseLock(); }
+    })();
+    return;
+  }
+  samplingMode = 'video-callback';
   const sample = () => {
     if (!video || !stream) return;
     try { if (mediaClock?.state === 'recording' && video.readyState >= 2) {
@@ -77,14 +180,15 @@ function startFrameSampling(): void {
         let source: HTMLVideoElement | OffscreenCanvas = video;
         // Some drivers ignore ideal constraints and deliver 4K frames. Bound the
         // live frame surfaces before retaining up to four seconds in the buffer.
-        if (video.videoWidth > 1280 || video.videoHeight > 720) {
-          const scale = Math.min(1280 / video.videoWidth, 720 / video.videoHeight);
+        {
+          const scale = Math.min(1, 1280 / video.videoWidth, 720 / video.videoHeight);
           const width = Math.max(2, Math.floor(video.videoWidth * scale / 2) * 2), height = Math.max(2, Math.floor(video.videoHeight * scale / 2) * 2);
           sampleCanvas ??= new OffscreenCanvas(width, height);
           if (sampleCanvas.width !== width || sampleCanvas.height !== height) { sampleCanvas.width = width; sampleCanvas.height = height; }
-          sampleCanvas.getContext('2d')!.drawImage(video, 0, 0, width, height); source = sampleCanvas;
+          sampleCanvas.getContext('2d', { willReadFrequently: true })!.drawImage(video, 0, 0, width, height); source = sampleCanvas;
         }
-        frameBuffer.push(tick, new VideoFrame(source, { timestamp: Math.round(tick / 10) })); lastFrameTick = tick;
+        const pixels = sampleCanvas!.getContext('2d')!.getImageData(0, 0, sampleCanvas!.width, sampleCanvas!.height);
+        frameBuffer.push(tick, new VideoFrame(pixels.data, { format: 'RGBA', codedWidth: sampleCanvas!.width, codedHeight: sampleCanvas!.height, timestamp: Math.round(tick / 10) })); lastFrameTick = tick;
       }
     } } catch { /* Transient driver/context failures must not cancel future frame callbacks. */ }
     frameCallback = video.requestVideoFrameCallback(sample);
@@ -176,6 +280,7 @@ async function open(deviceId?: string): Promise<{ ok: boolean; deviceId?: string
       activeDeviceId = track?.getSettings().deviceId ?? deviceId ?? null;
       const label = track?.label ?? '';
       startFrameSampling();
+      ensureEncoderWorker();
       return { ok: true, deviceId: activeDeviceId ?? undefined, label };
     } catch (error) {
       lastError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
@@ -204,6 +309,12 @@ async function open(deviceId?: string): Promise<{ ok: boolean; deviceId?: string
 
 /** 关闭摄像头，释放设备（否则录制结束后摄像头灯会一直亮）。 */
 async function close(): Promise<void> {
+  pendingEncode?.reject(new Error('摄像头已关闭'));
+  pendingEncode = null;
+  encoderWorker?.terminate(); encoderWorker = null;
+  samplingGeneration++;
+  const reader = frameReader; frameReader = null;
+  await reader?.cancel().catch(() => undefined);
   if (video && frameCallback) video.cancelVideoFrameCallback(frameCallback);
   frameCallback = 0; mediaClock = null; frameBuffer.clear(); lastFrameTick = -Infinity;
   if (sampleCanvas) { sampleCanvas.width = 0; sampleCanvas.height = 0; sampleCanvas = null; }
@@ -272,15 +383,12 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
     return { ok: false, error: '上一段摄像头编码尚未完成，跳过该段' };
   }
   encoding = true;
-  let encoder: SegmentEncoder | null = null;
   let captured: { tick: number; frame: VideoFrame }[] = [];
   try {
     if (!isReady()) {
       return { ok: false, error: '摄像头未就绪，跳过该段' };
     }
     const fps = request.fps > 0 ? request.fps : 30;
-    const width = request.width > 0 ? request.width : 1280;
-    const height = request.height > 0 ? request.height : 720;
     const start = request.startTick ?? 0;
     captured = frameBuffer.take(start, start + request.durationTicks);
     if (!captured.length) return { ok: false, error: '此时间段没有已采集的摄像头帧；不会用停止后的画面补录。' };
@@ -288,79 +396,20 @@ async function encodeSegment(request: CameraSegmentRequest): Promise<CameraSegme
       return { ok: false, error: '摄像头采集已落后或缓冲帧已过期，此段跳过以免画中画显示错误时间的画面。' };
     }
 
-    encoder = new SegmentEncoder({
-      width,
-      height,
-      fps,
-      // 摄像头画面细节比屏幕少，码率给低一些，避免文件无谓变大
-      videoBitrate: Math.round(width * height * fps * 0.06),
-      audioBitrate: 128_000,
-      hardwarePreferred: true,
-      // 摄像头不带音轨：麦克风由单独的 audio 工作进程采集，
-      // 在摄像头轨再放一份会导致导出时声音翻倍
-      includeAudio: false,
-      audioSampleRate: 48_000,
-      audioChannels: 2,
-      startTimestampUs: 0,
-    });
-    await encoder.init();
-    const drawContext = encoder.drawContext;
-
-    const targetFrames = Math.max(1, Math.round((request.durationTicks / 10_000_000) * fps));
-    const frameStepUs = Math.round(1_000_000 / fps);
-    let written = 0;
-    let cursor = 0;
-    for (let i = 0; i < targetFrames; i++) {
-      const tick = start + Math.round(i * 10_000_000 / fps);
-      while (cursor + 1 < captured.length && captured[cursor + 1].tick <= tick) cursor++;
-      const frame = captured[cursor].frame;
-      const scale = Math.max(width / frame.displayWidth, height / frame.displayHeight);
-      const w = frame.displayWidth * scale, h = frame.displayHeight * scale;
-      drawContext.drawImage(frame, (width - w) / 2, (height - h) / 2, w, h);
-      await encoder.commitVideoFrame(i * frameStepUs);
-      written++;
-      // WebCodecs/mediabunny may resolve each commit as a microtask. Yield a
-      // browser task while recording so requestVideoFrameCallback can keep
-      // sampling the next segment instead of losing its opening frames.
-      if (mediaClock?.state === 'recording' && i % 4 === 3) {
-        await new Promise<void>(resolve => setTimeout(resolve, 0));
-      }
-      // Encode only frames captured within this screen segment's media-clock range.
+    const result = await encodeInWorker(request, captured);
+    if (result.diagnostics) {
+      result.diagnostics.samplingMode = samplingMode + '/worker';
+      const gaps = captured.slice(1).map((item, i) => (item.tick - captured[i].tick) / 10000);
+      const max = Math.max(0, ...gaps), index = gaps.indexOf(max);
+      result.diagnostics.maxSourceGapMs = max;
+      result.diagnostics.sourceGapAtMs = index < 0 ? 0 : (captured[index].tick - start) / 10000;
     }
-
-    if (written === 0) {
-      return { ok: false, error: '该段没有取到任何摄像头帧' };
-    }
-
-    const result = await encoder.finalize();
-    const bytes = result.data instanceof Uint8Array ? result.data : new Uint8Array(result.data);
-    let binary = '';
-    const chunk = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunk) {
-      binary += String.fromCharCode.apply(
-        null,
-        Array.from(bytes.subarray(i, Math.min(i + chunk, bytes.length))) as unknown as number[],
-      );
-    }
-    return {
-      ok: true,
-      mp4: btoa(binary),
-      frames: written,
-      bytes: bytes.length,
-      encoder: result.encoder,
-    };
+    return result;
   } catch (error) {
     return { ok: false, error: String(error instanceof Error ? (error.stack ?? error.message) : error) };
   } finally {
     encoding = false;
     for (const item of captured) item.frame.close();
-    // 每段都新建编码器（硬件 VideoEncoder + OffscreenCanvas 后备存储），
-    // 成功与失败都必须释放；旧实现只在 finalize 成功后靠 GC，连续失败会线性涨内存。
-    try {
-      encoder?.dispose();
-    } catch {
-      // 忽略
-    }
   }
 }
 
@@ -394,6 +443,7 @@ declare global {
       encodeSegment: typeof encodeSegment;
       snapshot: typeof snapshot;
       setClock: typeof setClock;
+      diagnostics: () => typeof samplingStats;
     };
   }
 }
@@ -416,6 +466,6 @@ function isCameraRole(): boolean {
 }
 
 if (isCameraRole()) {
-  window.__wcsCamera = { listDevices, open, close, isReady, encodeSegment, snapshot, setClock };
+  window.__wcsCamera = { listDevices, open, close, isReady, encodeSegment, snapshot, setClock, diagnostics: () => ({ ...samplingStats }) };
   console.log('[camera] 摄像头运行时就绪');
 }

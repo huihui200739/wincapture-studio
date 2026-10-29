@@ -179,6 +179,7 @@ export class CameraCoordinator {
       this.status.segments += 1;
       this.status.reason = null;
       this.deps.log(`[camera] 段 #${index} 完成 ${result.frames} 帧 / ${bytes.length} 字节`);
+      if (result.diagnostics) this.deps.log(`[camera] 段 #${index} 采样诊断 ${JSON.stringify(result.diagnostics)}`);
       return { path: target, bytes: bytes.length, frames: result.frames ?? 0 };
     } catch (error) {
       this.status.reason = String(error instanceof Error ? error.message : error);

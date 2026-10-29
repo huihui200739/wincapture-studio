@@ -61,6 +61,28 @@ async function cameraProbe() {
   } });
   paint(); const stream = source.captureStream(30); const timer = setInterval(paint, 30);
   Object.defineProperty(navigator.mediaDevices, 'getUserMedia', { value: async () => stream, configurable: true });
+  // Model a real driver's three borrowed frame surfaces: capture stalls if a
+  // consumer retains native frames until segment encoding instead of copying.
+  let leased = 0, peakLeased = 0, delivered = 0;
+  const NativeProcessor = window.MediaStreamTrackProcessor;
+  window.MediaStreamTrackProcessor = class {
+    constructor() {
+      let producer;
+      this.readable = new ReadableStream({
+        start(controller) {
+          producer = setInterval(() => {
+            if (leased >= 3) return;
+            const frame = new OriginalFrame(source, { timestamp: Math.round(performance.now() * 1000) });
+            const close = frame.close.bind(frame); let closed = false;
+            leased++; delivered++; peakLeased = Math.max(peakLeased, leased);
+            frame.close = () => { if (!closed) { closed = true; leased--; close(); } };
+            controller.enqueue(frame);
+          }, 33);
+        },
+        cancel() { clearInterval(producer); },
+      }, { highWaterMark: 0 });
+    }
+  };
   const camera = window.__wcsCamera;
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const clock = (state, mediaTick) => camera.setClock({ state, mediaTick, wallTimeMs: performance.timeOrigin + performance.now() });
@@ -100,15 +122,16 @@ async function cameraProbe() {
     const expired = await camera.encodeSegment({ index: 3, startTick: 100_000_000, durationTicks: 8_000_000, fps: 30, width: 320, height: 180 });
     if (expired.ok || !expired.error.includes('过期')) throw new Error('Stale camera frames accepted');
     clock('recording', 0); color = 'red'; await sleep(800);
-    const callbacksBefore = frameCallbacks;
+    const callbacksBefore = camera.diagnostics().received;
     const live = await camera.encodeSegment({ index: 1, startTick: 0, durationTicks: 8_000_000, fps: 60, width: 1280, height: 720, sampleTimesMs: [] });
-    const callbacksDuringEncode = frameCallbacks - callbacksBefore;
+    const callbacksDuringEncode = camera.diagnostics().received - callbacksBefore;
     if (!live.ok || callbacksDuringEncode < 1) throw new Error('Live camera encoding starved capture callbacks: ' + JSON.stringify({result:live.error, callbacksDuringEncode}));
     await sleep(850); clock('stopped', 16_000_000);
     const next = await camera.encodeSegment({ index: 2, startTick: 8_000_000, durationTicks: 8_000_000, fps: 30, width: 1280, height: 720, sampleTimesMs: [] });
     if (!next.ok || next.frames !== 24) throw new Error('Live encoding lost the following camera segment: ' + next.error);
-    return { controlledMediaStream: true, pauseExcluded: true, stopDoesNotRecapture: true, oversizedSourceBounded: {maxWidth,maxHeight}, staleFramesRejected: true, liveEncoding: {callbacksDuringEncode, nextSegmentFrames: next.frames}, segments: output };
-  } finally { clearInterval(timer); await camera.close(); window.VideoFrame = OriginalFrame; HTMLVideoElement.prototype.requestVideoFrameCallback = originalCallback; }
+    if (delivered < 90 || leased !== 0) throw new Error('Camera driver pool stalled or leaked: ' + JSON.stringify({delivered,leased,peakLeased}));
+    return { controlledMediaStream: true, nativeSurfacePoolReleased: {delivered,leased,peakLeased}, pauseExcluded: true, stopDoesNotRecapture: true, oversizedSourceBounded: {maxWidth,maxHeight}, staleFramesRejected: true, liveEncoding: {callbacksDuringEncode, nextSegmentFrames: next.frames}, segments: output };
+  } finally { clearInterval(timer); await camera.close(); window.VideoFrame = OriginalFrame; window.MediaStreamTrackProcessor = NativeProcessor; HTMLVideoElement.prototype.requestVideoFrameCallback = originalCallback; }
 }
 
 app.whenReady().then(async () => {
@@ -117,12 +140,12 @@ app.whenReady().then(async () => {
   try {
     win = new BrowserWindow({ width: 400, height: 300, x: 40, y: 40, show: false });
     await win.loadURL('data:text/html,<title>Input test</title><body style="background:navy;color:white">Windows click verification</body>');
-    win.showInactive(); await sleep(200); const pointer = await pointerProbe(win); win.destroy();
+    win.showInactive(); await sleep(200); const pointer = process.argv.includes('--camera-only') ? { skipped: 'camera-only verification' } : await pointerProbe(win); win.destroy();
     const { build } = require('esbuild');
-    const bundle = await build({ stdin: { contents: `import './src/renderer/cameraRuntime'; import * as mb from 'mediabunny'; import {configureMediabunny} from './src/media/decoder'; configureMediabunny(mb); export {mb};`, resolveDir: ROOT }, bundle: true, write: false, platform: 'browser', format: 'iife', globalName: 'CameraProbe' });
+    const bundle = await build({ stdin: { contents: `import * as mb from 'mediabunny'; import {configureMediabunny} from './src/media/decoder'; configureMediabunny(mb); export {mb};`, resolveDir: ROOT }, bundle: true, write: false, platform: 'browser', format: 'iife', globalName: 'CameraProbe' });
     const entry = path.join(OUT, 'input-camera.html'); fs.writeFileSync(entry, '<!doctype html><title>Camera sync probe</title>');
     camera = new BrowserWindow({ show: false, webPreferences: { backgroundThrottling: false } });
-    await camera.loadFile(entry, { hash: 'camera' });
+    await camera.loadFile(path.join(ROOT, 'dist/renderer/index.html'), { hash: 'camera' });
     const cameraResult = await camera.webContents.executeJavaScript(bundle.outputFiles[0].text + ';(' + cameraProbe.toString() + ')()');
     report = { ok: true, pointer, camera: cameraResult };
   } catch (error) { report = { ok: false, error: String(error.stack || error) }; }

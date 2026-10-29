@@ -148,13 +148,12 @@ describe('buildWaveform', () => {
     }
   });
 
-  it('立体声取平均后仍能反映整体响度', () => {
-    // 左 +1 右 -1 的完全反相：平均为 0，是正确行为（不会误报大音量）
+  it('反相立体声保留各声道峰值，不抵消为假静音', () => {
     const samples = new Float32Array([1, -1, 1, -1, 1, -1, 1, -1]);
     const data = buildWaveform(samples, 2, 48000, 2);
     const bucket = data.levels[0].buckets[0];
-    expect(Math.abs(bucket.min)).toBeLessThan(1e-6);
-    expect(Math.abs(bucket.max)).toBeLessThan(1e-6);
+    expect(bucket.min).toBe(-1);
+    expect(bucket.max).toBe(1);
   });
 
   it('空输入不崩，返回空桶列表', () => {

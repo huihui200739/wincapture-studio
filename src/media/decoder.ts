@@ -289,6 +289,7 @@ interface FrameCache {
 interface VideoCursor {
   iter: AsyncIterator<MediabunnyVideoSample> | null;
   sample: MediabunnyVideoSample | null;
+  next?: MediabunnyVideoSample | null;
   /** 当前 sample 的文件内时间戳（秒） */
   pos: number;
 }
@@ -785,13 +786,14 @@ export class VideoFrameSource {
     t: number,
   ): Promise<MediabunnyVideoSample | null> {
     for (;;) {
-      const next = await cur.iter!.next();
+      const next = cur.next ? { done: false, value: cur.next } : await cur.iter!.next();
+      cur.next = null;
       if (next.done) return cur.sample;
       const sample = next.value;
       if (sample.timestamp > t + TIME_EPS) {
         // 越过了目标：保留上一帧（t 早于首帧时用这一帧兜底）
         if (cur.sample) {
-          sample.close();
+          cur.next = sample;
           return cur.sample;
         }
         cur.sample = sample;
@@ -812,6 +814,7 @@ export class VideoFrameSource {
     if (!cursor) return;
     try {
       cursor.sample?.close();
+      cursor.next?.close();
     } catch {
       // 忽略
     }

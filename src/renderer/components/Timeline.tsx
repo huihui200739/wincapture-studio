@@ -22,6 +22,8 @@ import { LineIcon, type LineIconKind } from './LineIcon';
 import { ContextMenu, type ContextMenuItem } from './ContextMenu';
 import { ChoiceButton } from './ChoiceButton';
 import { AudioWaveform } from './AudioWaveform';
+import { WaveformSource, type WaveformPeakLoader } from '../lib/waveformSource';
+import { wcs } from '../lib/wcs';
 import { VideoThumbnails } from './VideoThumbnails';
 import { usePreviewMedia } from '../lib/previewSource';
 import { timelineSnapTargets, snapPosition } from '@domain/snapping';
@@ -81,13 +83,8 @@ export interface TimelineProps {
   onZoomChange: (zoom: number) => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
-  /** 工程根目录绝对路径，波形读取 WAV 时需要（可选，缺省时波形退化为色块） */
+  /** 工程根目录绝对路径，用于读取真实音频分段。 */
   projectPath?: string | null;
-}
-
-/** 只取波形读取需要的那一小部分 API，避免把整个 WcsApi 类型拖进来。 */
-interface WcsLike {
-  readExportFile?: (path: string) => Promise<{ ok: boolean; data?: unknown; error?: unknown }>;
 }
 
 interface RowDef {
@@ -703,34 +700,14 @@ export function Timeline({
 
   const assetPathOf = useCallback((assetId: string): string | null => assetPathMap.get(assetId) ?? null, [assetPathMap]);
 
-  /**
-   * 读素材字节给波形用。
-   *
-   * 注意：这里的相对路径是「工程内相对路径」，IPC 要绝对路径。
-   * 拿不到工程目录时直接返回 null，波形退化成纯色块而不是报错。
-   */
-  const readAssetBytes = useCallback(
-    async (relativePath: string): Promise<ArrayBuffer | null> => {
-      if (!relativePath) return null;
-      try {
-        const api = (window as unknown as { wcs?: WcsLike }).wcs;
-        if (!api?.readExportFile || !projectPath) return null;
-        const normalized = relativePath.replace(/[\\/]+/g, '\\');
-        const absolute = `${projectPath.replace(/[\\/]+$/, '')}\\${normalized}`;
-        const response = await api.readExportFile(absolute);
-        if (!response?.ok || !response.data) return null;
-        const bytes = response.data as Uint8Array;
-        // Uint8Array 可能只是更大 ArrayBuffer 的视图，必须按 offset 切出来
-        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-      } catch {
-        return null;
-      }
-    },
-    [projectPath],
-  );
+  const waveformSource = useMemo(() => projectPath ? new WaveformSource(projectPath, wcs()) : null, [projectPath, project.id]);
+  const loadWaveformPeaks = useCallback<WaveformPeakLoader>((...args) => {
+    if (!waveformSource) return Promise.reject(new Error('工程尚未打开'));
+    return waveformSource.load(...args);
+  }, [waveformSource]);
 
   return (
-    <section ref={timelineRef} className={cn('editor-timeline', collapsed && 'is-collapsed')} aria-label="时间线" tabIndex={-1}
+    <section ref={timelineRef} className={cn('editor-timeline', collapsed && 'is-collapsed', waveformMode && 'is-waveform-mode')} aria-label="时间线" tabIndex={-1}
       data-keys="shift+f10 contextmenu"
       onContextMenu={event => {
         const target = event.target as HTMLElement;
@@ -1052,7 +1029,7 @@ export function Timeline({
                         return (
                           <div
                             key={clip.id}
-                            className={cn('tl-clip', selectedClipId === clip.id && 'is-selected', dragging && 'is-dragging')}
+                            className={cn('tl-clip', isAudioRow && 'is-audio-clip', isAudioRow && muteOf(row.kind as TrackKind) && 'is-muted', selectedClipId === clip.id && 'is-selected', dragging && 'is-dragging')}
                             style={{
                               left: tickToX(leftTick),
                               width,
@@ -1100,8 +1077,7 @@ export function Timeline({
                             title={`${TRACK_LABEL[row.kind as TrackKind]} · ${formatDuration(clip.sourceDurationTicks)} · 拖动吸附到片段边缘/播放头，Alt 暂停磁吸，双击定位`}
                             onDoubleClick={() => onSeek(clip.timelineInTicks)}
                           >
-                            {/* 音频轨叠加真实波形（§10.4）；读不到就退回纯色块 */}
-                            {!isAudioRow && !waveformMode && <VideoThumbnails project={project} clip={clip} width={width} camera={row.kind === 'camera'} media={thumbnailMedia} />}
+                            {!isAudioRow && <VideoThumbnails project={project} clip={clip} width={width} camera={row.kind === 'camera'} media={thumbnailMedia} />}
                             {isAudioRow && clip.assetId && (
                               <AudioWaveform
                                 assetId={clip.assetId}
@@ -1109,8 +1085,8 @@ export function Timeline({
                                 sourceFromSeconds={ticksToSeconds(clip.sourceInTicks)}
                                 durationSeconds={ticksToSeconds(clip.sourceDurationTicks)}
                                 width={width}
-                                height={22}
-                                readFile={readAssetBytes}
+                                height={waveformMode ? 40 : 26}
+                                loadPeaks={loadWaveformPeaks}
                                 className="tl-waveform"
                               />
                             )}

@@ -506,7 +506,7 @@ export function EditorView() {
             onPointerUp={onStagePointerUp}
             onPointerCancel={() => setDrag({ kind: 'none' })}
           >
-            <PreviewCanvas project={project} tick={tick} projectPath={projectPath} onScene={setScene}
+            <PreviewCanvas project={project} tick={tick} playing={playing} projectPath={projectPath} onScene={setScene}
               maxWidth={Math.min(3840, Math.max(1280, Math.ceil(Math.max(stageFit.width, stageFit.height) * (window.devicePixelRatio || 1) / 64) * 64))} />
             <div className="stage-overlay-layer">
               {/* 已存在的遮挡区域（显示为框，未确认用虚线） */}

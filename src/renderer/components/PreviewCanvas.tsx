@@ -24,10 +24,12 @@ import {
   usePreviewMedia,
 } from '../lib/previewSource';
 import { TICKS_PER_SECOND } from '@domain/timebase';
+import { PreviewQueue } from '../lib/previewQueue';
 
 export interface PreviewCanvasProps {
   project: Project;
   tick: number;
+  playing?: boolean;
   /** 工程目录绝对路径：真实模式解码素材分段必需 */
   projectPath?: string | null;
   /** 预览渲染宽度上限（像素）；高度按画幅计算 */
@@ -60,6 +62,7 @@ function pointerAt(tick: number): { x: number; y: number; visible: boolean; clic
 export function PreviewCanvas({
   project,
   tick,
+  playing = false,
   projectPath = null,
   maxWidth = 1280,
   includeOverlays = true,
@@ -78,6 +81,13 @@ export function PreviewCanvas({
   const media = usePreviewMedia(projectPath);
 
   const size = useMemo(() => previewSizeFor(project, maxWidth), [project, maxWidth]);
+  const playbackQueue = useMemo(() => new PreviewQueue(),
+    [project, media, playing, size.width, size.height, size.variantId, includeOverlays, highlight, onScene]);
+  useEffect(() => () => playbackQueue.cancel(), [playbackQueue]);
+  const previousTick = useRef(tick);
+  // Seeking during playback must invalidate an old in-flight image too.
+  if (playing && (tick < previousTick.current || tick - previousTick.current > TICKS_PER_SECOND / 2)) playbackQueue.cancel();
+  previousTick.current = tick;
 
   useEffect(() => {
     canvasRefOut?.(canvasRef.current);
@@ -107,6 +117,7 @@ export function PreviewCanvas({
           highlight,
           devicePixelRatio: Math.min(2, window.devicePixelRatio || 1),
         });
+        canvas.dataset.previewTick = String(tick);
       } catch (error) {
         console.error('[preview] drawScene 失败', error);
         return false;
@@ -188,10 +199,10 @@ export function PreviewCanvas({
     }
     if (!paintedRef.current) placeholder('正在解码预览画面…');
 
-    void decode
+    const renderDecoded = (isCurrent: () => boolean) => decode
         .resolve(project, scene, tick, canvas)
       .then((result) => {
-        if (cancelled || requestId !== requestRef.current) return;
+        if (!isCurrent()) return;
         if (!result) return; // 已被更新的请求取代
         const current = canvasRef.current;
         if (!current) return;
@@ -216,15 +227,18 @@ export function PreviewCanvas({
         }
       })
       .catch((error) => {
-        if (cancelled || requestId !== requestRef.current) return;
+        if (!isCurrent()) return;
         console.error('[preview] 解码预览失败', error);
         placeholder('预览解码失败，导出画面不受影响');
       });
 
+    if (playing) playbackQueue.submit(renderDecoded);
+    else void renderDecoded(() => !cancelled && requestId === requestRef.current);
+
     return () => {
       cancelled = true;
     };
-  }, [project, tick, size.width, size.height, size.variantId, includeOverlays, highlight, onScene, synthetic, media, projectPath]);
+  }, [project, tick, size.width, size.height, size.variantId, includeOverlays, highlight, onScene, synthetic, media, projectPath, playing, playbackQueue]);
 
   return (
     <canvas
